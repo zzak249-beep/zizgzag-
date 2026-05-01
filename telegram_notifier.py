@@ -1,182 +1,114 @@
 """
-telegram_notifier.py — Envía notificaciones al bot de Telegram.
-
-Todos los eventos importantes del bot se notifican:
-  - Bot iniciado / detenido
-  - Señal de entrada detectada
-  - Orden colocada (con detalles de precio, TP, SL)
-  - Orden cerrada (con P&L)
-  - Errores críticos
+telegram_notifier.py — Notificaciones Telegram para el bot multi-símbolo.
 """
-
 from __future__ import annotations
-import logging
-import requests
+import logging, requests
 from datetime import datetime
-
 import config
 
-logger = logging.getLogger(__name__)
-
-BASE_URL = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}"
-
-
-def _send(message: str, parse_mode: str = "HTML") -> bool:
-    """Envía un mensaje al chat configurado."""
-    try:
-        resp = requests.post(
-            f"{BASE_URL}/sendMessage",
-            json={
-                "chat_id":    config.TELEGRAM_CHAT_ID,
-                "text":       message,
-                "parse_mode": parse_mode,
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        logger.error("Error al enviar Telegram: %s", e)
-        return False
-
+logger  = logging.getLogger(__name__)
+API_URL = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}"
 
 def _now() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.utcnow().strftime("%d/%m/%Y %H:%M UTC")
 
+def send(text: str) -> bool:
+    try:
+        r = requests.post(f"{API_URL}/sendMessage", json={
+            "chat_id": config.TELEGRAM_CHAT_ID,
+            "text": text, "parse_mode": "HTML",
+        }, timeout=10)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        logger.error("Telegram error: %s", e)
+        return False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mensajes específicos
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Mensajes ───────────────────────────────────────────────────────────────
 
-def send_bot_started(symbol: str, leverage: int) -> None:
-    msg = (
-        "🤖 <b>ZigZag Bot INICIADO</b>\n"
-        f"📊 Símbolo:      <code>{symbol}</code>\n"
-        f"⚡ Apalancamiento: <code>{leverage}x</code>\n"
-        f"⏱  Timeframe:    <code>{config.TIMEFRAME}</code>\n"
-        f"🎯 TP:           <code>{config.TP_PIPS} pips</code>\n"
-        f"🛑 SL:           <code>{config.SL_PIPS} pips</code>\n"
-        f"💰 Capital/op:   <code>{config.CAPITAL_PER_TRADE} USDT</code>\n"
+def bot_started(symbols_count: int) -> None:
+    send(
+        f"🤖 <b>ZigZag Multi-Bot INICIADO</b>\n"
+        f"🔍 Monitorizando: <b>{symbols_count} monedas</b>\n"
+        f"⚡ Leverage:  <code>{config.LEVERAGE}x</code>\n"
+        f"🎯 TP: <code>{config.TP_PIPS} pips</code>  "
+        f"🛑 SL: <code>{config.SL_PIPS} pips</code>\n"
+        f"💰 Capital/op: <code>{config.CAPITAL_PER_TRADE} USDT</code>\n"
+        f"📊 Max posiciones: <code>{config.MAX_OPEN_POSITIONS}</code>\n"
         f"🕒 {_now()}"
     )
-    _send(msg)
 
+def bot_stopped(reason: str = "Manual") -> None:
+    send(f"🔴 <b>Bot DETENIDO</b>\nMotivo: {reason}\n🕒 {_now()}")
 
-def send_bot_stopped(reason: str = "Manual") -> None:
-    msg = (
-        "🔴 <b>ZigZag Bot DETENIDO</b>\n"
-        f"Motivo: {reason}\n"
+def scan_summary(scanned: int, signals: int, skipped: int) -> None:
+    send(
+        f"🔎 <b>Escaneo completado</b>\n"
+        f"Analizadas:  <code>{scanned}</code> monedas\n"
+        f"Señales:     <code>{signals}</code>\n"
+        f"Omitidas:    <code>{skipped}</code> (límite posiciones)\n"
         f"🕒 {_now()}"
     )
-    _send(msg)
 
-
-def send_signal_detected(
-    direction:  str,    # "LONG" | "SHORT"
-    symbol:     str,
-    price:      float,
-    resistance: float,
-    support:    float,
-) -> None:
-    emoji    = "🟢" if direction == "LONG" else "🔴"
-    trigger  = f"↗️ Rompe resistencia <code>{resistance:.4f}</code>" \
-               if direction == "LONG" \
-               else f"↘️ Rompe soporte <code>{support:.4f}</code>"
-    msg = (
-        f"{emoji} <b>SEÑAL {direction} detectada</b>\n"
-        f"📊 {symbol}\n"
-        f"💹 Precio actual: <code>{price:.4f}</code>\n"
-        f"{trigger}\n"
-        f"🏔  Resistencia ZZ: <code>{resistance:.4f}</code>\n"
-        f"🏔  Soporte ZZ:     <code>{support:.4f}</code>\n"
+def signal_detected(direction: str, symbol: str, price: float,
+                    resistance: float, support: float) -> None:
+    e = "🟢" if direction == "LONG" else "🔴"
+    lvl = f"Rompe resistencia <code>{resistance:.6g}</code>" \
+          if direction == "LONG" else \
+          f"Rompe soporte <code>{support:.6g}</code>"
+    send(
+        f"{e} <b>SEÑAL {direction}</b> — {symbol}\n"
+        f"💹 Precio: <code>{price:.6g}</code>\n"
+        f"📐 {lvl}\n"
+        f"🏔 Resist: <code>{resistance:.6g}</code>  "
+        f"🏔 Soporte: <code>{support:.6g}</code>\n"
         f"🕒 {_now()}"
     )
-    _send(msg)
 
-
-def send_order_placed(
-    direction:  str,
-    symbol:     str,
-    entry:      float,
-    tp:         float,
-    sl:         float,
-    quantity:   float,
-    leverage:   int,
-    capital:    float,
-) -> None:
-    emoji = "🟢" if direction == "LONG" else "🔴"
-    msg = (
-        f"{emoji} <b>ORDEN ABIERTA — {direction}</b>\n"
-        f"📊 {symbol}\n"
-        f"📈 Entrada:  <code>{entry:.4f}</code>\n"
-        f"🎯 TP:       <code>{tp:.4f}</code>\n"
-        f"🛑 SL:       <code>{sl:.4f}</code>\n"
-        f"📦 Cantidad: <code>{quantity:.4f}</code>\n"
-        f"⚡ Leverage: <code>{leverage}x</code>\n"
-        f"💰 Capital:  <code>{capital:.2f} USDT</code>\n"
+def order_opened(direction: str, symbol: str, entry: float,
+                 tp: float, sl: float, qty: float, capital: float) -> None:
+    e = "🟢" if direction == "LONG" else "🔴"
+    send(
+        f"{e} <b>ORDEN ABIERTA — {direction}</b>\n"
+        f"📊 <b>{symbol}</b>\n"
+        f"📈 Entrada:  <code>{entry:.6g}</code>\n"
+        f"🎯 TP:       <code>{tp:.6g}</code>\n"
+        f"🛑 SL:       <code>{sl:.6g}</code>\n"
+        f"📦 Cantidad: <code>{qty:.4f}</code>\n"
+        f"⚡ {config.LEVERAGE}x  💰 {capital:.2f} USDT\n"
         f"🕒 {_now()}"
     )
-    _send(msg)
 
-
-def send_order_closed(
-    direction:  str,
-    symbol:     str,
-    entry:      float,
-    exit_price: float,
-    pnl:        float,
-    reason:     str,     # "TP" | "SL" | "Manual"
-) -> None:
+def order_closed(direction: str, symbol: str, entry: float,
+                 exit_p: float, pnl: float, reason: str) -> None:
     if pnl >= 0:
-        emoji  = "✅"
-        result = f"+{pnl:.2f} USDT 🎉"
+        e, res = "✅", f"<b>+{pnl:.2f} USDT 🎉</b>"
     else:
-        emoji  = "❌"
-        result = f"{pnl:.2f} USDT 😔"
-
-    msg = (
-        f"{emoji} <b>ORDEN CERRADA — {direction}</b>\n"
-        f"📊 {symbol}\n"
-        f"📈 Entrada:  <code>{entry:.4f}</code>\n"
-        f"📉 Salida:   <code>{exit_price:.4f}</code>\n"
-        f"💵 P&L:      <b>{result}</b>\n"
-        f"📌 Motivo:   {reason}\n"
+        e, res = "❌", f"<b>{pnl:.2f} USDT 😔</b>"
+    send(
+        f"{e} <b>CERRADA — {direction}</b>\n"
+        f"📊 <b>{symbol}</b>\n"
+        f"📈 Entrada: <code>{entry:.6g}</code>\n"
+        f"📉 Salida:  <code>{exit_p:.6g}</code>\n"
+        f"💵 P&amp;L:    {res}\n"
+        f"📌 Motivo:  {reason}\n"
         f"🕒 {_now()}"
     )
-    _send(msg)
 
-
-def send_zigzag_levels(
-    symbol:     str,
-    resistance: float,
-    support:    float,
-    current:    float,
-) -> None:
-    msg = (
-        f"📐 <b>Niveles ZigZag actualizados</b>\n"
-        f"📊 {symbol}\n"
-        f"🏔  Resistencia: <code>{resistance:.4f}</code>\n"
-        f"🏔  Soporte:     <code>{support:.4f}</code>\n"
-        f"💹  Precio:      <code>{current:.4f}</code>\n"
-        f"↕️  Rango:       <code>{(resistance - support):.4f}</code>\n"
+def daily_report(trades: int, wins: int, losses: int,
+                 total_pnl: float, balance: float) -> None:
+    wr  = f"{wins/(wins+losses)*100:.1f}%" if (wins+losses) > 0 else "—"
+    pnl = f"+{total_pnl:.2f}" if total_pnl >= 0 else f"{total_pnl:.2f}"
+    send(
+        f"📊 <b>REPORTE DIARIO</b>\n"
+        f"Operaciones:  <code>{trades}</code>\n"
+        f"✅ Wins:      <code>{wins}</code>\n"
+        f"❌ Losses:    <code>{losses}</code>\n"
+        f"🎯 Win rate:  <code>{wr}</code>\n"
+        f"💵 P&amp;L día: <b>{pnl} USDT</b>\n"
+        f"💼 Balance:   <code>{balance:.2f} USDT</code>\n"
         f"🕒 {_now()}"
     )
-    _send(msg)
 
-
-def send_error(error: str) -> None:
-    msg = (
-        f"⚠️ <b>ERROR en ZigZag Bot</b>\n"
-        f"<code>{error[:300]}</code>\n"
-        f"🕒 {_now()}"
-    )
-    _send(msg)
-
-
-def send_balance(balance_usdt: float) -> None:
-    msg = (
-        f"💼 <b>Balance actual</b>\n"
-        f"💰 <code>{balance_usdt:.2f} USDT</code>\n"
-        f"🕒 {_now()}"
-    )
-    _send(msg)
+def error(msg: str) -> None:
+    send(f"⚠️ <b>ERROR</b>\n<code>{str(msg)[:300]}</code>\n🕒 {_now()}")

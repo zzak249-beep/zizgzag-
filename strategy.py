@@ -1,23 +1,17 @@
 """
-strategy.py — Lógica principal de la estrategia ZigZag Breakout.
+strategy.py — Estrategia ZigZag Breakout multi-símbolo.
 
-Estrategia de Maki@テクニカル先生 (1M visitas TikTok):
-────────────────────────────────────────────────────
-  1. Calcular ZigZag++ sobre las últimas N velas de 15 minutos
-  2. Identificar último PICO (resistencia) y último VALLE (soporte)
-  3. Si el precio cierra POR ENCIMA de la resistencia → LONG
-  4. Si el precio cierra POR DEBAJO del soporte       → SHORT
-  5. TP = entrada ± 45 pips
-  6. SL = entrada ∓ 30 pips
-  7. Apalancamiento: 10x
-────────────────────────────────────────────────────
+Por cada símbolo activo:
+  1. Calcular ZigZag++ → obtener resistencia y soporte
+  2. Si precio rompe resistencia → LONG  (TP +45 pips, SL -30 pips, 10x)
+  3. Si precio rompe soporte    → SHORT (TP -45 pips, SL +30 pips, 10x)
+  4. Monitorizar posiciones abiertas → detectar cierre → notificar P&L
 """
-
 from __future__ import annotations
-import logging
+import logging, time
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, date
+from typing import Dict, Optional
 
 import config
 import bingx_client as bx
@@ -27,314 +21,245 @@ from zigzag import get_breakout_levels
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Estado del bot (en memoria; persiste mientras el proceso esté vivo)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Posición activa ────────────────────────────────────────────────────────
 
 @dataclass
-class BotState:
-    in_trade:       bool  = False
-    direction:      str   = ""          # "LONG" | "SHORT"
-    entry_price:    float = 0.0
-    tp_price:       float = 0.0
-    sl_price:       float = 0.0
-    quantity:       float = 0.0
-    resistance:     float = 0.0
-    support:        float = 0.0
-    last_signal:    str   = ""          # para no repetir misma señal
-    trades_today:   int   = 0
-    wins:           int   = 0
-    losses:         int   = 0
-    total_pnl:      float = 0.0
-    candle_counter: int   = 0
+class Position:
+    symbol:    str
+    direction: str        # "LONG" | "SHORT"
+    entry:     float
+    tp:        float
+    sl:        float
+    qty:       float
+    opened_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    last_sig:  str = ""   # evitar re-entrada en mismo nivel
 
 
-state = BotState()
+# ── Estado global ──────────────────────────────────────────────────────────
+
+positions:    Dict[str, Position] = {}   # symbol → Position
+signal_cache: Dict[str, str]      = {}   # symbol → last signal_id
+stats = {
+    "trades": 0, "wins": 0, "losses": 0,
+    "pnl": 0.0, "day": date.today(),
+}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilidades
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Utilidades ─────────────────────────────────────────────────────────────
 
-def _pip_size() -> float:
-    """Tamaño de 1 pip para el símbolo configurado."""
-    sym = config.SYMBOL
-    if "BTC" in sym:
-        return 1.0
-    elif "ETH" in sym:
-        return 0.1
-    elif "XRP" in sym or "ADA" in sym or "DOGE" in sym:
-        return 0.00001
-    else:
-        return 0.0001   # Forex / otros
+def _pip(symbol: str) -> float:
+    return bx.pip_size(symbol)
 
+def _tp(entry: float, direction: str, symbol: str) -> float:
+    p = config.TP_PIPS * _pip(symbol)
+    return entry + p if direction == "LONG" else entry - p
 
-def _tp_price(entry: float, direction: str) -> float:
-    pips = config.TP_PIPS * _pip_size()
-    return entry + pips if direction == "LONG" else entry - pips
+def _sl(entry: float, direction: str, symbol: str) -> float:
+    p = config.SL_PIPS * _pip(symbol)
+    return entry - p if direction == "LONG" else entry + p
 
+def _in_hours() -> bool:
+    h = datetime.utcnow().hour
+    return config.TRADE_START_HOUR <= h <= config.TRADE_END_HOUR
 
-def _sl_price(entry: float, direction: str) -> float:
-    pips = config.SL_PIPS * _pip_size()
-    return entry - pips if direction == "LONG" else entry + pips
+def _reset_daily():
+    today = date.today()
+    if stats["day"] != today:
+        stats.update({"trades":0,"wins":0,"losses":0,"pnl":0.0,"day":today})
 
 
-def _is_trading_hours() -> bool:
-    """Verifica si estamos dentro del horario de trading permitido."""
-    hour = datetime.utcnow().hour
-    return config.TRADE_START_HOUR <= hour <= config.TRADE_END_HOUR
+# ── Verificar cierres ──────────────────────────────────────────────────────
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Verificación de cierre de posición (TP/SL alcanzado)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def check_position_closed() -> None:
+def check_all_closed() -> None:
     """
-    Comprueba si la posición se ha cerrado (TP o SL alcanzado).
-    BingX cierra la posición automáticamente; aquí detectamos el cierre
-    y enviamos la notificación con P&L.
+    Compara posiciones abiertas en BingX con las que tenemos registradas.
+    Si una posición ya no existe en BingX → fue cerrada (TP/SL) → notificar P&L.
     """
-    if not state.in_trade:
+    if not positions:
+        return
+    try:
+        open_on_exchange = {p["symbol"] for p in bx.get_all_open_positions()}
+    except Exception as e:
+        logger.error("check_all_closed: %s", e)
         return
 
+    for sym in list(positions.keys()):
+        if sym not in open_on_exchange:
+            pos = positions.pop(sym)
+            _handle_closed(pos)
+
+
+def _handle_closed(pos: Position) -> None:
+    """Calcula P&L y notifica cierre de posición."""
     try:
-        positions = bx.get_open_positions(config.SYMBOL)
-        still_open = any(
-            float(p.get("positionAmt", 0)) != 0 for p in positions
-        )
+        ticker     = bx.get_ticker(pos.symbol)
+        exit_price = float(ticker.get("lastPrice", pos.entry))
+    except Exception:
+        exit_price = pos.entry
 
-        if not still_open:
-            # Posición cerrada — calcular P&L aproximado
-            ticker     = bx.get_ticker(config.SYMBOL)
-            exit_price = float(ticker.get("lastPrice", state.entry_price))
+    if pos.direction == "LONG":
+        pnl    = (exit_price - pos.entry) * pos.qty
+        reason = "✅ Take Profit" if exit_price >= pos.tp * 0.998 else "🛑 Stop Loss"
+    else:
+        pnl    = (pos.entry - exit_price) * pos.qty
+        reason = "✅ Take Profit" if exit_price <= pos.tp * 1.002 else "🛑 Stop Loss"
 
-            if state.direction == "LONG":
-                pnl = (exit_price - state.entry_price) * state.quantity * config.LEVERAGE
-            else:
-                pnl = (state.entry_price - exit_price) * state.quantity * config.LEVERAGE
+    if pnl >= 0:
+        stats["wins"] += 1
+    else:
+        stats["losses"] += 1
+    stats["pnl"] += pnl
 
-            # Determinar motivo
-            if state.direction == "LONG":
-                if exit_price >= state.tp_price * 0.999:
-                    reason = "✅ Take Profit"
-                    state.wins += 1
-                else:
-                    reason = "🛑 Stop Loss"
-                    state.losses += 1
-            else:
-                if exit_price <= state.tp_price * 1.001:
-                    reason = "✅ Take Profit"
-                    state.wins += 1
-                else:
-                    reason = "🛑 Stop Loss"
-                    state.losses += 1
-
-            state.total_pnl += pnl
-
-            tg.send_order_closed(
-                direction  = state.direction,
-                symbol     = config.SYMBOL,
-                entry      = state.entry_price,
-                exit_price = exit_price,
-                pnl        = pnl,
-                reason     = reason,
-            )
-
-            logger.info(
-                "Posición cerrada | %s | Entrada: %.4f | Salida: %.4f | P&L: %.2f USDT | %s",
-                state.direction, state.entry_price, exit_price, pnl, reason,
-            )
-
-            # Resetear estado
-            state.in_trade    = False
-            state.direction   = ""
-            state.entry_price = 0.0
-            state.last_signal = ""
-
-    except Exception as e:
-        logger.error("Error comprobando posición: %s", e)
-        tg.send_error(f"check_position_closed: {e}")
+    tg.order_closed(pos.direction, pos.symbol, pos.entry, exit_price, pnl, reason)
+    logger.info("CERRADA %s %s | entrada %.6g | salida %.6g | P&L %.2f USDT | %s",
+                pos.direction, pos.symbol, pos.entry, exit_price, pnl, reason)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Apertura de trade
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Abrir posición ─────────────────────────────────────────────────────────
 
-def open_trade(direction: str, current_price: float) -> None:
+def open_trade(symbol: str, direction: str, price: float) -> bool:
     """Abre una posición en BingX con TP y SL automáticos."""
     try:
-        entry = current_price
-        tp    = _tp_price(entry, direction)
-        sl    = _sl_price(entry, direction)
-        qty   = bx.calculate_quantity(config.CAPITAL_PER_TRADE, entry, config.LEVERAGE)
+        bx.set_leverage(symbol, config.LEVERAGE)
+        tp  = _tp(price, direction, symbol)
+        sl  = _sl(price, direction, symbol)
+        qty = bx.calc_quantity(config.CAPITAL_PER_TRADE, price, config.LEVERAGE)
 
-        side  = "BUY" if direction == "LONG" else "SELL"
+        if qty <= 0:
+            logger.warning("Cantidad cero para %s precio %.6g", symbol, price)
+            return False
 
-        order = bx.place_market_order(
-            symbol   = config.SYMBOL,
-            side     = side,
-            quantity = qty,
-            tp_price = round(tp, 4),
-            sl_price = round(sl, 4),
-        )
+        side = "BUY" if direction == "LONG" else "SELL"
+        bx.place_market_order(symbol, side, qty, round(tp,8), round(sl,8))
 
-        # Guardar estado
-        state.in_trade    = True
-        state.direction   = direction
-        state.entry_price = entry
-        state.tp_price    = tp
-        state.sl_price    = sl
-        state.quantity    = qty
-        state.trades_today += 1
+        pos = Position(symbol=symbol, direction=direction,
+                       entry=price, tp=tp, sl=sl, qty=qty)
+        positions[symbol] = pos
+        stats["trades"] += 1
 
-        tg.send_order_placed(
-            direction = direction,
-            symbol    = config.SYMBOL,
-            entry     = entry,
-            tp        = tp,
-            sl        = sl,
-            quantity  = qty,
-            leverage  = config.LEVERAGE,
-            capital   = config.CAPITAL_PER_TRADE,
-        )
-
-        logger.info(
-            "Trade abierto | %s | Entrada: %.4f | TP: %.4f | SL: %.4f | Qty: %.4f",
-            direction, entry, tp, sl, qty,
-        )
+        tg.order_opened(direction, symbol, price, tp, sl, qty, config.CAPITAL_PER_TRADE)
+        logger.info("ABIERTA %s %s | precio %.6g | TP %.6g | SL %.6g | qty %.4f",
+                    direction, symbol, price, tp, sl, qty)
+        return True
 
     except Exception as e:
-        logger.error("Error abriendo trade: %s", e)
-        tg.send_error(f"open_trade: {e}")
-        state.in_trade = False
+        logger.error("open_trade %s: %s", symbol, e)
+        tg.error(f"No se pudo abrir {symbol}: {e}")
+        return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Ciclo principal de estrategia
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Escanear un símbolo ────────────────────────────────────────────────────
 
-def run_strategy() -> None:
+def scan_symbol(symbol: str) -> str:
     """
-    Se ejecuta al cierre de cada vela de 15 minutos.
-
-    Flujo:
-      1. Verificar si hay posición abierta (¿se cerró por TP/SL?)
-      2. Si no hay posición, buscar señal de breakout
-      3. Si hay señal, abrir trade
+    Analiza un símbolo. Retorna: 'long' | 'short' | 'none' | 'error'
     """
-    state.candle_counter += 1
-    logger.info("─── Tick #%d ─── %s", state.candle_counter, datetime.utcnow().isoformat())
-
-    # ── 1. Comprobar si la posición activa se cerró ──────────────────────
-    check_position_closed()
-
-    if not _is_trading_hours():
-        logger.info("Fuera de horario de trading. Saltando.")
-        return
-
-    # ── 2. No operar si ya estamos en posición ───────────────────────────
-    if state.in_trade:
-        logger.info(
-            "Posición activa: %s | Entrada: %.4f | TP: %.4f | SL: %.4f",
-            state.direction, state.entry_price, state.tp_price, state.sl_price,
-        )
-        return
-
-    # ── 3. Obtener velas y calcular ZigZag ───────────────────────────────
     try:
-        candles = bx.get_klines(
-            symbol   = config.SYMBOL,
-            interval = config.BINGX_INTERVAL,
-            limit    = config.ZZ_LOOKBACK + 10,
-        )
+        candles = bx.get_klines(symbol, config.BINGX_INTERVAL, config.ZZ_LOOKBACK + 10)
     except Exception as e:
-        logger.error("Error obteniendo velas: %s", e)
-        tg.send_error(f"get_klines: {e}")
-        return
+        logger.debug("klines %s: %s", symbol, e)
+        return "error"
 
     if len(candles) < config.ZZ_LOOKBACK:
-        logger.warning("Pocas velas disponibles: %d", len(candles))
-        return
+        return "none"
 
     highs  = [c["high"]  for c in candles]
     lows   = [c["low"]   for c in candles]
     closes = [c["close"] for c in candles]
 
     resistance, support = get_breakout_levels(
-        highs     = highs,
-        lows      = lows,
-        depth     = config.ZZ_DEPTH,
-        deviation = config.ZZ_DEVIATION,
-        backstep  = config.ZZ_BACKSTEP,
+        highs, lows, config.ZZ_DEPTH, config.ZZ_DEVIATION, config.ZZ_BACKSTEP
     )
-
     if resistance is None or support is None:
-        logger.warning("ZigZag no encontró niveles suficientes. Esperando más datos.")
+        return "none"
+
+    price = closes[-1]
+    sig_id = f"{resistance:.8g}_{support:.8g}"
+
+    # Evitar re-entrada en el mismo nivel
+    if signal_cache.get(symbol) == sig_id:
+        return "none"
+
+    if price > resistance:
+        signal_cache[symbol] = sig_id
+        return "long"
+    elif price < support:
+        signal_cache[symbol] = sig_id
+        return "short"
+
+    return "none"
+
+
+# ── Ciclo principal ────────────────────────────────────────────────────────
+
+def run_scan_cycle(symbols: list) -> None:
+    """
+    Ejecuta un ciclo completo: verifica cierres + escanea todos los símbolos.
+    """
+    _reset_daily()
+    logger.info("═══ Ciclo iniciado | %d símbolos | %d posiciones abiertas ═══",
+                len(symbols), len(positions))
+
+    # 1. Comprobar si alguna posición se cerró
+    check_all_closed()
+
+    if not _in_hours():
+        logger.info("Fuera de horario de trading (UTC %dh–%dh).",
+                    config.TRADE_START_HOUR, config.TRADE_END_HOUR)
         return
 
-    current_close = closes[-1]
-    current_price = current_close
+    # 2. Escanear símbolos
+    new_signals  = 0
+    skipped      = 0
+    errors       = 0
 
-    state.resistance = resistance
-    state.support    = support
+    for symbol in symbols:
+        # Límite de posiciones simultáneas
+        if len(positions) >= config.MAX_OPEN_POSITIONS:
+            skipped += len(symbols) - symbols.index(symbol)
+            logger.info("Límite de %d posiciones alcanzado.", config.MAX_OPEN_POSITIONS)
+            break
 
-    logger.info(
-        "ZigZag | Resistencia: %.4f | Soporte: %.4f | Precio: %.4f",
-        resistance, support, current_price,
-    )
+        # Ya tenemos posición abierta en este símbolo
+        if symbol in positions:
+            time.sleep(config.SCAN_DELAY_SEC * 0.5)
+            continue
 
-    # Enviar niveles cada 8 velas (~2 horas) para no saturar Telegram
-    if state.candle_counter % 8 == 0:
-        tg.send_zigzag_levels(config.SYMBOL, resistance, support, current_price)
+        signal = scan_symbol(symbol)
+        time.sleep(config.SCAN_DELAY_SEC)   # respetar rate limit
 
-    # ── 4. Detectar breakout ─────────────────────────────────────────────
-    signal = ""
+        if signal in ("long", "short"):
+            direction = signal.upper()
+            try:
+                ticker = bx.get_ticker(symbol)
+                price  = float(ticker.get("lastPrice", 0))
+            except Exception:
+                errors += 1
+                continue
 
-    if current_close > resistance:
-        signal = "LONG"
-    elif current_close < support:
-        signal = "SHORT"
+            if price <= 0:
+                continue
 
-    if not signal:
-        logger.info("Sin señal. Precio dentro del rango ZigZag.")
-        return
+            # Notificar señal
+            try:
+                candles = bx.get_klines(symbol, config.BINGX_INTERVAL, config.ZZ_LOOKBACK + 10)
+                highs = [c["high"] for c in candles]
+                lows  = [c["low"]  for c in candles]
+                r, s  = get_breakout_levels(highs, lows, config.ZZ_DEPTH,
+                                            config.ZZ_DEVIATION, config.ZZ_BACKSTEP)
+                tg.signal_detected(direction, symbol, price, r or 0, s or 0)
+            except Exception:
+                pass
 
-    # Evitar entrar dos veces seguidas con la misma señal en el mismo nivel
-    signal_id = f"{signal}_{resistance:.4f}_{support:.4f}"
-    if signal_id == state.last_signal:
-        logger.info("Señal duplicada ignorada: %s", signal_id)
-        return
+            if open_trade(symbol, direction, price):
+                new_signals += 1
 
-    state.last_signal = signal_id
+        elif signal == "error":
+            errors += 1
 
-    logger.info("¡SEÑAL DETECTADA! %s | Precio: %.4f", signal, current_price)
+    logger.info("Ciclo completo | señales: %d | omitidos: %d | errores: %d",
+                new_signals, skipped, errors)
 
-    tg.send_signal_detected(
-        direction  = signal,
-        symbol     = config.SYMBOL,
-        price      = current_price,
-        resistance = resistance,
-        support    = support,
-    )
-
-    # ── 5. Configurar leverage y abrir trade ─────────────────────────────
-    try:
-        bx.set_leverage(config.SYMBOL, config.LEVERAGE)
-    except Exception as e:
-        logger.warning("No se pudo establecer leverage (puede ya estar configurado): %s", e)
-
-    open_trade(direction=signal, current_price=current_price)
-
-
-def get_stats_summary() -> str:
-    """Resumen de estadísticas del bot para reporte diario."""
-    winrate = (state.wins / (state.wins + state.losses) * 100) if (state.wins + state.losses) > 0 else 0
-    return (
-        f"📊 <b>Estadísticas del bot</b>\n"
-        f"Trades hoy:  {state.trades_today}\n"
-        f"Wins:        {state.wins}\n"
-        f"Losses:      {state.losses}\n"
-        f"Win rate:    {winrate:.1f}%\n"
-        f"P&L total:   {state.total_pnl:+.2f} USDT\n"
-    )
+    # Notificar resumen solo si hay actividad o cada 4 ciclos
+    if new_signals > 0 or skipped > 0:
+        tg.scan_summary(len(symbols), new_signals, skipped)

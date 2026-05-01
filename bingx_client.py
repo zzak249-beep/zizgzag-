@@ -1,277 +1,258 @@
 """
-bingx_client.py — Cliente para la API de BingX Perpetual Swap (Futuros).
-
-Documentación oficial: https://bingx-api.github.io/docs/
+bingx_client.py — Cliente BingX Perpetual Swap (Futuros).
+Soporta: obtener todos los símbolos, klines, órdenes, posiciones.
 """
-
 from __future__ import annotations
-import hashlib
-import hmac
-import json
-import logging
-import time
-from typing import Dict, Optional
+import hashlib, hmac, json, logging, time
+from typing import Dict, List, Optional
 from urllib.parse import urlencode
-
 import requests
-
 import config
 
 logger = logging.getLogger(__name__)
+BASE   = config.BINGX_BASE_URL
 
-BASE_URL = config.BINGX_BASE_URL
 
+# ── Firma ──────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers de firma
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _timestamp() -> str:
+def _ts() -> str:
     return str(int(time.time() * 1000))
 
-
 def _sign(secret: str, payload: str) -> str:
-    return hmac.new(
-        secret.encode("utf-8"),
-        payload.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
+    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
-
-def _signed_request(
-    method: str,
-    path:   str,
-    params: Optional[Dict] = None,
-    body:   Optional[Dict] = None,
-) -> Dict:
-    """
-    Realiza una petición firmada a la API de BingX.
-    """
-    params = params or {}
-    params["timestamp"] = _timestamp()
-
-    # Construir la cadena a firmar
-    query_string = urlencode(params)
-    if body:
-        body_string  = json.dumps(body, separators=(",", ":"))
-        sign_payload = query_string + body_string
-    else:
-        body_string  = ""
-        sign_payload = query_string
-
-    params["signature"] = _sign(config.BINGX_SECRET_KEY, sign_payload)
-
-    headers = {
-        "X-BX-APIKEY": config.BINGX_API_KEY,
-        "Content-Type": "application/json",
-    }
-
-    url = f"{BASE_URL}{path}?{urlencode(params)}"
-
+def _req(method: str, path: str, params: dict = None, body: dict = None) -> Dict:
+    params = dict(params or {})
+    params["timestamp"] = _ts()
+    qs = urlencode(params)
+    bs = json.dumps(body, separators=(",",":")) if body else ""
+    params["signature"] = _sign(config.BINGX_SECRET_KEY, qs + bs)
+    headers = {"X-BX-APIKEY": config.BINGX_API_KEY, "Content-Type": "application/json"}
+    url = f"{BASE}{path}?{urlencode(params)}"
     try:
-        if method.upper() == "GET":
-            resp = requests.get(url, headers=headers, timeout=10)
-        elif method.upper() == "POST":
-            resp = requests.post(url, headers=headers, data=body_string, timeout=10)
-        elif method.upper() == "DELETE":
-            resp = requests.delete(url, headers=headers, timeout=10)
+        if method == "GET":
+            r = requests.get(url, headers=headers, timeout=10)
+        elif method == "POST":
+            r = requests.post(url, headers=headers, data=bs, timeout=10)
+        elif method == "DELETE":
+            r = requests.delete(url, headers=headers, timeout=10)
         else:
-            raise ValueError(f"Método HTTP no soportado: {method}")
-
-        resp.raise_for_status()
-        data = resp.json()
-
+            raise ValueError(method)
+        r.raise_for_status()
+        data = r.json()
         if data.get("code") not in (0, "0", None):
-            raise RuntimeError(f"BingX error {data.get('code')}: {data.get('msg')}")
-
+            raise RuntimeError(f"BingX {data.get('code')}: {data.get('msg')}")
         return data
-
     except requests.RequestException as e:
-        logger.error("Error HTTP en BingX: %s", e)
+        logger.error("HTTP error BingX %s %s: %s", method, path, e)
         raise
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Datos de mercado
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Mercado público ────────────────────────────────────────────────────────
 
-def get_klines(symbol: str, interval: str, limit: int = 100) -> list:
+def get_all_symbols() -> List[Dict]:
     """
-    Obtiene velas históricas.
-    interval: "1", "3", "5", "15", "30", "60", "120", "240", "360", "720", "D", "W", "M"
-    Retorna lista de dicts: {open, high, low, close, volume, timestamp}
+    Retorna todos los contratos perpetuos de BingX (USDT).
+    Cada item: {symbol, lastPrice, volume24h, ...}
     """
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
-    }
-    # Endpoint público (no requiere firma)
-    url = f"{BASE_URL}/openApi/swap/v2/quote/klines"
-    resp = requests.get(url, params=params, timeout=10)
+    url  = f"{BASE}/openApi/swap/v2/quote/contracts"
+    resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     data = resp.json()
+    contracts = data.get("data", [])
+    # Filtrar solo pares USDT activos
+    return [c for c in contracts if str(c.get("currency","")).upper() == "USDT"
+            or str(c.get("symbol","")).endswith("-USDT")]
 
+
+def get_tickers_all() -> List[Dict]:
+    """Ticker de todos los símbolos (precio, volumen 24h)."""
+    url  = f"{BASE}/openApi/swap/v2/quote/ticker"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    tickers = data.get("data", [])
+    if isinstance(tickers, dict):
+        tickers = [tickers]
+    return tickers
+
+
+def get_top_symbols_by_volume(max_n: int = 30, min_vol: float = 5_000_000) -> List[str]:
+    """
+    Retorna los top N símbolos USDT ordenados por volumen 24h (mayor a menor).
+    Filtra por volumen mínimo para evitar pares ilíquidos.
+    """
+    try:
+        tickers = get_tickers_all()
+    except Exception as e:
+        logger.error("Error obteniendo tickers: %s", e)
+        return []
+
+    usdt = []
+    for t in tickers:
+        sym = t.get("symbol","")
+        if not sym.endswith("-USDT"):
+            continue
+        try:
+            vol = float(t.get("quoteVolume", t.get("volume", 0)))
+            price = float(t.get("lastPrice", t.get("price", 0)))
+            if vol >= min_vol and price > 0:
+                usdt.append((sym, vol))
+        except (ValueError, TypeError):
+            continue
+
+    usdt.sort(key=lambda x: x[1], reverse=True)
+    result = [s for s, _ in usdt[:max_n]]
+    logger.info("Símbolos seleccionados (%d): %s", len(result), result[:10])
+    return result
+
+
+def get_klines(symbol: str, interval: str, limit: int = 110) -> List[Dict]:
+    """Velas históricas. interval: '15' para 15 minutos."""
+    url    = f"{BASE}/openApi/swap/v2/quote/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    resp   = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    data   = resp.json()
     if data.get("code") not in (0, "0", None):
-        raise RuntimeError(f"BingX klines error: {data}")
-
+        raise RuntimeError(f"klines error: {data}")
     candles = []
-    for item in data.get("data", []):
-        candles.append({
-            "timestamp": item[0],
-            "open":      float(item[1]),
-            "high":      float(item[2]),
-            "low":       float(item[3]),
-            "close":     float(item[4]),
-            "volume":    float(item[5]),
-        })
-
-    # Ordenar por timestamp ascendente (más antigua primero)
-    candles.sort(key=lambda x: x["timestamp"])
+    for item in (data.get("data") or []):
+        try:
+            candles.append({
+                "ts":    int(item[0]),
+                "open":  float(item[1]),
+                "high":  float(item[2]),
+                "low":   float(item[3]),
+                "close": float(item[4]),
+                "vol":   float(item[5]),
+            })
+        except (IndexError, TypeError, ValueError):
+            continue
+    candles.sort(key=lambda x: x["ts"])
     return candles
 
 
 def get_ticker(symbol: str) -> Dict:
-    """Precio actual del símbolo."""
-    url    = f"{BASE_URL}/openApi/swap/v2/quote/ticker"
-    params = {"symbol": symbol}
-    resp   = requests.get(url, params=params, timeout=10)
+    url    = f"{BASE}/openApi/swap/v2/quote/ticker"
+    resp   = requests.get(url, params={"symbol": symbol}, timeout=10)
     resp.raise_for_status()
     return resp.json().get("data", {})
 
 
+# ── Cuenta ─────────────────────────────────────────────────────────────────
+
 def get_balance() -> Dict:
-    """Balance de la cuenta de futuros."""
-    data = _signed_request("GET", "/openApi/swap/v2/user/balance")
-    return data.get("data", {})
+    data = _req("GET", "/openApi/swap/v2/user/balance")
+    balances = data.get("data", {})
+    # Buscar balance USDT
+    if isinstance(balances, list):
+        for b in balances:
+            if b.get("asset","").upper() == "USDT":
+                return b
+        return balances[0] if balances else {}
+    return balances
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Gestión de posiciones y órdenes
-# ─────────────────────────────────────────────────────────────────────────────
-
-def set_leverage(symbol: str, leverage: int) -> Dict:
-    """Establece el apalancamiento para el símbolo."""
-    data = _signed_request(
-        "POST",
-        "/openApi/swap/v2/trade/leverage",
-        body={"symbol": symbol, "side": "LONG",  "leverage": leverage},
-    )
-    _signed_request(
-        "POST",
-        "/openApi/swap/v2/trade/leverage",
-        body={"symbol": symbol, "side": "SHORT", "leverage": leverage},
-    )
-    return data
-
-
-def get_open_positions(symbol: str) -> list:
-    """Posiciones abiertas para el símbolo."""
-    data = _signed_request(
-        "GET",
-        "/openApi/swap/v2/user/positions",
-        params={"symbol": symbol},
-    )
+def get_open_positions(symbol: str = None) -> List[Dict]:
+    params = {}
+    if symbol:
+        params["symbol"] = symbol
+    data = _req("GET", "/openApi/swap/v2/user/positions", params=params)
     positions = data.get("data", [])
-    # Filtrar posiciones con cantidad > 0
-    return [p for p in positions if float(p.get("positionAmt", 0)) != 0]
+    return [p for p in positions if abs(float(p.get("positionAmt", 0))) > 0]
 
 
-def get_open_orders(symbol: str) -> list:
-    """Órdenes abiertas (pendientes)."""
-    data = _signed_request(
-        "GET",
-        "/openApi/swap/v2/trade/openOrders",
-        params={"symbol": symbol},
-    )
-    return data.get("data", {}).get("orders", [])
+def get_all_open_positions() -> List[Dict]:
+    return get_open_positions()
+
+
+# ── Trading ────────────────────────────────────────────────────────────────
+
+def set_leverage(symbol: str, leverage: int) -> None:
+    for side in ("LONG", "SHORT"):
+        try:
+            _req("POST", "/openApi/swap/v2/trade/leverage",
+                 body={"symbol": symbol, "side": side, "leverage": leverage})
+        except Exception as e:
+            logger.debug("set_leverage %s %s: %s", symbol, side, e)
 
 
 def place_market_order(
     symbol:   str,
-    side:     str,      # "BUY" | "SELL"
+    side:     str,       # "BUY" | "SELL"
     quantity: float,
     tp_price: float,
     sl_price: float,
-    position_side: str = "BOTH",  # "BOTH" | "LONG" | "SHORT"
 ) -> Dict:
-    """
-    Abre una orden de mercado con TP y SL automáticos.
-    """
     body = {
         "symbol":       symbol,
         "side":         side,
-        "positionSide": position_side,
+        "positionSide": "BOTH",
         "type":         "MARKET",
         "quantity":     str(round(quantity, 6)),
-        "takeProfit":   json.dumps({
-            "type":       "TAKE_PROFIT_MARKET",
-            "stopPrice":  str(tp_price),
+        "takeProfit": json.dumps({
+            "type":        "TAKE_PROFIT_MARKET",
+            "stopPrice":   str(round(tp_price, 6)),
             "workingType": "MARK_PRICE",
         }),
         "stopLoss": json.dumps({
-            "type":       "STOP_MARKET",
-            "stopPrice":  str(sl_price),
+            "type":        "STOP_MARKET",
+            "stopPrice":   str(round(sl_price, 6)),
             "workingType": "MARK_PRICE",
         }),
     }
-    logger.info("Colocando orden: %s", json.dumps(body))
-    data = _signed_request("POST", "/openApi/swap/v2/trade/order", body=body)
+    data = _req("POST", "/openApi/swap/v2/trade/order", body=body)
     return data.get("data", {})
 
 
-def close_position(symbol: str, position_side: str = "BOTH") -> Dict:
-    """Cierra la posición abierta para el símbolo."""
-    data = _signed_request(
-        "POST",
-        "/openApi/swap/v2/trade/closePosition",
-        body={"symbol": symbol, "positionSide": position_side},
-    )
+def close_position_market(symbol: str) -> Dict:
+    """Cierra toda la posición abierta en un símbolo a mercado."""
+    positions = get_open_positions(symbol)
+    if not positions:
+        return {}
+    pos   = positions[0]
+    amt   = float(pos.get("positionAmt", 0))
+    side  = "SELL" if amt > 0 else "BUY"
+    body  = {
+        "symbol":       symbol,
+        "side":         side,
+        "positionSide": "BOTH",
+        "type":         "MARKET",
+        "quantity":     str(abs(round(amt, 6))),
+    }
+    data = _req("POST", "/openApi/swap/v2/trade/order", body=body)
     return data.get("data", {})
 
 
-def cancel_all_orders(symbol: str) -> Dict:
-    """Cancela todas las órdenes abiertas del símbolo."""
-    data = _signed_request(
-        "DELETE",
-        "/openApi/swap/v2/trade/allOpenOrders",
-        params={"symbol": symbol},
-    )
-    return data.get("data", {})
+# ── Historial ──────────────────────────────────────────────────────────────
+
+def get_closed_orders(symbol: str, limit: int = 10) -> List[Dict]:
+    try:
+        data = _req("GET", "/openApi/swap/v2/trade/allFillOrders",
+                    params={"symbol": symbol, "limit": limit})
+        return data.get("data", {}).get("fill_orders", [])
+    except Exception:
+        return []
 
 
-def get_trade_history(symbol: str, limit: int = 20) -> list:
-    """Historial de operaciones cerradas."""
-    data = _signed_request(
-        "GET",
-        "/openApi/swap/v2/trade/allFillOrders",
-        params={"symbol": symbol, "limit": limit},
-    )
-    return data.get("data", {}).get("fill_orders", [])
+# ── Utilidades ─────────────────────────────────────────────────────────────
+
+def pip_size(symbol: str) -> float:
+    """Valor de 1 pip según el símbolo."""
+    s = symbol.upper()
+    if "BTC"  in s: return 1.0
+    if "ETH"  in s: return 0.1
+    if "BNB"  in s: return 0.01
+    if "SOL"  in s: return 0.01
+    if "XRP"  in s: return 0.0001
+    if "DOGE" in s: return 0.00001
+    if "PEPE" in s: return 0.0000001
+    return 0.0001  # default
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilidades
-# ─────────────────────────────────────────────────────────────────────────────
-
-def calculate_quantity(capital_usdt: float, price: float, leverage: int) -> float:
-    """
-    Calcula la cantidad de contratos a abrir.
-    cantidad = (capital × leverage) / precio
-    """
-    notional = capital_usdt * leverage
-    return notional / price
-
-
-def pip_value(symbol: str) -> float:
-    """
-    Retorna el valor de 1 pip para el símbolo.
-    Para pares de crypto (BTC-USDT), 1 pip = 0.1 USDT (ajusta según el símbolo).
-    Para pares de Forex podría ser 0.0001.
-    """
-    if "BTC" in symbol:
-        return 1.0      # 1 pip = $1 para BTC
-    elif "ETH" in symbol:
-        return 0.1
-    else:
-        return 0.0001   # Forex
+def calc_quantity(capital_usdt: float, price: float, leverage: int) -> float:
+    """Cantidad de contratos = (capital × leverage) / precio."""
+    if price <= 0:
+        return 0
+    return (capital_usdt * leverage) / price
