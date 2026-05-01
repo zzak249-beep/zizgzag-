@@ -1,292 +1,340 @@
-# -*- coding: utf-8 -*-
-"""strategy.py -- Three Step Future-Trend + Double Top/Bottom filter.
-
-PRIMARY SIGNAL:
-  delta_vol = close > open ? +volume : -volume
-  delta1    = sum(delta_vol, period)
-  delta2    = sum(delta_vol, period*2) - delta1
-  LONG  when delta1 crosses ABOVE 0  AND delta2 >= 0
-  SHORT when delta1 crosses BELOW 0  AND delta2 <= 0
-
-DOUBLE TOP / DOUBLE BOTTOM FILTER (from the @mrk_rsifx article):
-  Only take LONG  signals where a Double Bottom is detected (neckline break up)
-  Only take SHORT signals where a Double Top  is detected (neckline break down)
-  This keeps the bot in range-market conditions with high-probability reversals.
-
-Detection algo:
-  - Find two local highs/lows within dt_lookback bars
-  - Both peaks/troughs within dt_tolerance * ATR of each other (similar level)
-  - Neckline = lowest low between two tops / highest high between two bottoms
-  - Confirmation = current price has broken through the neckline
 """
+strategy.py — Lógica principal de la estrategia ZigZag Breakout.
+
+Estrategia de Maki@テクニカル先生 (1M visitas TikTok):
+────────────────────────────────────────────────────
+  1. Calcular ZigZag++ sobre las últimas N velas de 15 minutos
+  2. Identificar último PICO (resistencia) y último VALLE (soporte)
+  3. Si el precio cierra POR ENCIMA de la resistencia → LONG
+  4. Si el precio cierra POR DEBAJO del soporte       → SHORT
+  5. TP = entrada ± 45 pips
+  6. SL = entrada ∓ 30 pips
+  7. Apalancamiento: 10x
+────────────────────────────────────────────────────
+"""
+
 from __future__ import annotations
-import numpy as np
+import logging
 from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+import config
+import bingx_client as bx
+import telegram_notifier as tg
+from zigzag import get_breakout_levels
+
+logger = logging.getLogger(__name__)
 
 
-# ── Data classes ───────────────────────────────────────────────────────────────
-
-@dataclass
-class Signal:
-    symbol:    str
-    side:      str      # "BUY" | "SELL"
-    price:     float
-    sl:        float
-    tp:        float
-    atr:       float
-    delta1:    float
-    delta2:    float
-    delta3:    float
-    pattern:   str = ""  # "DOUBLE_BOTTOM" | "DOUBLE_TOP" | "DELTA_ONLY"
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Estado del bot (en memoria; persiste mientras el proceso esté vivo)
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
-class DoublePattern:
-    kind:      str    # "DOUBLE_TOP" | "DOUBLE_BOTTOM"
-    peak1:     float
-    peak2:     float
-    neckline:  float
-    confirmed: bool
+class BotState:
+    in_trade:       bool  = False
+    direction:      str   = ""          # "LONG" | "SHORT"
+    entry_price:    float = 0.0
+    tp_price:       float = 0.0
+    sl_price:       float = 0.0
+    quantity:       float = 0.0
+    resistance:     float = 0.0
+    support:        float = 0.0
+    last_signal:    str   = ""          # para no repetir misma señal
+    trades_today:   int   = 0
+    wins:           int   = 0
+    losses:         int   = 0
+    total_pnl:      float = 0.0
+    candle_counter: int   = 0
 
 
-# ── Internal helpers ───────────────────────────────────────────────────────────
-
-def _rolling_sum(arr: np.ndarray, n: int) -> np.ndarray:
-    cs  = np.cumsum(arr)
-    out = cs.copy()
-    out[n:] = cs[n:] - cs[:-n]
-    out[:n] = cs[:n]
-    return out
+state = BotState()
 
 
-def _atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int) -> np.ndarray:
-    prev_close = np.roll(closes, 1)
-    prev_close[0] = closes[0]
-    tr = np.maximum(highs - lows,
-         np.maximum(np.abs(highs - prev_close),
-                    np.abs(lows  - prev_close)))
-    atr_arr = np.zeros_like(tr)
-    atr_arr[period - 1] = tr[:period].mean()
-    for i in range(period, len(tr)):
-        atr_arr[i] = (atr_arr[i - 1] * (period - 1) + tr[i]) / period
-    return atr_arr
+# ─────────────────────────────────────────────────────────────────────────────
+# Utilidades
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def _local_highs(arr: np.ndarray, window: int = 5) -> list[int]:
-    peaks = []
-    for i in range(window, len(arr) - window):
-        if arr[i] == arr[i - window:i + window + 1].max():
-            peaks.append(i)
-    return peaks
-
-
-def _local_lows(arr: np.ndarray, window: int = 5) -> list[int]:
-    troughs = []
-    for i in range(window, len(arr) - window):
-        if arr[i] == arr[i - window:i + window + 1].min():
-            troughs.append(i)
-    return troughs
-
-
-# ── Delta computation ──────────────────────────────────────────────────────────
-
-def compute_deltas(
-    opens: np.ndarray, closes: np.ndarray, volumes: np.ndarray, period: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    delta_vol = np.where(closes > opens, volumes, -volumes)
-    d1 = _rolling_sum(delta_vol, period)
-    d2 = _rolling_sum(delta_vol, period * 2) - d1
-    d3 = _rolling_sum(delta_vol, period * 3) - d1 - d2
-    return d1, d2, d3
-
-
-# ── Double Top / Bottom detection ──────────────────────────────────────────────
-
-def detect_double_top(
-    highs:     np.ndarray,
-    lows:      np.ndarray,
-    closes:    np.ndarray,
-    atr:       float,
-    lookback:  int   = 60,
-    tolerance: float = 0.5,
-    pivot_win: int   = 5,
-) -> DoublePattern | None:
-    """
-    Double Top: two peaks at similar price level, neckline broken downward.
-    """
-    safe_n = min(lookback + pivot_win, len(highs) - pivot_win - 1)
-    h_sl = highs[-(safe_n):-pivot_win]
-    l_sl = lows[ -(safe_n):-pivot_win]
-    c_price = closes[-2]
-
-    peaks = _local_highs(h_sl, window=pivot_win)
-    if len(peaks) < 2:
-        return None
-
-    p1_idx, p2_idx = peaks[-2], peaks[-1]
-    p1_val = h_sl[p1_idx]
-    p2_val = h_sl[p2_idx]
-
-    if abs(p1_val - p2_val) > tolerance * atr:
-        return None
-    if p2_idx <= p1_idx:
-        return None
-
-    neckline = float(l_sl[p1_idx:p2_idx + 1].min())
-    confirmed = c_price < neckline
-
-    return DoublePattern(
-        kind="DOUBLE_TOP",
-        peak1=p1_val, peak2=p2_val,
-        neckline=neckline,
-        confirmed=confirmed,
-    )
-
-
-def detect_double_bottom(
-    highs:     np.ndarray,
-    lows:      np.ndarray,
-    closes:    np.ndarray,
-    atr:       float,
-    lookback:  int   = 60,
-    tolerance: float = 0.5,
-    pivot_win: int   = 5,
-) -> DoublePattern | None:
-    """
-    Double Bottom: two troughs at similar price level, neckline broken upward.
-    """
-    safe_n = min(lookback + pivot_win, len(lows) - pivot_win - 1)
-    h_sl = highs[-(safe_n):-pivot_win]
-    l_sl = lows[ -(safe_n):-pivot_win]
-    c_price = closes[-2]
-
-    troughs = _local_lows(l_sl, window=pivot_win)
-    if len(troughs) < 2:
-        return None
-
-    t1_idx, t2_idx = troughs[-2], troughs[-1]
-    t1_val = l_sl[t1_idx]
-    t2_val = l_sl[t2_idx]
-
-    if abs(t1_val - t2_val) > tolerance * atr:
-        return None
-    if t2_idx <= t1_idx:
-        return None
-
-    neckline = float(h_sl[t1_idx:t2_idx + 1].max())
-    confirmed = c_price > neckline
-
-    return DoublePattern(
-        kind="DOUBLE_BOTTOM",
-        peak1=t1_val, peak2=t2_val,
-        neckline=neckline,
-        confirmed=confirmed,
-    )
-
-
-# ── Main signal function ───────────────────────────────────────────────────────
-
-def get_signal(
-    ohlcv:           dict,
-    symbol:          str,
-    period:          int   = 25,
-    atr_period:      int   = 14,
-    atr_mult:        float = 2.0,
-    rr:              float = 2.0,
-    dt_lookback:     int   = 60,
-    dt_tolerance:    float = 0.5,
-    dt_pivot_win:    int   = 5,
-    require_pattern: bool  = True,
-) -> Signal | None:
-    """
-    Signal = Three Step delta cross + confirmed Double Top/Bottom (when require_pattern=True).
-    Set REQUIRE_PATTERN=false in env to use delta signal only.
-    """
-    opens   = ohlcv["open"]
-    highs   = ohlcv["high"]
-    lows    = ohlcv["low"]
-    closes  = ohlcv["close"]
-    volumes = ohlcv["volume"]
-
-    min_bars = period * 3 + atr_period + dt_lookback + 15
-    if len(closes) < min_bars:
-        return None
-
-    delta1, delta2, _ = compute_deltas(opens, closes, volumes, period)
-    atr_arr = _atr(highs, lows, closes, atr_period)
-
-    d1_prev = delta1[-3]
-    d1_curr = delta1[-2]
-    d2_curr = delta2[-2]
-    atr_val = atr_arr[-2]
-    price   = closes[-2]
-
-    if atr_val <= 0 or price <= 0:
-        return None
-
-    sl_dist = atr_val * atr_mult
-    tp_dist = sl_dist * rr
-
-    long_delta  = (d1_prev <= 0 < d1_curr) and (d2_curr >= 0)
-    short_delta = (d1_prev >= 0 > d1_curr) and (d2_curr <= 0)
-
-    if not long_delta and not short_delta:
-        return None
-
-    # ── Double pattern filter ─────────────────────────────────────────────
-    pattern_name = "DELTA_ONLY"
-
-    if require_pattern:
-        if long_delta:
-            db = detect_double_bottom(
-                highs, lows, closes, atr_val,
-                lookback=dt_lookback, tolerance=dt_tolerance, pivot_win=dt_pivot_win,
-            )
-            if db is None or not db.confirmed:
-                return None
-            pattern_name = "DOUBLE_BOTTOM"
-
-        else:  # short_delta
-            dt = detect_double_top(
-                highs, lows, closes, atr_val,
-                lookback=dt_lookback, tolerance=dt_tolerance, pivot_win=dt_pivot_win,
-            )
-            if dt is None or not dt.confirmed:
-                return None
-            pattern_name = "DOUBLE_TOP"
-
-    # ── Build signal ──────────────────────────────────────────────────────
-    if long_delta:
-        return Signal(
-            symbol=symbol, side="BUY", price=price,
-            sl=round(price - sl_dist, 8),
-            tp=round(price + tp_dist, 8),
-            atr=atr_val, delta1=d1_curr, delta2=d2_curr, delta3=0,
-            pattern=pattern_name,
-        )
+def _pip_size() -> float:
+    """Tamaño de 1 pip para el símbolo configurado."""
+    sym = config.SYMBOL
+    if "BTC" in sym:
+        return 1.0
+    elif "ETH" in sym:
+        return 0.1
+    elif "XRP" in sym or "ADA" in sym or "DOGE" in sym:
+        return 0.00001
     else:
-        return Signal(
-            symbol=symbol, side="SELL", price=price,
-            sl=round(price + sl_dist, 8),
-            tp=round(price - tp_dist, 8),
-            atr=atr_val, delta1=d1_curr, delta2=d2_curr, delta3=0,
-            pattern=pattern_name,
+        return 0.0001   # Forex / otros
+
+
+def _tp_price(entry: float, direction: str) -> float:
+    pips = config.TP_PIPS * _pip_size()
+    return entry + pips if direction == "LONG" else entry - pips
+
+
+def _sl_price(entry: float, direction: str) -> float:
+    pips = config.SL_PIPS * _pip_size()
+    return entry - pips if direction == "LONG" else entry + pips
+
+
+def _is_trading_hours() -> bool:
+    """Verifica si estamos dentro del horario de trading permitido."""
+    hour = datetime.utcnow().hour
+    return config.TRADE_START_HOUR <= hour <= config.TRADE_END_HOUR
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Verificación de cierre de posición (TP/SL alcanzado)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_position_closed() -> None:
+    """
+    Comprueba si la posición se ha cerrado (TP o SL alcanzado).
+    BingX cierra la posición automáticamente; aquí detectamos el cierre
+    y enviamos la notificación con P&L.
+    """
+    if not state.in_trade:
+        return
+
+    try:
+        positions = bx.get_open_positions(config.SYMBOL)
+        still_open = any(
+            float(p.get("positionAmt", 0)) != 0 for p in positions
         )
 
+        if not still_open:
+            # Posición cerrada — calcular P&L aproximado
+            ticker     = bx.get_ticker(config.SYMBOL)
+            exit_price = float(ticker.get("lastPrice", state.entry_price))
 
-# ── Trailing exit helper ───────────────────────────────────────────────────────
+            if state.direction == "LONG":
+                pnl = (exit_price - state.entry_price) * state.quantity * config.LEVERAGE
+            else:
+                pnl = (state.entry_price - exit_price) * state.quantity * config.LEVERAGE
 
-def delta1_flipped(ohlcv: dict, period: int, trade_side: str) -> bool:
-    """Return True when delta1 flips against the open trade (trailing exit signal)."""
-    opens   = ohlcv["open"]
-    closes  = ohlcv["close"]
-    volumes = ohlcv["volume"]
-    if len(closes) < period * 3 + 5:
-        return False
-    delta1, _, _ = compute_deltas(opens, closes, volumes, period)
-    curr = delta1[-2]
-    if trade_side == "BUY"  and curr < 0:
-        return True
-    if trade_side == "SELL" and curr > 0:
-        return True
-    return False
+            # Determinar motivo
+            if state.direction == "LONG":
+                if exit_price >= state.tp_price * 0.999:
+                    reason = "✅ Take Profit"
+                    state.wins += 1
+                else:
+                    reason = "🛑 Stop Loss"
+                    state.losses += 1
+            else:
+                if exit_price <= state.tp_price * 1.001:
+                    reason = "✅ Take Profit"
+                    state.wins += 1
+                else:
+                    reason = "🛑 Stop Loss"
+                    state.losses += 1
+
+            state.total_pnl += pnl
+
+            tg.send_order_closed(
+                direction  = state.direction,
+                symbol     = config.SYMBOL,
+                entry      = state.entry_price,
+                exit_price = exit_price,
+                pnl        = pnl,
+                reason     = reason,
+            )
+
+            logger.info(
+                "Posición cerrada | %s | Entrada: %.4f | Salida: %.4f | P&L: %.2f USDT | %s",
+                state.direction, state.entry_price, exit_price, pnl, reason,
+            )
+
+            # Resetear estado
+            state.in_trade    = False
+            state.direction   = ""
+            state.entry_price = 0.0
+            state.last_signal = ""
+
+    except Exception as e:
+        logger.error("Error comprobando posición: %s", e)
+        tg.send_error(f"check_position_closed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Apertura de trade
+# ─────────────────────────────────────────────────────────────────────────────
+
+def open_trade(direction: str, current_price: float) -> None:
+    """Abre una posición en BingX con TP y SL automáticos."""
+    try:
+        entry = current_price
+        tp    = _tp_price(entry, direction)
+        sl    = _sl_price(entry, direction)
+        qty   = bx.calculate_quantity(config.CAPITAL_PER_TRADE, entry, config.LEVERAGE)
+
+        side  = "BUY" if direction == "LONG" else "SELL"
+
+        order = bx.place_market_order(
+            symbol   = config.SYMBOL,
+            side     = side,
+            quantity = qty,
+            tp_price = round(tp, 4),
+            sl_price = round(sl, 4),
+        )
+
+        # Guardar estado
+        state.in_trade    = True
+        state.direction   = direction
+        state.entry_price = entry
+        state.tp_price    = tp
+        state.sl_price    = sl
+        state.quantity    = qty
+        state.trades_today += 1
+
+        tg.send_order_placed(
+            direction = direction,
+            symbol    = config.SYMBOL,
+            entry     = entry,
+            tp        = tp,
+            sl        = sl,
+            quantity  = qty,
+            leverage  = config.LEVERAGE,
+            capital   = config.CAPITAL_PER_TRADE,
+        )
+
+        logger.info(
+            "Trade abierto | %s | Entrada: %.4f | TP: %.4f | SL: %.4f | Qty: %.4f",
+            direction, entry, tp, sl, qty,
+        )
+
+    except Exception as e:
+        logger.error("Error abriendo trade: %s", e)
+        tg.send_error(f"open_trade: {e}")
+        state.in_trade = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ciclo principal de estrategia
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_strategy() -> None:
+    """
+    Se ejecuta al cierre de cada vela de 15 minutos.
+
+    Flujo:
+      1. Verificar si hay posición abierta (¿se cerró por TP/SL?)
+      2. Si no hay posición, buscar señal de breakout
+      3. Si hay señal, abrir trade
+    """
+    state.candle_counter += 1
+    logger.info("─── Tick #%d ─── %s", state.candle_counter, datetime.utcnow().isoformat())
+
+    # ── 1. Comprobar si la posición activa se cerró ──────────────────────
+    check_position_closed()
+
+    if not _is_trading_hours():
+        logger.info("Fuera de horario de trading. Saltando.")
+        return
+
+    # ── 2. No operar si ya estamos en posición ───────────────────────────
+    if state.in_trade:
+        logger.info(
+            "Posición activa: %s | Entrada: %.4f | TP: %.4f | SL: %.4f",
+            state.direction, state.entry_price, state.tp_price, state.sl_price,
+        )
+        return
+
+    # ── 3. Obtener velas y calcular ZigZag ───────────────────────────────
+    try:
+        candles = bx.get_klines(
+            symbol   = config.SYMBOL,
+            interval = config.BINGX_INTERVAL,
+            limit    = config.ZZ_LOOKBACK + 10,
+        )
+    except Exception as e:
+        logger.error("Error obteniendo velas: %s", e)
+        tg.send_error(f"get_klines: {e}")
+        return
+
+    if len(candles) < config.ZZ_LOOKBACK:
+        logger.warning("Pocas velas disponibles: %d", len(candles))
+        return
+
+    highs  = [c["high"]  for c in candles]
+    lows   = [c["low"]   for c in candles]
+    closes = [c["close"] for c in candles]
+
+    resistance, support = get_breakout_levels(
+        highs     = highs,
+        lows      = lows,
+        depth     = config.ZZ_DEPTH,
+        deviation = config.ZZ_DEVIATION,
+        backstep  = config.ZZ_BACKSTEP,
+    )
+
+    if resistance is None or support is None:
+        logger.warning("ZigZag no encontró niveles suficientes. Esperando más datos.")
+        return
+
+    current_close = closes[-1]
+    current_price = current_close
+
+    state.resistance = resistance
+    state.support    = support
+
+    logger.info(
+        "ZigZag | Resistencia: %.4f | Soporte: %.4f | Precio: %.4f",
+        resistance, support, current_price,
+    )
+
+    # Enviar niveles cada 8 velas (~2 horas) para no saturar Telegram
+    if state.candle_counter % 8 == 0:
+        tg.send_zigzag_levels(config.SYMBOL, resistance, support, current_price)
+
+    # ── 4. Detectar breakout ─────────────────────────────────────────────
+    signal = ""
+
+    if current_close > resistance:
+        signal = "LONG"
+    elif current_close < support:
+        signal = "SHORT"
+
+    if not signal:
+        logger.info("Sin señal. Precio dentro del rango ZigZag.")
+        return
+
+    # Evitar entrar dos veces seguidas con la misma señal en el mismo nivel
+    signal_id = f"{signal}_{resistance:.4f}_{support:.4f}"
+    if signal_id == state.last_signal:
+        logger.info("Señal duplicada ignorada: %s", signal_id)
+        return
+
+    state.last_signal = signal_id
+
+    logger.info("¡SEÑAL DETECTADA! %s | Precio: %.4f", signal, current_price)
+
+    tg.send_signal_detected(
+        direction  = signal,
+        symbol     = config.SYMBOL,
+        price      = current_price,
+        resistance = resistance,
+        support    = support,
+    )
+
+    # ── 5. Configurar leverage y abrir trade ─────────────────────────────
+    try:
+        bx.set_leverage(config.SYMBOL, config.LEVERAGE)
+    except Exception as e:
+        logger.warning("No se pudo establecer leverage (puede ya estar configurado): %s", e)
+
+    open_trade(direction=signal, current_price=current_price)
+
+
+def get_stats_summary() -> str:
+    """Resumen de estadísticas del bot para reporte diario."""
+    winrate = (state.wins / (state.wins + state.losses) * 100) if (state.wins + state.losses) > 0 else 0
+    return (
+        f"📊 <b>Estadísticas del bot</b>\n"
+        f"Trades hoy:  {state.trades_today}\n"
+        f"Wins:        {state.wins}\n"
+        f"Losses:      {state.losses}\n"
+        f"Win rate:    {winrate:.1f}%\n"
+        f"P&L total:   {state.total_pnl:+.2f} USDT\n"
+    )
