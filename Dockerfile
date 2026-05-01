@@ -5,7 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar el código fuente (carpeta src/)
-COPY src/ ./src/
+COPY bot.py bingx.py strategy.py telegram.py ./
 
-CMD ["python", "src/bot.py"]
+CMD ["python", "bot.py"]
