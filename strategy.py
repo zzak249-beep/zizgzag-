@@ -1,265 +1,176 @@
 """
-strategy.py — Estrategia ZigZag Breakout multi-símbolo.
-
-Por cada símbolo activo:
-  1. Calcular ZigZag++ → obtener resistencia y soporte
-  2. Si precio rompe resistencia → LONG  (TP +45 pips, SL -30 pips, 10x)
-  3. Si precio rompe soporte    → SHORT (TP -45 pips, SL +30 pips, 10x)
-  4. Monitorizar posiciones abiertas → detectar cierre → notificar P&L
+Estrategia Maki v2 — ZigZag + 20MA 4H
+TP dinámico basado en ATR | SL dinámico basado en ATR
+Apalancamiento: 10x
 """
-from __future__ import annotations
-import logging, time
-from dataclasses import dataclass, field
-from datetime import datetime, date
-from typing import Dict, Optional
+from typing import Optional
 
-import config
-import bingx_client as bx
-import telegram_notifier as tg
-from zigzag import get_breakout_levels
+# ── Parámetros de estrategia ──────────────────────────────────────────────────
+PIVOT_BARS   = 5      # velas a cada lado para confirmar pivot
+ATR_PERIOD   = 14     # período ATR para TP/SL dinámicos
+ATR_TP_MULT  = 1.5    # TP = entrada ± ATR * multiplicador
+ATR_SL_MULT  = 1.0    # SL = entrada ∓ ATR * multiplicador
+MIN_ATR_PCT  = 0.003  # ATR mínimo respecto al precio (0.3%) — filtra pares sin movimiento
+MAX_ATR_PCT  = 0.04   # ATR máximo (4%) — filtra pares demasiado volátiles
 
-logger = logging.getLogger(__name__)
-
-
-# ── Posición activa ────────────────────────────────────────────────────────
-
-@dataclass
-class Position:
-    symbol:    str
-    direction: str        # "LONG" | "SHORT"
-    entry:     float
-    tp:        float
-    sl:        float
-    qty:       float
-    opened_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    last_sig:  str = ""   # evitar re-entrada en mismo nivel
+# Fallback fijo si el ATR no está disponible
+TP_PCT_FIXED = 0.0045
+SL_PCT_FIXED = 0.0030
 
 
-# ── Estado global ──────────────────────────────────────────────────────────
+# ── Indicadores ──────────────────────────────────────────────────────────────
 
-positions:    Dict[str, Position] = {}   # symbol → Position
-signal_cache: Dict[str, str]      = {}   # symbol → last signal_id
-stats = {
-    "trades": 0, "wins": 0, "losses": 0,
-    "pnl": 0.0, "day": date.today(),
-}
-
-
-# ── Utilidades ─────────────────────────────────────────────────────────────
-
-def _pip(symbol: str) -> float:
-    return bx.pip_size(symbol)
-
-def _tp(entry: float, direction: str, symbol: str) -> float:
-    p = config.TP_PIPS * _pip(symbol)
-    return entry + p if direction == "LONG" else entry - p
-
-def _sl(entry: float, direction: str, symbol: str) -> float:
-    p = config.SL_PIPS * _pip(symbol)
-    return entry - p if direction == "LONG" else entry + p
-
-def _in_hours() -> bool:
-    h = datetime.utcnow().hour
-    return config.TRADE_START_HOUR <= h <= config.TRADE_END_HOUR
-
-def _reset_daily():
-    today = date.today()
-    if stats["day"] != today:
-        stats.update({"trades":0,"wins":0,"losses":0,"pnl":0.0,"day":today})
+def _sma(values: list[float], period: int) -> list[Optional[float]]:
+    result: list[Optional[float]] = []
+    for i in range(len(values)):
+        if i < period - 1:
+            result.append(None)
+        else:
+            result.append(sum(values[i - period + 1: i + 1]) / period)
+    return result
 
 
-# ── Verificar cierres ──────────────────────────────────────────────────────
+def _atr(candles: list[dict], period: int = ATR_PERIOD) -> Optional[float]:
+    """Average True Range — mide volatilidad real del mercado."""
+    if len(candles) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        h  = candles[i]["h"]
+        l  = candles[i]["l"]
+        pc = candles[i - 1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-period:]) / period
 
-def check_all_closed() -> None:
+
+def _last_pivot_high(highs: list[float]) -> Optional[float]:
+    """Último pivot high confirmado (excluye la vela en formación)."""
+    n = len(highs)
+    for i in range(n - PIVOT_BARS - 2, PIVOT_BARS - 1, -1):
+        h = highs[i]
+        if (
+            all(h > highs[i - j] for j in range(1, PIVOT_BARS + 1))
+            and all(h > highs[i + j] for j in range(1, PIVOT_BARS + 1))
+        ):
+            return h
+    return None
+
+
+def _last_pivot_low(lows: list[float]) -> Optional[float]:
+    """Último pivot low confirmado."""
+    n = len(lows)
+    for i in range(n - PIVOT_BARS - 2, PIVOT_BARS - 1, -1):
+        lo = lows[i]
+        if (
+            all(lo < lows[i - j] for j in range(1, PIVOT_BARS + 1))
+            and all(lo < lows[i + j] for j in range(1, PIVOT_BARS + 1))
+        ):
+            return lo
+    return None
+
+
+# ── Señal principal ──────────────────────────────────────────────────────────
+
+def signal(candles_15m: list[dict], candles_4h: list[dict]) -> Optional[str]:
     """
-    Compara posiciones abiertas en BingX con las que tenemos registradas.
-    Si una posición ya no existe en BingX → fue cerrada (TP/SL) → notificar P&L.
+    Retorna "LONG", "SHORT" o None.
+    Condiciones LONG:
+      1. MA20 4H con pendiente alcista
+      2. Precio sobre MA20 4H
+      3. Ruptura alcista de pivot high en 15m
+      4. Extensión de ruptura < 0.5% (no entrar tarde)
+      5. ATR dentro de rango de volatilidad aceptable
+    Condiciones SHORT: simétricas.
     """
-    if not positions:
-        return
-    try:
-        open_on_exchange = {p["symbol"] for p in bx.get_all_open_positions()}
-    except Exception as e:
-        logger.error("check_all_closed: %s", e)
-        return
+    if len(candles_15m) < PIVOT_BARS * 2 + 5 or len(candles_4h) < 22:
+        return None
 
-    for sym in list(positions.keys()):
-        if sym not in open_on_exchange:
-            pos = positions.pop(sym)
-            _handle_closed(pos)
+    # ── 1. MA20 4H ────────────────────────────────────────────────────────────
+    closes_4h = [c["c"] for c in candles_4h]
+    ma20_vals = _sma(closes_4h, 20)
+    valid_ma  = [v for v in ma20_vals if v is not None]
+    if len(valid_ma) < 3:
+        return None
+
+    slope     = valid_ma[-1] - valid_ma[-3]
+    threshold = valid_ma[-1] * 0.0001  # pendiente mínima del 0.01%
+
+    ma_up   = slope >  threshold
+    ma_down = slope < -threshold
+    if not ma_up and not ma_down:
+        return None  # MA plana
+
+    last_4h_close = closes_4h[-1]
+    above_ma = last_4h_close > valid_ma[-1]
+    below_ma = last_4h_close < valid_ma[-1]
+
+    # ── 2. ATR 15m — filtro de volatilidad ───────────────────────────────────
+    atr   = _atr(candles_15m)
+    price = candles_15m[-2]["c"]
+    if atr is not None:
+        atr_pct = atr / price
+        if atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
+            return None  # demasiado quieto o demasiado volátil
+
+    # ── 3. Pivotes en 15m ─────────────────────────────────────────────────────
+    highs  = [c["h"] for c in candles_15m]
+    lows   = [c["l"] for c in candles_15m]
+    peak   = _last_pivot_high(highs)
+    valley = _last_pivot_low(lows)
+    if peak is None or valley is None:
+        return None
+
+    prev_c = candles_15m[-2]["c"]
+    last_c = candles_15m[-1]["c"]
+
+    # ── LONG ──────────────────────────────────────────────────────────────────
+    if prev_c <= peak < last_c and ma_up and above_ma:
+        ext = (last_c - peak) / peak
+        if ext < 0.005:
+            return "LONG"
+
+    # ── SHORT ─────────────────────────────────────────────────────────────────
+    if prev_c >= valley > last_c and ma_down and below_ma:
+        ext = (valley - last_c) / valley
+        if ext < 0.005:
+            return "SHORT"
+
+    return None
 
 
-def _handle_closed(pos: Position) -> None:
-    """Calcula P&L y notifica cierre de posición."""
-    try:
-        ticker     = bx.get_ticker(pos.symbol)
-        exit_price = float(ticker.get("lastPrice", pos.entry))
-    except Exception:
-        exit_price = pos.entry
+# ── TP / SL dinámicos basados en ATR ────────────────────────────────────────
 
-    if pos.direction == "LONG":
-        pnl    = (exit_price - pos.entry) * pos.qty
-        reason = "✅ Take Profit" if exit_price >= pos.tp * 0.998 else "🛑 Stop Loss"
+def tp_sl(entry: float, side: str, candles_15m: list[dict] | None = None) -> tuple[float, float]:
+    """
+    Calcula TP y SL.
+    Si se pasan las velas usa ATR dinámico; si no, usa porcentajes fijos.
+    """
+    atr = _atr(candles_15m) if candles_15m else None
+
+    if atr:
+        if side == "LONG":
+            tp = entry + atr * ATR_TP_MULT
+            sl = entry - atr * ATR_SL_MULT
+        else:
+            tp = entry - atr * ATR_TP_MULT
+            sl = entry + atr * ATR_SL_MULT
     else:
-        pnl    = (pos.entry - exit_price) * pos.qty
-        reason = "✅ Take Profit" if exit_price <= pos.tp * 1.002 else "🛑 Stop Loss"
+        if side == "LONG":
+            tp = entry * (1 + TP_PCT_FIXED)
+            sl = entry * (1 - SL_PCT_FIXED)
+        else:
+            tp = entry * (1 - TP_PCT_FIXED)
+            sl = entry * (1 + SL_PCT_FIXED)
 
-    if pnl >= 0:
-        stats["wins"] += 1
+    return tp, sl
+
+
+def risk_reward(tp: float, sl: float, entry: float, side: str) -> float:
+    """Calcula ratio reward/risk."""
+    if side == "LONG":
+        reward = tp - entry
+        risk   = entry - sl
     else:
-        stats["losses"] += 1
-    stats["pnl"] += pnl
-
-    tg.order_closed(pos.direction, pos.symbol, pos.entry, exit_price, pnl, reason)
-    logger.info("CERRADA %s %s | entrada %.6g | salida %.6g | P&L %.2f USDT | %s",
-                pos.direction, pos.symbol, pos.entry, exit_price, pnl, reason)
-
-
-# ── Abrir posición ─────────────────────────────────────────────────────────
-
-def open_trade(symbol: str, direction: str, price: float) -> bool:
-    """Abre una posición en BingX con TP y SL automáticos."""
-    try:
-        bx.set_leverage(symbol, config.LEVERAGE)
-        tp  = _tp(price, direction, symbol)
-        sl  = _sl(price, direction, symbol)
-        qty = bx.calc_quantity(config.CAPITAL_PER_TRADE, price, config.LEVERAGE)
-
-        if qty <= 0:
-            logger.warning("Cantidad cero para %s precio %.6g", symbol, price)
-            return False
-
-        side = "BUY" if direction == "LONG" else "SELL"
-        bx.place_market_order(symbol, side, qty, round(tp,8), round(sl,8))
-
-        pos = Position(symbol=symbol, direction=direction,
-                       entry=price, tp=tp, sl=sl, qty=qty)
-        positions[symbol] = pos
-        stats["trades"] += 1
-
-        tg.order_opened(direction, symbol, price, tp, sl, qty, config.CAPITAL_PER_TRADE)
-        logger.info("ABIERTA %s %s | precio %.6g | TP %.6g | SL %.6g | qty %.4f",
-                    direction, symbol, price, tp, sl, qty)
-        return True
-
-    except Exception as e:
-        logger.error("open_trade %s: %s", symbol, e)
-        tg.error(f"No se pudo abrir {symbol}: {e}")
-        return False
-
-
-# ── Escanear un símbolo ────────────────────────────────────────────────────
-
-def scan_symbol(symbol: str) -> str:
-    """
-    Analiza un símbolo. Retorna: 'long' | 'short' | 'none' | 'error'
-    """
-    try:
-        candles = bx.get_klines(symbol, config.BINGX_INTERVAL, config.ZZ_LOOKBACK + 10)
-    except Exception as e:
-        logger.debug("klines %s: %s", symbol, e)
-        return "error"
-
-    if len(candles) < config.ZZ_LOOKBACK:
-        return "none"
-
-    highs  = [c["high"]  for c in candles]
-    lows   = [c["low"]   for c in candles]
-    closes = [c["close"] for c in candles]
-
-    resistance, support = get_breakout_levels(
-        highs, lows, config.ZZ_DEPTH, config.ZZ_DEVIATION, config.ZZ_BACKSTEP
-    )
-    if resistance is None or support is None:
-        return "none"
-
-    price = closes[-1]
-    sig_id = f"{resistance:.8g}_{support:.8g}"
-
-    # Evitar re-entrada en el mismo nivel
-    if signal_cache.get(symbol) == sig_id:
-        return "none"
-
-    if price > resistance:
-        signal_cache[symbol] = sig_id
-        return "long"
-    elif price < support:
-        signal_cache[symbol] = sig_id
-        return "short"
-
-    return "none"
-
-
-# ── Ciclo principal ────────────────────────────────────────────────────────
-
-def run_scan_cycle(symbols: list) -> None:
-    """
-    Ejecuta un ciclo completo: verifica cierres + escanea todos los símbolos.
-    """
-    _reset_daily()
-    logger.info("═══ Ciclo iniciado | %d símbolos | %d posiciones abiertas ═══",
-                len(symbols), len(positions))
-
-    # 1. Comprobar si alguna posición se cerró
-    check_all_closed()
-
-    if not _in_hours():
-        logger.info("Fuera de horario de trading (UTC %dh–%dh).",
-                    config.TRADE_START_HOUR, config.TRADE_END_HOUR)
-        return
-
-    # 2. Escanear símbolos
-    new_signals  = 0
-    skipped      = 0
-    errors       = 0
-
-    for symbol in symbols:
-        # Límite de posiciones simultáneas
-        if len(positions) >= config.MAX_OPEN_POSITIONS:
-            skipped += len(symbols) - symbols.index(symbol)
-            logger.info("Límite de %d posiciones alcanzado.", config.MAX_OPEN_POSITIONS)
-            break
-
-        # Ya tenemos posición abierta en este símbolo
-        if symbol in positions:
-            time.sleep(config.SCAN_DELAY_SEC * 0.5)
-            continue
-
-        signal = scan_symbol(symbol)
-        time.sleep(config.SCAN_DELAY_SEC)   # respetar rate limit
-
-        if signal in ("long", "short"):
-            direction = signal.upper()
-            try:
-                ticker = bx.get_ticker(symbol)
-                price  = float(ticker.get("lastPrice", 0))
-            except Exception:
-                errors += 1
-                continue
-
-            if price <= 0:
-                continue
-
-            # Notificar señal
-            try:
-                candles = bx.get_klines(symbol, config.BINGX_INTERVAL, config.ZZ_LOOKBACK + 10)
-                highs = [c["high"] for c in candles]
-                lows  = [c["low"]  for c in candles]
-                r, s  = get_breakout_levels(highs, lows, config.ZZ_DEPTH,
-                                            config.ZZ_DEVIATION, config.ZZ_BACKSTEP)
-                tg.signal_detected(direction, symbol, price, r or 0, s or 0)
-            except Exception:
-                pass
-
-            if open_trade(symbol, direction, price):
-                new_signals += 1
-
-        elif signal == "error":
-            errors += 1
-
-    logger.info("Ciclo completo | señales: %d | omitidos: %d | errores: %d",
-                new_signals, skipped, errors)
-
-    # Notificar resumen solo si hay actividad o cada 4 ciclos
-    if new_signals > 0 or skipped > 0:
-        tg.scan_summary(len(symbols), new_signals, skipped)
+        reward = entry - tp
+        risk   = sl - entry
+    return reward / risk if risk > 0 else 0.0

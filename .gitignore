@@ -1,33 +1,6 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-env/
-venv/
-.venv/
-*.egg-info/
-dist/
-build/
-
-# Entorno
 .env
-*.env
-
-# Logs
-*.log
-logs/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
+__pycache__/
+*.pyc
+*.pyo
 .DS_Store
-Thumbs.db
-
-# Railway
-.railway/
+/tmp/maki_state.json
