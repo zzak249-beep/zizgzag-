@@ -1,428 +1,275 @@
 # -*- coding: utf-8 -*-
+"""bot.py -- Phantom Edge Bot ELITE v2.0
+ZigZag(5m+15m) + Supertrend(15m) + VWAP + RSI + Engulfing + Session + Correlation
+Analiza TODOS los pares USDT de BingX perpetuos.
 """
-Maki Bot v4 -- ZigZag + 20MA 4H + RSI + Volumen para BingX Futures
-Alineado con indicador Pine Script de TradingView:
-  - Señal en 5m  (entradas más precisas sobre/bajo ruptura)
-  - Filtro MA20 en 4H
-  - Crossover/crossunder fiel al indicador TV
-  - TP/SL automático ATR (2x / 1x)
-  - Notificaciones Telegram con PnL real
-  - Resumen diario a las 00:00 UTC
-  - Estado persistente en disco
-  - Healthcheck HTTP para Railway
-"""
-import asyncio
-import json
-import logging
-import os
-import signal
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
+from __future__ import annotations
+import asyncio, signal, sys
+from collections import Counter
+
+from loguru import logger
 from aiohttp import web
 
-from bingx    import BingXClient
-from strategy import signal as get_signal, tp_sl, risk_reward, get_rsi_value, get_atr_pct
-import telegram as tg
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+from config import cfg
+import client as ex
+from scanner import fetch_universe, get_symbols
+from strategy import get_signal, _in_dead_session
+from pos_manager import (
+    Trade, add_trade, open_symbols, trade_count, is_halted,
+    manage_positions, sync_from_exchange, get_stats, consecutive_losses,
 )
-logger = logging.getLogger("bot")
+import notifier
 
-# ── Config ────────────────────────────────────────────────────────────────────
-API_KEY    = os.environ["BINGX_API_KEY"]
-API_SECRET = os.environ["BINGX_API_SECRET"]
-TG_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHAT    = os.environ["TELEGRAM_CHAT_ID"]
+logger.remove()
+logger.add(sys.stdout, level="INFO",
+    format="<green>{time:HH:mm:ss}</green> | <level>{level: <7}</level> | {message}")
 
-TRADE_USDT   = float(os.environ.get("TRADE_AMOUNT_USDT", "10"))
-MAX_TRADES   = int(os.environ.get("MAX_OPEN_TRADES", "5"))
-SCAN_SEC     = int(os.environ.get("SCAN_INTERVAL_SECONDS", "30"))   # 30s — más reactivo en 5m
-LEVERAGE     = int(os.environ.get("LEVERAGE", "10"))
-COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SECONDS", "300"))
-SCAN_BATCH   = int(os.environ.get("SCAN_BATCH_SIZE", "10"))
-MIN_VOLUME   = float(os.environ.get("MIN_VOLUME_USDT", "500000"))
-MIN_RR       = float(os.environ.get("MIN_RR", "1.5"))
-PORT         = int(os.environ.get("PORT", "8080"))
+_active_symbols: list[str] = []
+_cycle: int = 0
+SYMBOL_REFRESH_CYCLES = 60
 
-# Velas 5m: cuántas cargar. 200 = ~16h, suficiente para pivots + ATR
-CANDLES_5M  = int(os.environ.get("CANDLES_5M", "200"))
-CANDLES_4H  = int(os.environ.get("CANDLES_4H", "50"))
-
-# ── Estado persistente ────────────────────────────────────────────────────────
-STATE_FILE = Path("/tmp/maki_state.json")
-
-
-def _load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
-    return {"trades": {}, "cooldowns": {}, "daily": {}}
-
-
-def _save_state():
-    try:
-        STATE_FILE.write_text(json.dumps({
-            "trades":    open_trades,
-            "cooldowns": cooldowns,
-            "daily":     daily_stats,
-        }, default=str))
-    except Exception as e:
-        logger.warning(f"save_state: {e}")
-
-
-state        = _load_state()
-open_trades: dict = state.get("trades", {})
-cooldowns:   dict = state.get("cooldowns", {})
-daily_stats: dict = state.get("daily", {
-    "date": "", "trades": 0, "wins": 0, "losses": 0,
-    "total_pnl": 0.0, "best": None, "worst": None,
-})
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-async def notify(text: str):
-    await tg.send(TG_TOKEN, TG_CHAT, text)
-
-
-def _in_cooldown(symbol: str) -> bool:
-    return datetime.now(timezone.utc).timestamp() < cooldowns.get(symbol, 0)
-
-
-def _set_cooldown(symbol: str):
-    cooldowns[symbol] = datetime.now(timezone.utc).timestamp() + COOLDOWN_SEC
-
-
-def _reset_daily_if_new_day():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if daily_stats.get("date") != today:
-        daily_stats.update({
-            "date": today, "trades": 0, "wins": 0,
-            "losses": 0, "total_pnl": 0.0,
-            "best": None, "worst": None,
-        })
-
-
-def _record_closed_trade(symbol: str, pnl: float):
-    _reset_daily_if_new_day()
-    daily_stats["trades"] += 1
-    daily_stats["total_pnl"] += pnl
-    if pnl >= 0:
-        daily_stats["wins"] += 1
-        if daily_stats["best"] is None or pnl > daily_stats["best"][1]:
-            daily_stats["best"] = [symbol, pnl]
-    else:
-        daily_stats["losses"] += 1
-        if daily_stats["worst"] is None or pnl < daily_stats["worst"][1]:
-            daily_stats["worst"] = [symbol, pnl]
-    _save_state()
-
-
-# ── Healthcheck ───────────────────────────────────────────────────────────────
 
 async def _health(_: web.Request) -> web.Response:
-    return web.Response(text="OK")
+    stats = get_stats()
+    return web.json_response({
+        "status":        "halted" if stats["halted"] else "ok",
+        "version":       "phantom-elite-2.0",
+        "open_trades":   stats["open"],
+        "daily_pnl":     stats["daily_pnl"],
+        "daily_wins":    stats["daily_wins"],
+        "daily_losses":  stats["daily_losses"],
+        "consec_losses": stats["consec_losses"],
+        "total_symbols": len(_active_symbols),
+        "symbols_open":  list(open_symbols()),
+    })
 
-
-async def start_healthcheck():
-    app    = web.Application()
-    app.router.add_get("/",       _health)
+async def start_health_server() -> None:
+    app = web.Application()
+    app.router.add_get("/", _health)
     app.router.add_get("/health", _health)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    site = web.TCPSite(runner, "0.0.0.0", cfg.health_port)
     await site.start()
-    logger.info(f"Healthcheck en puerto {PORT}")
+    logger.info(f"Health :{cfg.health_port}")
 
 
-# ── Monitor de posiciones abiertas ────────────────────────────────────────────
+async def enter_trade(sig) -> None:
+    if sig.symbol in open_symbols(): return
+    if trade_count() >= cfg.max_positions: return
+    if is_halted(): return
 
-async def monitor(client: BingXClient):
-    """
-    1. Detecta cierres automáticos por BingX (TP/SL ejecutado).
-    2. Red de seguridad manual si no se ejecutó la orden.
-    """
-    if not open_trades:
+    # Escalate min score after consecutive losses
+    min_s = cfg.min_score + 2 if consecutive_losses() >= 3 else cfg.min_score
+    if sig.score < min_s:
+        logger.debug(f"[SKIP] {sig.symbol} score={sig.score}<{min_s}")
         return
 
-    try:
-        real_positions = {p["symbol"]: p for p in await client.get_open_positions()}
-    except Exception:
-        real_positions = {}
+    size   = max(cfg.trade_usdt, 5.0)
+    lev    = cfg.leverage
+    margin = (size / lev) * 1.3
 
-    for symbol, trade in list(open_trades.items()):
-        try:
-            side  = trade["side"]
-            entry = float(trade["entry"])
-            qty   = float(trade["qty"])
-            tp    = float(trade["tp"])
-            sl    = float(trade["sl"])
-            usdt  = float(trade.get("usdt", TRADE_USDT))
-            lev   = int(trade.get("leverage", LEVERAGE))
-
-            # ── Cierre automático detectado (posición ya no existe en BingX) ──
-            if symbol not in real_positions:
-                price = await client.last_price(symbol)
-                if side == "LONG":
-                    pnl_pct = (price - entry) / entry * 100
-                else:
-                    pnl_pct = (entry - price) / entry * 100
-                pnl_usdt = usdt * lev * (pnl_pct / 100)
-                reason   = "TP (auto)" if pnl_usdt >= 0 else "SL (auto)"
-
-                msg = tg.msg_trade_close(symbol, side, entry, price, qty, usdt, lev, reason)
-                logger.info(f"Auto-cerrado {symbol} {side} {reason} pnl={pnl_usdt:+.4f} USDT")
-                await notify(msg)
-                _record_closed_trade(symbol, pnl_usdt)
-                del open_trades[symbol]
-                _set_cooldown(symbol)
-                _save_state()
-                continue
-
-            # ── Red de seguridad manual ───────────────────────────────────────
-            price  = await client.last_price(symbol)
-            hit_tp = price >= tp if side == "LONG" else price <= tp
-            hit_sl = price <= sl if side == "LONG" else price >= sl
-
-            if hit_tp or hit_sl:
-                reason = "TP" if hit_tp else "SL"
-                try:
-                    exit_price = await client.close_position(symbol, side, qty)
-                    await client.cancel_all_orders(symbol)
-                except Exception as e:
-                    logger.warning(f"close_position {symbol}: {e}")
-                    exit_price = price
-
-                if side == "LONG":
-                    pnl_pct = (exit_price - entry) / entry * 100
-                else:
-                    pnl_pct = (entry - exit_price) / entry * 100
-                pnl_usdt = usdt * lev * (pnl_pct / 100)
-
-                msg = tg.msg_trade_close(symbol, side, entry, exit_price, qty, usdt, lev, reason)
-                logger.info(f"Cerrado {symbol} {side} {reason} @ {exit_price:.6f} pnl={pnl_usdt:+.4f}")
-                await notify(msg)
-                _record_closed_trade(symbol, pnl_usdt)
-                del open_trades[symbol]
-                _set_cooldown(symbol)
-                _save_state()
-
-        except Exception as e:
-            logger.warning(f"monitor {symbol}: {e}")
-
-
-# ── Scanner ───────────────────────────────────────────────────────────────────
-
-async def scan_symbol(client: BingXClient, symbol: str) -> bool:
-    if symbol in open_trades or _in_cooldown(symbol):
-        return False
-    if len(open_trades) >= MAX_TRADES:
-        return False
-
-    try:
-        # 5m para señal (más velas para tener pivots bien formados), 4H para filtro MA
-        c5m, c4h = await asyncio.gather(
-            client.klines(symbol, "5m",  limit=CANDLES_5M),
-            client.klines(symbol, "4h",  limit=CANDLES_4H),
-        )
-
-        if len(c5m) < 20 or len(c4h) < 22:
-            return False
-
-        sig = get_signal(c5m, c4h)
-        if sig is None:
-            return False
-
-        # Precio de entrada: última vela 5m cerrada
-        entry  = c5m[-2]["c"]
-        tp, sl = tp_sl(entry, sig, c5m)
-
-        rr = risk_reward(tp, sl, entry, sig)
-        if rr < MIN_RR:
-            logger.debug(f"{symbol} {sig}: R/R={rr:.2f} < {MIN_RR}, skip")
-            return False
-
-        atr_pct = get_atr_pct(c5m)
-        rsi_val = get_rsi_value(c5m)
-
-        order_id, qty, real_entry = await client.open_order(
-            symbol, sig, TRADE_USDT, tp, sl, leverage=LEVERAGE,
-        )
-
-        # Recalcular TP/SL con el precio real de ejecución
-        tp, sl = tp_sl(real_entry, sig, c5m)
-
-        open_trades[symbol] = {
-            "side": sig, "entry": real_entry, "tp": tp, "sl": sl,
-            "qty": qty, "order_id": order_id,
-            "opened_at": datetime.now(timezone.utc).isoformat(),
-            "usdt": TRADE_USDT, "leverage": LEVERAGE,
-        }
-        _save_state()
-
-        msg = tg.msg_trade_open(
-            symbol, sig, real_entry, tp, sl, qty,
-            TRADE_USDT, LEVERAGE, rr, atr_pct, rsi_val,
-        )
-        logger.info(f"Abierto: {symbol} {sig} @ {real_entry:.6f} R/R={rr:.2f}")
-        await notify(msg)
-        return True
-
-    except Exception as e:
-        logger.warning(f"scan {symbol}: {e}")
-        return False
-
-
-async def scan_all(client: BingXClient, symbols: list[str]):
-    if len(open_trades) >= MAX_TRADES:
+    bal = await ex.get_balance()
+    if bal < cfg.min_balance_usdt or bal < margin:
+        logger.warning(f"[SKIP] {sig.symbol} balance {bal:.2f} insuficiente")
         return
 
-    total   = len(symbols)
-    scanned = 0
-    opened  = 0
+    if sig.side == "BUY"  and (sig.sl >= sig.price or sig.tp <= sig.price): return
+    if sig.side == "SELL" and (sig.sl <= sig.price or sig.tp >= sig.price): return
+    if abs(sig.price - sig.sl) / sig.price * 100 < 0.08: return
 
-    for i in range(0, total, SCAN_BATCH):
-        if len(open_trades) >= MAX_TRADES:
-            break
-        batch   = symbols[i: i + SCAN_BATCH]
-        results = await asyncio.gather(
-            *[scan_symbol(client, s) for s in batch],
-            return_exceptions=True,
-        )
-        opened  += sum(1 for r in results if r is True)
-        scanned += len(batch)
-        await asyncio.sleep(0.5)   # menos espera entre batches — señales 5m son fugaces
+    await ex.set_leverage(sig.symbol, lev)
+    await asyncio.sleep(0.15)
 
-    logger.info(
-        f"Scan: {scanned}/{total} pares | "
-        f"abiertos={opened} | total pos={len(open_trades)}"
+    resp = await ex.place_market_order(
+        symbol=sig.symbol, side=sig.side,
+        size_usdt=size, sl=sig.sl, tp=sig.tp,
+    )
+    code = resp.get("code", -1)
+    if code not in (0, 200, None):
+        logger.warning(f"[FAIL] {sig.symbol} code={code} {resp.get('msg','')}")
+        return
+
+    od  = resp.get("data", {})
+    if isinstance(od, dict): od = od.get("order", od)
+    qty = float(od.get("executedQty", 0) or od.get("origQty", 0))
+    if qty <= 0: qty = (size * lev) / sig.price
+
+    add_trade(Trade(
+        symbol=sig.symbol, side=sig.side,
+        entry=sig.price, sl=sig.sl, tp=sig.tp,
+        atr=sig.atr_5m, size_usdt=size, leverage=lev,
+        qty=qty, score=sig.score, vol_ratio=sig.vol_ratio,
+        delta1=sig.zz_high, delta2=sig.zz_low,
+        order_id=str(od.get("orderId", "")),
+        bot_opened=True,
+    ))
+
+    logger.success(
+        f"[ENTRADA] {sig.symbol} {sig.side} @ {sig.price:.6f}\n"
+        f"  SL={sig.sl:.6f} TP={sig.tp:.6f}\n"
+        f"  ZZ5 H={sig.zz_high:.4f} L={sig.zz_low:.4f} trend={sig.zz_trend}\n"
+        f"  ST={'BULL' if sig.st_bull_15m else 'BEAR'} | VWAP={sig.vwap:.4f} | "
+        f"RSI={sig.rsi:.1f} | vol={sig.vol_ratio:.1f}x\n"
+        f"  ATR_regime={sig.atr_regime} | score={sig.score}/12"
+    )
+    await notifier.notify_entry(
+        symbol=sig.symbol, side=sig.side, price=sig.price,
+        sl=sig.sl, tp=sig.tp, size_usdt=size, leverage=lev,
+        qty=qty, score=sig.score,
+        delta1=sig.zz_high, delta2=sig.zz_low, vol_ratio=sig.vol_ratio,
     )
 
 
-# ── Resumen diario ────────────────────────────────────────────────────────────
+async def scan_cycle(ohlcv_map: dict) -> None:
+    signals:    list = []
+    rejections: Counter = Counter()
+    open_syms = open_symbols()
 
-_last_summary_hour = -1
+    for sym, data in ohlcv_map.items():
+        if sym in open_syms: continue
 
-
-async def maybe_send_daily_summary():
-    global _last_summary_hour
-    hour = datetime.now(timezone.utc).hour
-    if hour == 0 and _last_summary_hour != 0:
-        _last_summary_hour = 0
-        _reset_daily_if_new_day()
-        if daily_stats.get("trades", 0) > 0:
-            await notify(tg.msg_daily_summary(daily_stats))
-    elif hour != 0:
-        _last_summary_hour = hour
-
-
-# ── Main loop ─────────────────────────────────────────────────────────────────
-
-async def main():
-    await start_healthcheck()
-
-    client = BingXClient(API_KEY, API_SECRET)
-
-    logger.info("Cargando metadatos de contratos...")
-    try:
-        await client.load_contracts_cache()
-    except Exception as e:
-        logger.warning(f"load_contracts_cache: {e}")
-
-    try:
-        balance = await client.balance_usdt()
-        logger.info(f"Balance USDT: {balance:.2f}")
-    except Exception as e:
-        logger.critical(f"Error balance: {e}")
-        await notify(f"<b>Error al iniciar Maki Bot v4</b>\n<code>{e}</code>")
-        await client.close()
-        return
-
-    try:
-        ticker_map  = await client.ticker_map()
-        symbols_raw = [
-            sym for sym, t in ticker_map.items()
-            if sym.endswith("-USDT")
-            and float(t.get("quoteVolume", 0) or 0) >= MIN_VOLUME
-        ]
-        symbols_raw.sort(
-            key=lambda s: float(ticker_map[s].get("quoteVolume", 0) or 0),
-            reverse=True,
+        sig, reason = get_signal(
+            ohlcv_5m      = data.get(cfg.timeframe,      {}),
+            ohlcv_15m     = data.get(cfg.timeframe_slow, None),
+            ohlcv_1h      = None,
+            symbol        = sym,
+            open_syms     = open_syms,
+            atr_period    = cfg.atr_period,
+            atr_mult      = cfg.atr_mult,
+            rr             = cfg.rr,
+            min_vol_mult  = cfg.min_vol_mult,
+            st_period     = cfg.st_period,
+            st_mult       = cfg.st_mult,
+            rsi_period    = cfg.rsi_period,
+            min_atr_pct   = cfg.min_atr_pct,
+            min_score     = cfg.min_score,
+            zz_deviation  = cfg.zz_deviation,
+            zz15_deviation = cfg.zz15_deviation,
         )
-    except Exception as e:
-        logger.critical(f"Error al obtener pares: {e}")
-        await notify(f"<b>Error pares</b>\n<code>{e}</code>")
-        await client.close()
-        return
+        if sig:
+            signals.append(sig)
+        else:
+            bucket = reason.split("_")[0].split("=")[0].split(" ")[0]
+            rejections[bucket] += 1
 
-    symbols = symbols_raw
-    logger.info(f"Pares con volumen >= {MIN_VOLUME:,.0f} USDT: {len(symbols)}")
+    scanned = len(ohlcv_map) - len(open_syms)
+    logger.info(
+        f"[ANALISIS] {scanned} pares | {len(signals)} senales | "
+        f"rechazos top: {dict(rejections.most_common(6))}"
+    )
 
-    if open_trades:
-        logger.info(f"Trades recuperados del estado: {list(open_trades.keys())}")
+    if not signals: return
 
-    await notify(tg.msg_bot_start(balance, len(symbols), TRADE_USDT, LEVERAGE, MAX_TRADES))
+    signals.sort(key=lambda s: s.score, reverse=True)
+    logger.info("[TOP SENALES ELITE]")
+    for s in signals[:6]:
+        logger.info(
+            f"  {s.symbol:16s} {s.side:4s} {s.score:2d}/12 "
+            f"trend={s.zz_trend:4s} ST={'B' if s.st_bull_15m else 'S'} "
+            f"RSI={s.rsi:4.0f} vol={s.vol_ratio:.1f}x "
+            f"atr={s.atr_regime} VWAP={'OK' if (s.side=='BUY') == (s.price > s.vwap) else 'NO'}"
+        )
 
-    loop       = asyncio.get_running_loop()
+    for sig in signals:
+        if trade_count() >= cfg.max_positions: break
+        await enter_trade(sig)
+
+
+async def main_loop() -> None:
+    global _active_symbols, _cycle
+
+    await start_health_server()
+    _active_symbols = await get_symbols(cfg.symbols_raw)
+
+    logger.info("=" * 70)
+    logger.info("  PHANTOM EDGE BOT ELITE v2.0")
+    logger.info("  ZigZag(5m+15m) + Supertrend(15m) + VWAP + RSI")
+    logger.info("  + Engulfing/Pinbar + Session + Correlation Filter")
+    logger.info("  SALIDA: 25%@1R + 25%@2R + Trail (ST5/ZZ/RSI)")
+    logger.info(f"  ZZ={cfg.zz_deviation}% ZZ15={cfg.zz15_deviation}% "
+                f"ST({cfg.st_period},{cfg.st_mult})")
+    logger.info(f"  ATRx{cfg.atr_mult} RR1:{cfg.rr} Score≥{cfg.min_score}/12")
+    logger.info(f"  {max(cfg.trade_usdt,5)}USDT x{cfg.leverage} MaxPos={cfg.max_positions}")
+    logger.info(f"  Simbolos: {len(_active_symbols)}")
+    logger.info("=" * 70)
+
+    bal = await ex.get_balance()
+    logger.info(f"  Balance: {bal:.2f} USDT")
+
+    await notifier.test_telegram()
+    await notifier.notify(
+        f"Phantom Edge Bot ELITE v2.0\n"
+        f"ZigZag(5m+15m) + ST(15m) + VWAP + RSI + Engulfing\n"
+        f"Session filter + Correlation filter\n"
+        f"Exit: 25%@1R + 25%@2R + Trail dinamico\n"
+        f"Score min {cfg.min_score}/12 | RR 1:{cfg.rr} | x{cfg.leverage}\n"
+        f"Pares: {len(_active_symbols)} | Balance: {bal:.2f} USDT"
+    )
+
+    await sync_from_exchange()
+
+    loop = asyncio.get_event_loop()
     stop_event = asyncio.Event()
-
-    def _shutdown():
-        logger.info("Apagando bot...")
-        stop_event.set()
-
-    for sig_name in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig_name, _shutdown)
-        except NotImplementedError:
-            pass
-
-    # Refrescar lista de pares cada ~1h
-    symbol_refresh_ticks = 0
-    REFRESH_EVERY = max(1, 3600 // SCAN_SEC)
+    for s in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(s, lambda: stop_event.set())
 
     while not stop_event.is_set():
         try:
-            _reset_daily_if_new_day()
-            await monitor(client)
-            await scan_all(client, symbols)
-            await maybe_send_daily_summary()
+            if is_halted():
+                await asyncio.sleep(60); continue
 
-            symbol_refresh_ticks += 1
-            if symbol_refresh_ticks >= REFRESH_EVERY:
-                symbol_refresh_ticks = 0
-                try:
-                    ticker_map = await client.ticker_map()
-                    symbols = [
-                        sym for sym, t in ticker_map.items()
-                        if sym.endswith("-USDT")
-                        and float(t.get("quoteVolume", 0) or 0) >= MIN_VOLUME
-                    ]
-                    symbols.sort(
-                        key=lambda s: float(ticker_map[s].get("quoteVolume", 0) or 0),
-                        reverse=True,
-                    )
-                    logger.info(f"Pares actualizados: {len(symbols)}")
-                except Exception as e:
-                    logger.warning(f"refresh symbols: {e}")
+            if _cycle > 0 and _cycle % SYMBOL_REFRESH_CYCLES == 0:
+                _active_symbols = await get_symbols(cfg.symbols_raw)
+                logger.info(f"[SYMBOLS] {len(_active_symbols)} pares")
 
+            _cycle += 1
+            t0 = loop.time()
+
+            dead = _in_dead_session()
+            logger.info(
+                f"CICLO {_cycle:04d} | {len(_active_symbols)} pares | "
+                f"open={trade_count()}/{cfg.max_positions} | "
+                f"consec_loss={consecutive_losses()} | "
+                f"{'SESION MUERTA' if dead else 'sesion OK'}"
+            )
+
+            ohlcv_map = await fetch_universe(
+                _active_symbols,
+                tf_5m  = cfg.timeframe,
+                tf_15m = cfg.timeframe_slow,
+                tf_1h  = cfg.timeframe_1h,
+                max_concurrent = cfg.max_concurrent,
+                min_vol_mult   = cfg.min_vol_mult,
+            )
+
+            await manage_positions(ohlcv_map)
+
+            # Skip new entries during dead session (manage still runs)
+            if not dead:
+                await scan_cycle(ohlcv_map)
+            else:
+                logger.info("[DEAD SESSION] Solo gestion de posiciones abiertas")
+
+            elapsed   = loop.time() - t0
+            sleep_for = max(0.0, cfg.scan_interval - elapsed)
+            logger.info(f"Ciclo {elapsed:.1f}s | siguiente en {sleep_for:.0f}s")
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
+            except asyncio.TimeoutError:
+                pass
+
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            logger.error(f"Loop error: {e}", exc_info=True)
-            await notify(tg.msg_error(str(e)))
+            logger.error(f"[ERROR] {e}")
+            await notifier.notify(f"Error: {e}")
+            await asyncio.sleep(30)
 
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=SCAN_SEC)
-        except asyncio.TimeoutError:
-            pass
-
-    await client.close()
-    await notify("<b>Maki Bot v4 detenido.</b>")
+    logger.info("Bot detenido limpiamente")
+    await ex.close_session()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main_loop())
