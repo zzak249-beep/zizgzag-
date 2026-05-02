@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""bot.py -- Phantom Edge Bot ELITE v2.1 -- API Key diagnostic on startup."""
+"""bot.py -- Phantom Edge Bot ELITE v2.2 -- Speed-optimized."""
 from __future__ import annotations
-import asyncio, signal, sys
+import asyncio, signal, sys, time
 from collections import Counter
 
 from loguru import logger
@@ -23,20 +23,23 @@ logger.add(sys.stdout, level="INFO",
 
 _active_symbols: list[str] = []
 _cycle: int = 0
+_cycle_times: list[float] = []
 SYMBOL_REFRESH_CYCLES = 60
 
 
 async def _health(_: web.Request) -> web.Response:
     stats = get_stats()
+    avg_cycle = sum(_cycle_times[-10:]) / len(_cycle_times[-10:]) if _cycle_times else 0
     return web.json_response({
         "status":        "halted" if stats["halted"] else "ok",
-        "version":       "phantom-elite-2.1",
+        "version":       "phantom-elite-2.2",
         "open_trades":   stats["open"],
         "daily_pnl":     stats["daily_pnl"],
         "daily_wins":    stats["daily_wins"],
         "daily_losses":  stats["daily_losses"],
         "total_symbols": len(_active_symbols),
         "symbols_open":  list(open_symbols()),
+        "avg_cycle_s":   round(avg_cycle, 1),
     })
 
 async def start_health_server() -> None:
@@ -50,39 +53,17 @@ async def start_health_server() -> None:
     logger.info(f"Health :{cfg.health_port}")
 
 
-async def _diagnose_api() -> bool:
-    """Test API key + balance on startup. Returns True if OK."""
-    logger.info("=== DIAGNOSTICO API BINGX ===")
-
-    # 1. Test public endpoint (no auth needed)
-    resp = await ex._get("/openApi/swap/v2/quote/price", {"symbol": "BTC-USDT"})
-    btc = resp.get("data", {}).get("price", 0) if isinstance(resp, dict) else 0
-    if float(btc or 0) > 0:
-        logger.info(f"  Conexion BingX: OK (BTC={btc})")
-    else:
-        logger.error(f"  Conexion BingX: FALLO (respuesta={resp})")
-        return False
-
-    # 2. Test authenticated balance
-    bal_resp = await ex._get("/openApi/swap/v2/user/balance", auth=True)
-    code     = bal_resp.get("code", -1) if isinstance(bal_resp, dict) else -1
-    msg      = bal_resp.get("msg", "") if isinstance(bal_resp, dict) else str(bal_resp)
-
-    if code in (0, 200, None) or "success" in str(msg).lower():
-        bal = await ex.get_balance()
-        logger.info(f"  API Key: OK | Balance futuros: {bal:.4f} USDT")
-        if bal < cfg.min_balance_usdt:
-            logger.warning(f"  balance_bajo={bal:.2f}U (necesita >={cfg.min_balance_usdt})")
-            logger.warning("  SOLUCION: Deposita USDT en BingX Futures O pon MIN_BALANCE_OVERRIDE=9.0 en env vars si el saldo es correcto")
-        return True
-    else:
-        logger.error(f"  API Key: FALLO code={code} msg={msg}")
-        if "Signature" in msg or "signature" in msg:
-            logger.error("  SOLUCION: Verifica BINGX_API_KEY y BINGX_SECRET_KEY en Railway Variables")
-            logger.error("  - Asegurate que no tienen espacios extra")
-            logger.error("  - La key debe tener permisos de 'Trade' y 'Read' en BingX")
-            logger.error("  - Si tienes IP whitelist en BingX API, desactivala")
-        return False
+async def _diagnose_api() -> float:
+    """Returns balance if API OK, 0.0 if signature error."""
+    resp = await ex._get("/openApi/swap/v2/user/balance", auth=True)
+    if not isinstance(resp, dict): return 0.0
+    code = resp.get("code", -1)
+    msg  = resp.get("msg", "")
+    if "Signature" in msg or "signature" in msg:
+        logger.error("FIRMA INVALIDA — verifica BINGX_API_KEY y BINGX_SECRET_KEY")
+        logger.error("Asegurate que no tienen espacios y tienen permisos Trade+Read")
+        return 0.0
+    return await ex.get_balance()
 
 
 async def enter_trade(sig) -> None:
@@ -91,27 +72,23 @@ async def enter_trade(sig) -> None:
     if is_halted(): return
 
     min_s = cfg.min_score + 2 if consecutive_losses() >= 3 else cfg.min_score
-    if sig.score < min_s:
-        return
+    if sig.score < min_s: return
 
     size   = max(cfg.trade_usdt, 9.0)
     lev    = cfg.leverage
     margin = (size / lev) * 1.3
 
     bal = await ex.get_balance()
-
-    # Allow override for balance detection issues
-    min_bal = float(cfg.min_balance_usdt)
-    if bal < min_bal or bal < margin:
-        logger.warning(f"[SKIP] {sig.symbol} balance {bal:.2f} < {max(min_bal, margin):.2f}")
+    if bal < cfg.min_balance_usdt or bal < margin:
+        logger.warning(f"[SKIP] {sig.symbol} bal={bal:.2f} < {max(cfg.min_balance_usdt,margin):.2f}")
         return
 
     if sig.side == "BUY"  and (sig.sl >= sig.price or sig.tp <= sig.price): return
     if sig.side == "SELL" and (sig.sl <= sig.price or sig.tp >= sig.price): return
     if abs(sig.price - sig.sl) / sig.price * 100 < 0.08: return
 
+    # Leverage set in parallel (cached after first time = 0ms)
     await ex.set_leverage(sig.symbol, lev)
-    await asyncio.sleep(0.15)
 
     resp = await ex.place_market_order(
         symbol=sig.symbol, side=sig.side,
@@ -133,13 +110,13 @@ async def enter_trade(sig) -> None:
         atr=sig.atr_5m, size_usdt=size, leverage=lev,
         qty=qty, score=sig.score, vol_ratio=sig.vol_ratio,
         delta1=sig.zz_high, delta2=sig.zz_low,
-        order_id=str(od.get("orderId", "")),
+        order_id=str(od.get("orderId","")),
         bot_opened=True,
     ))
-
     logger.success(
         f"[ENTRADA] {sig.symbol} {sig.side} @ {sig.price:.6f} | "
-        f"SL={sig.sl:.6f} TP={sig.tp:.6f} | score={sig.score}/12"
+        f"SL={sig.sl:.6f} TP={sig.tp:.6f} | score={sig.score}/12 "
+        f"vol={sig.vol_ratio:.1f}x"
     )
     await notifier.notify_entry(
         symbol=sig.symbol, side=sig.side, price=sig.price,
@@ -156,9 +133,8 @@ async def scan_cycle(ohlcv_map: dict) -> None:
 
     for sym, data in ohlcv_map.items():
         if sym in open_syms: continue
-
         sig, reason = get_signal(
-            ohlcv_5m      = data.get(cfg.timeframe,      {}),
+            ohlcv_5m      = data.get(cfg.timeframe, {}),
             ohlcv_15m     = data.get(cfg.timeframe_slow, None),
             ohlcv_1h      = None,
             symbol        = sym,
@@ -173,7 +149,7 @@ async def scan_cycle(ohlcv_map: dict) -> None:
             min_atr_pct   = cfg.min_atr_pct,
             min_score     = cfg.min_score,
             zz_deviation  = cfg.zz_deviation,
-            zz15_deviation = cfg.zz15_deviation,
+            zz15_deviation= cfg.zz15_deviation,
         )
         if sig:
             signals.append(sig)
@@ -186,12 +162,13 @@ async def scan_cycle(ohlcv_map: dict) -> None:
         f"[ANALISIS] {scanned} pares | {len(signals)} senales | "
         f"rechazos: {dict(rejections.most_common(5))}"
     )
-
     if not signals: return
+
     signals.sort(key=lambda s: s.score, reverse=True)
-    logger.info(f"[TOP SENALES] {len(signals)} encontradas:")
+    logger.info("[SENALES TOP]")
     for s in signals[:5]:
-        logger.info(f"  {s.symbol} {s.side} score={s.score}/12 vol={s.vol_ratio:.1f}x")
+        logger.info(f"  {s.symbol} {s.side} score={s.score}/12 vol={s.vol_ratio:.1f}x "
+                    f"trend={s.zz_trend} ST={'B' if s.st_bull_15m else 'S'}")
 
     for sig in signals:
         if trade_count() >= cfg.max_positions: break
@@ -204,35 +181,26 @@ async def main_loop() -> None:
     await start_health_server()
 
     logger.info("=" * 65)
-    logger.info("  PHANTOM EDGE BOT ELITE v2.1")
-    logger.info("  ZigZag(5m+15m) + Supertrend + VWAP + RSI + Patrones")
+    logger.info("  PHANTOM EDGE BOT ELITE v2.2 — SPEED OPTIMIZED")
+    logger.info("  Cache OHLCV incremental | Leverage cacheado")
+    logger.info("  Parallel leverage set | Pre-filtro volumen")
     logger.info(f"  Score>={cfg.min_score}/12 | RR 1:{cfg.rr} | x{cfg.leverage}")
     logger.info(f"  Trade={max(cfg.trade_usdt,9)} USDT | MaxPos={cfg.max_positions}")
     logger.info("=" * 65)
 
-    # API diagnosis on startup
-    api_ok = await _diagnose_api()
-    if not api_ok:
-        await notifier.notify(
-            "ERROR API BingX: Signature verification failed\n"
-            "Verifica BINGX_API_KEY y BINGX_SECRET_KEY en Railway Variables\n"
-            "Desactiva IP whitelist en BingX si la tienes activada"
-        )
+    bal = await _diagnose_api()
+    logger.info(f"  Balance: {bal:.4f} USDT")
 
     _active_symbols = await get_symbols(cfg.symbols_raw)
-    logger.info(f"  Simbolos cargados: {len(_active_symbols)}")
-
-    bal = await ex.get_balance()
-    logger.info(f"  Balance futuros: {bal:.4f} USDT")
+    logger.info(f"  Simbolos: {len(_active_symbols)}")
 
     await notifier.test_telegram()
     await notifier.notify(
-        f"Phantom Edge Bot v2.1\n"
-        f"API: {'OK' if api_ok else 'ERROR-FIRMA'}\n"
-        f"Balance: {bal:.4f} USDT\n"
-        f"Pares: {len(_active_symbols)} | Score>={cfg.min_score}/12"
+        f"Phantom Edge Bot v2.2 ELITE\n"
+        f"Balance: {bal:.4f} USDT | Pares: {len(_active_symbols)}\n"
+        f"Score>={cfg.min_score}/12 | RR 1:{cfg.rr} | x{cfg.leverage}\n"
+        f"Cache OHLCV + Leverage cache activados"
     )
-
     await sync_from_exchange()
 
     loop = asyncio.get_event_loop()
@@ -247,36 +215,37 @@ async def main_loop() -> None:
 
             if _cycle > 0 and _cycle % SYMBOL_REFRESH_CYCLES == 0:
                 _active_symbols = await get_symbols(cfg.symbols_raw)
+                logger.info(f"[SYMBOLS] {len(_active_symbols)} pares actualizados")
 
             _cycle += 1
-            t0 = loop.time()
-
-            bal = await ex.get_balance()
+            t0   = time.perf_counter()
             dead = _in_dead_session()
+
             logger.info(
-                f"CICLO {_cycle:04d} | Bal={bal:.2f}U | "
-                f"{len(_active_symbols)} pares | "
+                f"CICLO {_cycle:04d} | {len(_active_symbols)} pares | "
                 f"open={trade_count()}/{cfg.max_positions} | "
-                f"consec_loss={consecutive_losses()} | "
-                f"{'SESION MUERTA' if dead else 'OK'}"
+                f"loss={consecutive_losses()} | {'MUERTA' if dead else 'OK'}"
             )
 
             ohlcv_map = await fetch_universe(
                 _active_symbols,
-                tf_5m=cfg.timeframe,
-                tf_15m=cfg.timeframe_slow,
-                tf_1h=cfg.timeframe_1h,
-                max_concurrent=cfg.max_concurrent,
-                min_vol_mult=cfg.min_vol_mult,
+                tf_5m          = cfg.timeframe,
+                tf_15m         = cfg.timeframe_slow,
+                max_concurrent = cfg.max_concurrent,
+                min_vol_mult   = cfg.min_vol_mult,
             )
 
             await manage_positions(ohlcv_map)
             if not dead:
                 await scan_cycle(ohlcv_map)
 
-            elapsed   = loop.time() - t0
+            elapsed = time.perf_counter() - t0
+            _cycle_times.append(elapsed)
+            if len(_cycle_times) > 50: _cycle_times.pop(0)
+
+            avg = sum(_cycle_times[-5:]) / min(len(_cycle_times), 5)
             sleep_for = max(0.0, cfg.scan_interval - elapsed)
-            logger.info(f"Ciclo {elapsed:.1f}s | siguiente en {sleep_for:.0f}s")
+            logger.info(f"Ciclo {elapsed:.1f}s (avg5={avg:.1f}s) | sleep {sleep_for:.0f}s")
 
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
