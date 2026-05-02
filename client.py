@@ -1,13 +1,5 @@
 # -*- coding: utf-8 -*-
-"""client.py -- Phantom Edge Bot: High-Performance BingX Async Client.
-
-Improvements over v3:
-  - Persistent session (one session for lifetime of bot)
-  - Connection pool: 300 connections, keepalive
-  - Batch ticker price fetch (all positions in 1 call vs N calls)
-  - Adaptive retry with jitter backoff
-  - Response size limits to avoid memory spikes
-"""
+"""client.py -- Phantom Edge Bot: BingX Perpetual Futures Client (FIXED SIGNATURE)."""
 from __future__ import annotations
 import asyncio
 import hashlib
@@ -29,20 +21,12 @@ def _get_session() -> aiohttp.ClientSession:
     if _session is None or _session.closed:
         from config import cfg
         connector = aiohttp.TCPConnector(
-            limit           = 300,       # max simultaneous connections
-            limit_per_host  = 100,       # per-host limit
-            ttl_dns_cache   = 600,       # DNS cache 10 min
-            keepalive_timeout = 30,      # keep connections alive
-            ssl             = False,
-            force_close     = False,     # reuse connections
+            limit=200, limit_per_host=80,
+            ttl_dns_cache=300, ssl=False,
         )
         _session = aiohttp.ClientSession(
-            connector = connector,
-            timeout   = aiohttp.ClientTimeout(
-                total   = cfg.http_timeout,
-                connect = 5,             # fast fail on connect
-            ),
-            headers = {"X-BX-APIKEY": cfg.bingx_api_key},
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=cfg.http_timeout, connect=5),
         )
     return _session
 
@@ -54,13 +38,23 @@ async def close_session() -> None:
 
 
 def _sign(params: dict, secret: str) -> str:
-    qs = urlencode(sorted(params.items()))
-    return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    """
+    BingX signature: HMAC-SHA256 of sorted query string.
+    CRITICAL: sort keys alphabetically, urlencode, then sign.
+    """
+    sorted_params = sorted(params.items())
+    query_string  = urlencode(sorted_params)
+    signature     = hmac.new(
+        secret.encode("utf-8"),
+        query_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return signature
 
 
-def _auth_params(params: dict | None = None) -> dict:
+def _build_params(extra: dict | None = None) -> dict:
     from config import cfg
-    p = dict(params or {})
+    p = dict(extra or {})
     p["timestamp"] = int(time.time() * 1000)
     p["signature"] = _sign(p, cfg.bingx_secret_key)
     return p
@@ -68,53 +62,58 @@ def _auth_params(params: dict | None = None) -> dict:
 
 def _headers() -> dict:
     from config import cfg
-    return {"X-BX-APIKEY": cfg.bingx_api_key}
+    return {
+        "X-BX-APIKEY": cfg.bingx_api_key,
+        "Content-Type": "application/json",
+    }
 
 
-async def _request(
-    method: str, path: str,
-    params: dict | None = None,
-    auth: bool = True,
-    retries: int = 3,
-) -> Any:
-    sess = _get_session()
-    p    = _auth_params(params) if auth else (params or {})
-    hdrs = _headers() if auth else {}
-    url  = BASE_URL + path
+async def _request(method: str, path: str,
+                   params: dict | None = None,
+                   auth: bool = True,
+                   retries: int = 3) -> Any:
+    sess    = _get_session()
+    p       = _build_params(params) if auth else (params or {})
+    headers = _headers()
+    url     = BASE_URL + path
 
     for attempt in range(retries):
         try:
             if method == "GET":
-                async with sess.get(url, params=p, headers=hdrs) as r:
-                    return await r.json(content_type=None)
+                async with sess.get(url, params=p, headers=headers) as r:
+                    data = await r.json(content_type=None)
+                    if isinstance(data, dict) and data.get("code") not in (0, 200, None):
+                        msg = data.get("msg", "")
+                        if "Signature" in msg or "signature" in msg:
+                            logger.error(f"[FIRMA] {path}: {msg}")
+                            logger.error("Verifica BINGX_API_KEY y BINGX_SECRET_KEY en Railway Variables")
+                        elif attempt == 0:
+                            logger.debug(f"API {path} code={data.get('code')} {msg[:80]}")
+                    return data
             elif method == "POST":
-                async with sess.post(url, params=p, headers=hdrs) as r:
+                async with sess.post(url, params=p, headers=headers) as r:
                     return await r.json(content_type=None)
             elif method == "DELETE":
-                async with sess.delete(url, params=p, headers=hdrs) as r:
+                async with sess.delete(url, params=p, headers=headers) as r:
                     return await r.json(content_type=None)
         except asyncio.TimeoutError:
-            jitter = random.uniform(0, 0.5)
-            wait   = (1.5 ** attempt) + jitter
-            logger.warning(f"{method} {path} timeout #{attempt+1} → retry {wait:.1f}s")
+            wait = (1.5 ** attempt) + random.uniform(0, 0.5)
+            logger.warning(f"{method} {path} timeout #{attempt+1} retry {wait:.1f}s")
             if attempt < retries - 1:
                 await asyncio.sleep(wait)
-        except aiohttp.ClientConnectorError as e:
-            logger.warning(f"{method} {path} connection error: {e}")
-            await asyncio.sleep(1)
         except Exception as e:
             logger.warning(f"{method} {path} error: {e}")
             return {}
     return {}
 
 
-async def _get(path: str, params: dict | None = None, auth: bool = False) -> Any:
+async def _get(path, params=None, auth=False):
     return await _request("GET", path, params, auth=auth)
 
-async def _post(path: str, params: dict | None = None) -> Any:
+async def _post(path, params=None):
     return await _request("POST", path, params, auth=True)
 
-async def _delete(path: str, params: dict | None = None) -> Any:
+async def _delete(path, params=None):
     return await _request("DELETE", path, params, auth=True)
 
 
@@ -128,30 +127,51 @@ async def fetch_klines(symbol: str, interval: str, limit: int = 300) -> list[lis
 
 
 async def fetch_ohlcv(symbol: str, tf: str, limit: int = 300) -> dict | None:
+    import numpy as np
     raw = await fetch_klines(symbol, tf, limit=limit)
     if len(raw) < 50:
         return None
     try:
         return {
-            "open":   __import__("numpy").array([float(c[1]) for c in raw], dtype="float64"),
-            "high":   __import__("numpy").array([float(c[2]) for c in raw], dtype="float64"),
-            "low":    __import__("numpy").array([float(c[3]) for c in raw], dtype="float64"),
-            "close":  __import__("numpy").array([float(c[4]) for c in raw], dtype="float64"),
-            "volume": __import__("numpy").array([float(c[5]) for c in raw], dtype="float64"),
+            "open":   np.array([float(c[1]) for c in raw], dtype=np.float64),
+            "high":   np.array([float(c[2]) for c in raw], dtype=np.float64),
+            "low":    np.array([float(c[3]) for c in raw], dtype=np.float64),
+            "close":  np.array([float(c[4]) for c in raw], dtype=np.float64),
+            "volume": np.array([float(c[5]) for c in raw], dtype=np.float64),
         }
     except Exception as e:
         logger.debug(f"OHLCV parse {symbol}: {e}")
         return None
 
 
-# ── Batch price fetch (KEY OPTIMIZATION for pos_manager) ─────────────────────
+# ── Account ───────────────────────────────────────────────────────────────────
+
+async def get_balance() -> float:
+    """Fetch available USDT balance from BingX perpetual futures account."""
+    resp = await _get("/openApi/swap/v2/user/balance", auth=True)
+    try:
+        code = resp.get("code", -1)
+        if code not in (0, 200, None):
+            logger.warning(f"get_balance API error code={code}: {resp.get('msg','')}")
+            return 0.0
+        data = resp.get("data", {})
+        # BingX returns nested: data.balance.availableMargin
+        if isinstance(data, dict):
+            bal = data.get("balance", {})
+            if isinstance(bal, dict):
+                v = bal.get("availableMargin") or bal.get("available") or bal.get("balance") or 0
+                return float(v)
+            # Flat structure fallback
+            for key in ("availableMargin", "available", "equity", "balance"):
+                if key in data:
+                    return float(data[key])
+    except Exception as e:
+        logger.warning(f"get_balance parse error: {e} | resp: {str(resp)[:200]}")
+    return 0.0
+
 
 async def get_all_tickers() -> dict[str, float]:
-    """
-    Single API call → prices for ALL symbols.
-    Use instead of N individual get_price() calls in manage_positions.
-    Returns {symbol: price}
-    """
+    """Single call → prices for ALL symbols."""
     resp = await _get("/openApi/swap/v2/quote/ticker")
     prices: dict[str, float] = {}
     try:
@@ -162,30 +182,9 @@ async def get_all_tickers() -> dict[str, float]:
                 p   = float(item.get("lastPrice", 0) or 0)
                 if sym and p > 0:
                     prices[sym] = p
-        elif isinstance(data, dict):
-            sym = data.get("symbol", "")
-            p   = float(data.get("lastPrice", 0) or 0)
-            if sym and p > 0:
-                prices[sym] = p
     except Exception as e:
         logger.warning(f"get_all_tickers error: {e}")
     return prices
-
-
-# ── Account ───────────────────────────────────────────────────────────────────
-
-async def get_balance() -> float:
-    resp = await _get("/openApi/swap/v2/user/balance", auth=True)
-    try:
-        data = resp.get("data", {})
-        if isinstance(data, dict):
-            bal = data.get("balance", {})
-            if isinstance(bal, dict):
-                return float(bal.get("availableMargin", bal.get("balance", 0)))
-            return float(data.get("availableMargin", data.get("equity", 0)))
-    except Exception as e:
-        logger.warning(f"get_balance error: {e}")
-    return 0.0
 
 
 async def get_all_positions() -> dict[str, dict]:
@@ -200,6 +199,26 @@ async def get_all_positions() -> dict[str, dict]:
     except Exception as e:
         logger.warning(f"get_positions error: {e}")
     return {}
+
+
+async def get_price(symbol: str) -> float:
+    resp = await _get("/openApi/swap/v2/quote/price", {"symbol": symbol})
+    try:
+        p = float(resp.get("data", {}).get("price", 0))
+        if p > 0:
+            return p
+    except Exception:
+        pass
+    resp2 = await _get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
+    try:
+        d = resp2.get("data", {})
+        if isinstance(d, list) and d:
+            return float(d[0].get("lastPrice", 0))
+        if isinstance(d, dict):
+            return float(d.get("lastPrice", 0))
+    except Exception:
+        pass
+    return 0.0
 
 
 # ── Trading ───────────────────────────────────────────────────────────────────
@@ -218,15 +237,15 @@ async def place_market_order(symbol: str, side: str, size_usdt: float,
         "side":          side,
         "type":          "MARKET",
         "quoteOrderQty": size_usdt,
-        "stopLoss":      str(sl),
-        "takeProfit":    str(tp),
+        "stopLoss":      str(round(sl, 8)),
+        "takeProfit":    str(round(tp, 8)),
     }
     resp = await _post("/openApi/swap/v2/trade/order", params)
     code = resp.get("code", -1)
     if code not in (0, 200, None):
         logger.warning(
-            f"[ORDER FAIL] {symbol} {side} code={code} msg={resp.get('msg','')} "
-            f"sl={sl} tp={tp}"
+            f"[ORDER FAIL] {symbol} {side} code={code} "
+            f"msg={resp.get('msg','')} sl={sl} tp={tp}"
         )
     return resp if isinstance(resp, dict) else {"raw": resp}
 
@@ -256,23 +275,3 @@ async def close_position(symbol: str, position: dict) -> Any:
 
 async def cancel_all_orders(symbol: str) -> Any:
     return await _delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
-
-
-async def get_price(symbol: str) -> float:
-    """Single-symbol price. Use get_all_tickers() for bulk."""
-    resp = await _get("/openApi/swap/v2/quote/price", {"symbol": symbol})
-    try:
-        p = float(resp.get("data", {}).get("price", 0))
-        if p > 0: return p
-    except Exception:
-        pass
-    resp2 = await _get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
-    try:
-        d = resp2.get("data", {})
-        if isinstance(d, list) and d:
-            return float(d[0].get("lastPrice", 0))
-        if isinstance(d, dict):
-            return float(d.get("lastPrice", 0))
-    except Exception:
-        pass
-    return 0.0
