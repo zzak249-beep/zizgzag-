@@ -1,0 +1,5 @@
+[phases.install]
+cmds = ["pip install aiohttp==3.9.5 loguru==0.7.2 numpy==1.26.4"]
+
+[start]
+cmd = "python bot.py"
