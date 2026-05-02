@@ -1,1 +1,3 @@
 aiohttp==3.9.5
+loguru==0.7.2
+numpy==1.26.4
