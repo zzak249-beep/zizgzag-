@@ -1,7 +1,5 @@
-aiohttp==3.9.5
-aiosignal>=1.1.2
-frozenlist>=1.1.1
-multidict>=4.5
-yarl>=1.0
-loguru==0.7.2
-numpy==1.26.4
+ccxt>=4.3.0
+pandas>=2.2.0
+pandas-ta>=0.3.14b
+python-dotenv>=1.0.0
+requests>=2.31.0
