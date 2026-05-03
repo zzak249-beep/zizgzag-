@@ -12,20 +12,20 @@ class Config:
     telegram_chat_id: str   = ""
 
     trade_usdt:  float = 9.0
-    leverage:    int   = 10
+    leverage:    int   = 7      # FIX: 10→7 — reduce exposición en 5m
 
     # ── Estrategia v6 ─────────────────────────────────────────
     pivot_len:   int   = 5      # Pine: ta.pivothigh(high, 5, 5)
     hma_len:     int   = 50     # Pine: ta.hma(close, 50)
     ft_period:   int   = 25     # FutureTrend period
     atr_period:  int   = 14
-    atr_mult:    float = 1.5    # SL = ATR × 1.5
+    atr_mult:    float = 2.0    # FIX: 1.5→2.0 — más espacio en 5m, evita SL hunting
     rr:          float = 2.5    # TP = SL × 2.5
 
     # ── Filtros ───────────────────────────────────────────────
-    min_atr_pct:  float = 0.10
+    min_atr_pct:  float = 0.15  # FIX: 0.10→0.15 — evitar pares planos en 5m
     min_vol_mult: float = 0.6
-    min_score:    int   = 3     # Pine original = 3 (ZZ+HMA+FT)
+    min_score:    int   = 5     # FIX: 3→5 — exige confirmación 15m o volumen
 
     # ── Timeframes ────────────────────────────────────────────
     timeframe:      str = "5m"
