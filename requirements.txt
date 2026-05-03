@@ -5,4 +5,3 @@ multidict>=4.5
 yarl>=1.0
 loguru==0.7.2
 numpy==1.26.4
-httpx
