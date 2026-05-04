@@ -94,8 +94,14 @@ async def enter_trade(sig) -> None:
 
     od  = resp.get("data", {})
     if isinstance(od, dict): od = od.get("order", od)
-    qty = float(od.get("executedQty",0) or od.get("origQty",0))
-    if qty <= 0: qty = (size * lev) / sig.price
+    # Try to get qty from exchange response; fallback to calculated qty
+    qty = float(od.get("executedQty", 0) or od.get("origQty", 0) or od.get("quantity", 0))
+    if qty <= 0:
+        # Calculate same as client.py does
+        notional = size * lev
+        qty = round(notional / sig.price, 3) if sig.price >= 1000 else \
+              round(notional / sig.price, 2) if sig.price >= 1 else \
+              round(notional / sig.price, 0)
 
     add_trade(Trade(
         symbol=sig.symbol, side=sig.side,
