@@ -207,6 +207,20 @@ async def main_loop() -> None:
         tf_15m=cfg.timeframe_slow,
         batch=8,  # conservative concurrency for cold fetch
     )
+
+    # ── Retry warmup if success rate is too low ─────────────────
+    if warmed < len(_active_symbols) * 0.5:
+        logger.warning(f"[WARMUP] Solo {warmed}/{len(_active_symbols)} — reintentando en 30s...")
+        await asyncio.sleep(30)
+        warmed2 = await warmup_all(
+            _active_symbols,
+            tf_5m=cfg.timeframe,
+            tf_15m=cfg.timeframe_slow,
+            batch=5,  # even more conservative on retry
+        )
+        warmed = max(warmed, warmed2)
+        logger.info(f"[WARMUP] Retry: {warmed}/{len(_active_symbols)} calentados")
+
     _warmed_up = True
 
     await notifier.test_telegram()
@@ -250,6 +264,11 @@ async def main_loop() -> None:
                 max_concurrent=cfg.max_concurrent,
                 min_vol_mult=cfg.min_vol_mult,
             )
+
+            if not ohlcv_map:
+                logger.warning("[SKIP] ohlcv_map vacío — BingX sin datos. Reintentando en 30s.")
+                await asyncio.sleep(30)
+                continue
 
             await manage_positions(ohlcv_map)
             if not dead:

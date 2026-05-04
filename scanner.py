@@ -206,26 +206,28 @@ async def fetch_universe(
                   If any remain (new symbols added), fetch full.
     """
     results: dict[str, dict] = {}
-    sem  = asyncio.Semaphore(max_concurrent)
+    warm_sem = asyncio.Semaphore(max_concurrent)   # fast: 2 bars
+    cold_sem = asyncio.Semaphore(6)                # slow: 220 bars — BingX rate-limit safe
     stat = {"cold":0,"warm":0,"skip_vol":0,"ts_skip":0,"fail":0}
 
     async def _one(sym: str) -> None:
-        async with sem:
-            c5  = _get_cache(sym, tf_5m)
-            c15 = _get_cache(sym, tf_15m)
-            cold = not c5.warm or not c15.warm
+        c5  = _get_cache(sym, tf_5m)
+        c15 = _get_cache(sym, tf_15m)
+        cold = not c5.warm or not c15.warm
 
-            if cold:
-                # Fallback cold fetch (should be rare after warmup)
-                raw5  = await fetch_klines_retry(sym, tf_5m,  220, retries=2)
-                raw15 = await fetch_klines_retry(sym, tf_15m, 120, retries=2)
+        if cold:
+            # Use LOW concurrency for full cold fetches
+            async with cold_sem:
+                raw5  = await fetch_klines_retry(sym, tf_5m,  220, retries=3)
+                raw15 = await fetch_klines_retry(sym, tf_15m, 120, retries=3)
                 ok5   = c5.store(raw5)
                 ok15  = c15.store(raw15)
                 stat["cold"] += 1
                 if not ok5 or not ok15:
                     stat["fail"] += 1
                     return
-            else:
+        else:
+            async with warm_sem:
                 # Fast path: only 2 new bars needed
                 raw5 = await fetch_klines_retry(sym, tf_5m, 2, retries=2)
                 if not raw5:
@@ -249,9 +251,9 @@ async def fetch_universe(
                 raw15 = await fetch_klines_retry(sym, tf_15m, 2, retries=2)
                 c15.update(raw15)
 
-            d5=c5.to_dict(); d15=c15.to_dict()
-            if d5 and d15:
-                results[sym] = {tf_5m: d5, tf_15m: d15}
+        d5=c5.to_dict(); d15=c15.to_dict()
+        if d5 and d15:
+            results[sym] = {tf_5m: d5, tf_15m: d15}
 
     await asyncio.gather(
         *[asyncio.create_task(_one(s)) for s in symbols],
