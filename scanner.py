@@ -22,13 +22,14 @@ from client import fetch_klines as _fetch_klines_base, _get
 # ── fetch_klines with retry ───────────────────────────────────
 async def fetch_klines_retry(symbol: str, interval: str,
                               limit: int = 200, retries: int = 3) -> list:
-    """fetch_klines with retry + backoff. Logs on failure."""
+    """fetch_klines with retry + exponential backoff. Logs on failure."""
+    _waits = [2.0, 6.0, 15.0]  # longer waits to survive rate-limits / network blips
     for attempt in range(retries):
         raw = await _fetch_klines_base(symbol, interval, limit)
         if len(raw) >= 10:
             return raw
         if attempt < retries - 1:
-            wait = 1.0 * (attempt + 1)
+            wait = _waits[attempt]
             logger.debug(f"[RETRY] {symbol} {interval} got {len(raw)} bars, retry in {wait:.1f}s")
             await asyncio.sleep(wait)
         else:
@@ -183,7 +184,7 @@ async def warmup_all(
             return_exceptions=True,
         )
         logger.info(f"[WARMUP] {min(i+chunk, total)}/{total} procesados | {warmed} OK")
-        await asyncio.sleep(0.5)   # brief pause between chunks
+        await asyncio.sleep(3.0)   # 3s pause between chunks — BingX rate-limit safe
 
     logger.info(f"[WARMUP] Completo: {warmed}/{total} símbolos calentados")
     return warmed
