@@ -9,7 +9,7 @@ from aiohttp import web
 
 from config import cfg
 import client as ex
-from scanner import fetch_universe, get_symbols, warmup_all
+from scanner import fetch_universe, get_symbols, warmup_all, probe_bingx
 from strategy import get_signal, _in_dead_session
 from pos_manager import (
     Trade, add_trade, open_symbols, trade_count, is_halted,
@@ -213,13 +213,26 @@ async def main_loop() -> None:
         if warmup_attempt > 1:
             logger.warning(
                 f"[WARMUP] Intento {warmup_attempt}: solo {warmed}/{len(_active_symbols)} "
-                f"calentados. Reintentando en {wait_s}s (BingX lento o Railway incident)…"
+                f"calentados. Esperando {wait_s}s antes de reintentar…"
             )
             await notifier.notify(
                 f"⚠️ Warmup parcial ({warmed}/{len(_active_symbols)}).\n"
                 f"Reintentando en {wait_s}s…"
             )
             await asyncio.sleep(wait_s)
+
+        # ── Connectivity probe: no point starting warmup if BingX unreachable ──
+        probe_ok = False
+        for probe_try in range(5):
+            probe_ok = await probe_bingx()
+            if probe_ok:
+                break
+            wait_probe = 30 * (probe_try + 1)
+            logger.warning(f"[PROBE] BingX sin respuesta — esperando {wait_probe}s (intento {probe_try+1}/5)")
+            await asyncio.sleep(wait_probe)
+
+        if not probe_ok:
+            logger.warning("[PROBE] BingX inalcanzable tras 5 intentos — continuando de todos modos")
 
         warmed = await warmup_all(
             _active_symbols,

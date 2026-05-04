@@ -23,11 +23,14 @@ from client import fetch_klines as _fetch_klines_base, _get
 async def fetch_klines_retry(symbol: str, interval: str,
                               limit: int = 200, retries: int = 3) -> list:
     """fetch_klines with retry + exponential backoff. Logs on failure."""
-    _waits = [2.0, 6.0, 15.0]  # longer waits to survive rate-limits / network blips
+    _waits = [2.0, 6.0, 15.0]
     for attempt in range(retries):
         raw = await _fetch_klines_base(symbol, interval, limit)
         if len(raw) >= 10:
             return raw
+        # Log raw BingX response on first symbol failure (diagnose root cause)
+        if attempt == 0 and symbol in ("BTC-USDT", "ETH-USDT"):
+            logger.warning(f"[DIAG] {symbol} {interval} limit={limit} → got {len(raw)} bars (raw={str(raw)[:120]})")
         if attempt < retries - 1:
             wait = _waits[attempt]
             logger.debug(f"[RETRY] {symbol} {interval} got {len(raw)} bars, retry in {wait:.1f}s")
@@ -38,7 +41,19 @@ async def fetch_klines_retry(symbol: str, interval: str,
 
 
 # ── Symbol loader ─────────────────────────────────────────────
-async def fetch_all_bingx_symbols() -> list[str]:
+async def probe_bingx() -> bool:
+    """Quick connectivity check: fetch 10 BTC-USDT 5m bars.
+    Returns True if BingX is reachable and returning data."""
+    raw = await _fetch_klines_base("BTC-USDT", "5m", 10)
+    ok = len(raw) >= 5
+    if ok:
+        logger.info(f"[PROBE] BingX OK — BTC-USDT returned {len(raw)} bars")
+    else:
+        logger.warning(f"[PROBE] BingX NO RESPONDE — BTC-USDT returned {len(raw)} bars")
+    return ok
+
+
+
     resp = await _get("/openApi/swap/v2/quote/contracts")
     out  = []
     try:
