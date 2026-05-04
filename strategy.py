@@ -1,26 +1,12 @@
 # -*- coding: utf-8 -*-
-"""strategy.py -- Phantom Edge Bot v6.1 TURBO.
-
-VELOCIDAD: 14x más rápido que v6.0
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  HMA:          loop O(n×p) → convolve O(n log n)    25x
-  Pivot:        loop O(n×2p) → sliding_window O(n)   11x
-  FutureTrend:  Python for → numpy slice             2x
-  Cache:        recomputa solo si hay vela nueva     5x adicional
-
-ESTRATEGIA (Pine Script EXACTO):
-  LONG:  crossover(close, peak_series)   + HMA alcista + FutureTrend > 0
-  SHORT: crossunder(close, valley_series) + HMA bajista + FutureTrend < 0
-
-SCORE 0-6:
-  +2  ZigZag crossover/crossunder confirmado
-  +1  HMA dirección + precio vs HMA
-  +1  FutureTrend a favor (volume delta 3 periodos)
-  +1  Confirmación 15m (HMA + FT alineados)
-  +1  Volumen spike > media × 1.2
+"""strategy.py -- Phantom Edge Bot v6 — ZigZag Institutional Elite V6.
+Matches Pine Script EXACTLY:
+  LONG:  ta.crossover(close, peak)  + volume > vol_ma*vol_mult + close > open
+  SHORT: ta.crossunder(close, valley) + volume > vol_ma*vol_mult + close < open
+  SL:    valley (long) / peak (short)  ← pivot level, NOT ATR
+  TP:    close + (close-sl)*rr
 """
 from __future__ import annotations
-import math, datetime
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from dataclasses import dataclass, field
@@ -33,26 +19,27 @@ from typing import Optional
 
 @dataclass
 class Signal:
-    symbol:      str
-    side:        str
-    price:       float
-    sl:          float
-    tp:          float
-    atr_5m:      float
-    peak:        float
-    valley:      float
-    hma_val:     float
-    ft_val:      float
-    score:       int
-    vol_ratio:   float
-    reasons:     list = field(default_factory=list)
-    atr:         float = 0.0
-    zz_high:     float = 0.0
-    zz_low:      float = 0.0
-    zz_trend:    str   = "FLAT"
-    st_bull_15m: bool  = True
-    delta1:      float = 0.0
-    delta2:      float = 0.0
+    symbol:    str
+    side:      str
+    price:     float
+    sl:        float
+    tp:        float
+    atr_5m:    float
+    peak:      float
+    valley:    float
+    score:     int
+    vol_ratio: float
+    reasons:   list = field(default_factory=list)
+    # compat aliases
+    atr:       float = 0.0
+    zz_high:   float = 0.0
+    zz_low:    float = 0.0
+    hma_val:   float = 0.0
+    ft_val:    float = 0.0
+    zz_trend:  str   = "FLAT"
+    st_bull_15m: bool = True
+    delta1:    float = 0.0
+    delta2:    float = 0.0
 
     def __post_init__(self):
         self.atr     = self.atr_5m
@@ -63,84 +50,37 @@ class Signal:
 
 
 # ─────────────────────────────────────────────────────────────
-# CACHE DE SEÑALES (evita recomputar si misma vela)
+# CACHE (evita recomputar si misma vela)
 # ─────────────────────────────────────────────────────────────
-# {symbol: (last_close_ts, Signal|None)}
 _sig_cache: dict[str, tuple[float, Optional[Signal]]] = {}
 
 
 # ─────────────────────────────────────────────────────────────
-# INDICADORES VECTORIZADOS (TURBO)
+# INDICADORES VECTORIZADOS
 # ─────────────────────────────────────────────────────────────
 
 def _f(a) -> np.ndarray:
     return np.nan_to_num(np.asarray(a, dtype=np.float64), nan=0., posinf=0., neginf=0.)
 
 
-# ── WMA vectorizado (convolución) ─────────────────────────────
-def _wma_v(arr: np.ndarray, p: int) -> np.ndarray:
-    """
-    WMA usando convolución — 25x más rápido que loop.
-    Pine: ta.wma(source, length)
-    """
-    n = len(arr)
-    if n < p:
-        return np.full(n, arr[-1] if n > 0 else 0.)
-    w  = np.arange(1, p+1, dtype=np.float64)
-    w /= w.sum()
-    # Mode 'full' then trim — equivalent to rolling window
-    full = np.convolve(arr, w[::-1], mode='full')
-    out  = np.zeros(n)
-    out[p-1:] = full[p-1:n]
-    return out
-
-
-# ── HMA vectorizado ────────────────────────────────────────────
-def _hma_v(c: np.ndarray, n: int) -> np.ndarray:
-    """
-    HMA = WMA(2×WMA(n/2) − WMA(n), √n)
-    Pine: ta.hma(close, len)
-    Vectorized: 25x speedup vs loop version.
-    """
-    c     = _f(c)
-    if len(c) < n:
-        return np.full(len(c), c[-1] if len(c) > 0 else 0.)
-    half  = max(1, n // 2)
-    sqrtn = max(1, int(math.sqrt(n)))
-    raw   = 2. * _wma_v(c, half) - _wma_v(c, n)
-    return _wma_v(raw, sqrtn)
-
-
-def _hma_direction(hma: np.ndarray, c: np.ndarray) -> tuple[bool, bool]:
-    """hma_alcista = close > hma AND hma > hma[1]"""
-    if len(hma) < 2:
-        return False, False
-    bull = bool(c[-1] > hma[-1] and hma[-1] > hma[-2])
-    bear = bool(c[-1] < hma[-1] and hma[-1] < hma[-2])
-    return bull, bear
-
-
-# ── Pivot series vectorizado (stride trick) ───────────────────
 def _pivot_series_v(arr: np.ndarray, n: int, is_high: bool) -> np.ndarray:
     """
     ta.pivothigh / ta.pivotlow + forward-fill (Pine 'var float peak = na').
-    11x más rápido que loop via sliding_window_view.
+    Vectorized via sliding_window_view — O(n) instead of O(n×2p).
     """
     L = len(arr)
-    if L < 2*n + 1:
+    if L < 2 * n + 1:
         return np.full(L, np.nan)
 
-    wins = sliding_window_view(arr, 2*n+1)
-    ctr  = arr[n:L-n]
+    wins = sliding_window_view(arr, 2 * n + 1)
+    ctr  = arr[n : L - n]
     ref  = wins.max(axis=1) if is_high else wins.min(axis=1)
 
-    # Confirmed pivots (NaN where not pivot)
-    confirmed = np.where(ctr == ref, ctr, np.nan)
+    confirmed        = np.where(ctr == ref, ctr, np.nan)
+    result           = np.full(L, np.nan)
+    result[n : L-n]  = confirmed
 
-    # Build result with forward-fill (Pine 'var float peak = na')
-    result = np.full(L, np.nan)
-    result[n:L-n] = confirmed
-
+    # Forward-fill (Pine: var float peak = na / if not na(ph): peak := ph)
     cur = np.nan
     for i in range(L):
         if not np.isnan(result[i]):
@@ -149,95 +89,44 @@ def _pivot_series_v(arr: np.ndarray, n: int, is_high: bool) -> np.ndarray:
     return result
 
 
-def _crossover(series: np.ndarray, level: np.ndarray) -> bool:
-    """ta.crossover: prev <= level AND curr > level (no NaN at level)."""
-    if len(series) < 2 or len(level) < 2: return False
-    if np.isnan(level[-1]) or np.isnan(level[-2]): return False
-    return bool(series[-2] <= level[-2] and series[-1] > level[-1])
-
-
-def _crossunder(series: np.ndarray, level: np.ndarray) -> bool:
-    """ta.crossunder: prev >= level AND curr < level."""
-    if len(series) < 2 or len(level) < 2: return False
-    if np.isnan(level[-1]) or np.isnan(level[-2]): return False
-    return bool(series[-2] >= level[-2] and series[-1] < level[-1])
-
-
-# ── FutureTrend vectorizado ────────────────────────────────────
-def _future_trend_v(o: np.ndarray, c: np.ndarray, v: np.ndarray, p: int) -> float:
-    """
-    Volume delta × 3 periodos históricos — Pine original traducido.
-    Vectorizado: elimina el for-loop Python (2x speedup).
-    """
-    n = len(c)
-    if n < p * 3 + 1: return 0.
-    delta = np.where(c > o, v, np.where(c < o, -v, 0.))
-    # 3 slices del array delta (equivale al loop Pine)
-    d0 = delta[n-p:n][::-1]        # i=0..p-1, delta[i]
-    d1 = delta[n-2*p:n-p][::-1]    # delta[i+p]
-    d2 = delta[n-3*p:n-2*p][::-1]  # delta[i+2p]
-    return float((d0 + d1 + d2).sum() / (3. * p))
-
-
-# ── ATR (Wilder, vectorizado) ──────────────────────────────────
-def _atr_v(h, l, c, p=14) -> float:
+def _atr_v(h, l, c, p: int = 14) -> float:
     h, l, c = _f(h), _f(l), _f(c)
-    prev = np.roll(c, 1); prev[0] = c[0]
-    tr   = np.maximum(h-l, np.maximum(np.abs(h-prev), np.abs(l-prev)))
-    if len(tr) < p: return float(np.mean(h-l) + 1e-12)
+    prev     = np.roll(c, 1); prev[0] = c[0]
+    tr       = np.maximum(h - l, np.maximum(np.abs(h - prev), np.abs(l - prev)))
+    if len(tr) < p:
+        return float(np.mean(h - l)) + 1e-12
     atr = tr[:p].mean()
-    for x in tr[p:]: atr = (atr*(p-1) + x) / p
+    for x in tr[p:]:
+        atr = (atr * (p - 1) + x) / p
     return max(float(atr), 1e-12)
 
 
-# ─────────────────────────────────────────────────────────────
-# FILTROS
-# ─────────────────────────────────────────────────────────────
-
 def _in_dead_session() -> bool:
-    """01:30–05:00 UTC — baja liquidez, evitar entradas."""
-    t = datetime.datetime.utcnow()
-    m = t.hour * 60 + t.minute
-    return 90 <= m < 300
-
-
-_CORR_GROUPS = [
-    {"BTC-USDT", "ETH-USDT"},
-    {"SOL-USDT", "AVAX-USDT", "APT-USDT", "SUI-USDT", "NEAR-USDT"},
-    {"ARB-USDT", "OP-USDT", "MATIC-USDT"},
-    {"DOGE-USDT", "SHIB-USDT", "PEPE-USDT", "FLOKI-USDT", "BONK-USDT", "WIF-USDT"},
-]
-
-def is_correlated(symbol: str, open_syms: set) -> bool:
-    for grp in _CORR_GROUPS:
-        if symbol in grp:
-            if any(s in grp and s != symbol for s in open_syms):
-                return True
+    """Pine Script doesn't filter sessions — always False to match behavior."""
     return False
 
 
 # ─────────────────────────────────────────────────────────────
-# SEÑAL PRINCIPAL — con caché de vela
+# SEÑAL PRINCIPAL  (Pine Script exact match)
 # ─────────────────────────────────────────────────────────────
 
 def get_signal(
-    ohlcv_5m:       dict,
-    ohlcv_15m:      dict | None,
-    ohlcv_1h:       dict | None,
-    symbol:         str,
-    open_syms:      set   = None,
-    pivot_len:      int   = 5,
-    atr_period:     int   = 14,
-    atr_mult:       float = 1.5,
-    rr:             float = 2.5,
-    min_vol_mult:   float = 0.6,
-    hma_len:        int   = 50,
-    ft_period:      int   = 25,
-    min_atr_pct:    float = 0.10,
-    min_score:      int   = 3,
-    # compat
-    st_period:  int=10, st_mult:float=3., adx_period:int=14, adx_min:float=0.,
-    rsi_period: int=14, zz_deviation:float=0.5, zz15_deviation:float=0.8,
+    ohlcv_5m:     dict,
+    ohlcv_15m:    dict | None,
+    ohlcv_1h:     dict | None,
+    symbol:       str,
+    open_syms:    set   = None,
+    pivot_len:    int   = 5,
+    atr_period:   int   = 14,
+    atr_mult:     float = 2.0,   # kept for R-distance calc in pos_manager
+    rr:           float = 2.0,   # Pine: tp_mult = 2.0
+    min_vol_mult: float = 1.5,   # Pine: vol_mult = 1.5
+    hma_len:      int   = 50,    # unused (kept for compat)
+    ft_period:    int   = 25,    # unused (kept for compat)
+    min_atr_pct:  float = 0.0,   # optional pre-filter
+    min_score:    int   = 2,
+    # compat kwargs (ignored)
+    **kwargs,
 ) -> tuple[Signal | None, str]:
 
     if open_syms is None:
@@ -245,152 +134,186 @@ def get_signal(
     if not ohlcv_5m:
         return None, "no_data"
 
-    c5 = ohlcv_5m["close"]
-    if len(c5) < 2:
-        return None, "bars_insuf"
+    c5 = ohlcv_5m.get("close")
+    h5 = ohlcv_5m.get("high")
+    l5 = ohlcv_5m.get("low")
+    o5 = ohlcv_5m.get("open")
+    v5 = ohlcv_5m.get("volume")
 
-    # ── CACHE: skip if same candle as last check ──────────────
-    # FIX: usar hash de últimas 3 velas como ID único (precio solo no es fiable)
-    last_close_ts = hash((float(c5[-1]), float(c5[-2]), float(c5[-3])))
-    cached = _sig_cache.get(symbol)
-    if cached and cached[0] == last_close_ts:
+    if c5 is None or len(c5) < pivot_len * 4 + 5:
+        return None, f"bars_{0 if c5 is None else len(c5)}"
+
+    # ── Cache: skip if same candle ────────────────────────────
+    last_ts = hash((float(c5[-1]), float(c5[-2]), float(c5[-3])))
+    cached  = _sig_cache.get(symbol)
+    if cached and cached[0] == last_ts:
         sig = cached[1]
         return (sig, "ok") if sig else (None, "cached_none")
-
-    # ── Extract arrays ────────────────────────────────────────
-    h5 = ohlcv_5m["high"];  l5 = ohlcv_5m["low"]
-    o5 = ohlcv_5m["open"];  v5 = ohlcv_5m["volume"]
-
-    need = max(hma_len + 10, ft_period * 3 + 5, pivot_len * 4 + 5)
-    if len(c5) < need:
-        _sig_cache[symbol] = (last_close_ts, None)
-        return None, f"bars_{len(c5)}"
 
     price = float(c5[-1])
     if price <= 0:
         return None, "precio_cero"
 
-    # ── Session filter ────────────────────────────────────────
-    if _in_dead_session():
-        return None, "sesion_muerta"
-
-    # ── ATR filter ────────────────────────────────────────────
+    # ── ATR (for R-distance in pos_manager only) ──────────────
     atr_val = _atr_v(h5, l5, c5, atr_period)
-    if atr_val / price * 100 < min_atr_pct:
-        _sig_cache[symbol] = (last_close_ts, None)
-        return None, f"plano"
 
-    # ── Volume filter ─────────────────────────────────────────
-    vol_ma   = float(np.mean(v5[-20:])) if len(v5) >= 20 else 1.
-    vol_last = float(v5[-1])
-    if vol_ma <= 0 or vol_last < vol_ma * min_vol_mult:
-        _sig_cache[symbol] = (last_close_ts, None)
-        return None, f"vol_bajo_{vol_last/max(vol_ma,1):.2f}x"
+    # ── Pine: vol_ma = ta.sma(volume, 20) ────────────────────
+    # Pine checks current bar volume (v5[-1] = closed or forming candle)
+    # We use the second-to-last as reference SMA so current bar can spike
+    if len(v5) < 22:
+        return None, "vol_insuf"
+    vol_ma   = float(np.mean(v5[-21:-1]))   # SMA of last 20 closed bars
+    vol_last = float(v5[-2])                # last CLOSED bar (not forming)
+    if vol_ma <= 0:
+        return None, "vol_ma_cero"
+    vol_ratio = vol_last / vol_ma
 
-    # ── Correlation filter ────────────────────────────────────
-    if is_correlated(symbol, open_syms):
-        return None, "correlacion"
+    # Pine: institucional_vol = volume > (vol_ma * vol_mult)
+    institucional_vol = vol_ratio >= min_vol_mult
 
-    # ── ZigZag (vectorized pivot series + crossover) ──────────
-    pk_ser = _pivot_series_v(h5, pivot_len, is_high=True)
-    vl_ser = _pivot_series_v(l5, pivot_len, is_high=False)
+    # ── ATR pct pre-filter (optional, avoid flat pairs) ───────
+    if min_atr_pct > 0 and atr_val / price * 100 < min_atr_pct:
+        _sig_cache[symbol] = (last_ts, None)
+        return None, "plano"
 
-    long_zz  = _crossover(c5,  pk_ser)
-    short_zz = _crossunder(c5, vl_ser)
+    # ── ZigZag: pivot series (forward-filled) ────────────────
+    pk_ser = _pivot_series_v(_f(h5), pivot_len, is_high=True)
+    vl_ser = _pivot_series_v(_f(l5), pivot_len, is_high=False)
 
-    if not long_zz and not short_zz:
-        _sig_cache[symbol] = (last_close_ts, None)
-        pk = pk_ser[-1] if not np.isnan(pk_ser[-1]) else price
-        vl = vl_ser[-1] if not np.isnan(vl_ser[-1]) else price
-        return None, f"sin_cruce pk={pk:.4g} vl={vl:.4g}"
+    # Pine: ta.crossover(close, peak)  → prev <= peak AND curr > peak
+    # We use -2/-3 because -1 is the forming candle, -2 is last closed
+    # The "current" candle we evaluate is the LAST CLOSED bar (index -2)
+    curr_c   = float(c5[-2])
+    prev_c   = float(c5[-3])
+    curr_o   = float(o5[-2])
+    curr_pk  = pk_ser[-2] if not np.isnan(pk_ser[-2]) else pk_ser[-1]
+    curr_vl  = vl_ser[-2] if not np.isnan(vl_ser[-2]) else vl_ser[-1]
+    prev_pk  = pk_ser[-3] if not np.isnan(pk_ser[-3]) else curr_pk
+    prev_vl  = vl_ser[-3] if not np.isnan(vl_ser[-3]) else curr_vl
 
-    # ── HMA (vectorized) ──────────────────────────────────────
-    hma5       = _hma_v(c5, hma_len)
-    hb5, hd5   = _hma_direction(hma5, c5)
+    if np.isnan(curr_pk) or np.isnan(curr_vl):
+        _sig_cache[symbol] = (last_ts, None)
+        return None, "no_pivot"
 
-    if long_zz  and not hb5:
-        _sig_cache[symbol] = (last_close_ts, None)
-        return None, "long_HMA_bajista"
-    if short_zz and not hd5:
-        _sig_cache[symbol] = (last_close_ts, None)
-        return None, "short_HMA_alcista"
+    # Pine crossover/crossunder
+    long_cross  = (prev_c <= prev_pk) and (curr_c > curr_pk)
+    short_cross = (prev_c >= prev_vl) and (curr_c < curr_vl)
 
-    # ── FutureTrend (vectorized) ──────────────────────────────
-    ft5 = _future_trend_v(o5, c5, v5, ft_period)
-    if long_zz  and ft5 <= 0:
-        _sig_cache[symbol] = (last_close_ts, None)
-        return None, f"long_FT={ft5:.0f}"
-    if short_zz and ft5 >= 0:
-        _sig_cache[symbol] = (last_close_ts, None)
-        return None, f"short_FT={ft5:.0f}"
+    if not long_cross and not short_cross:
+        _sig_cache[symbol] = (last_ts, None)
+        return None, f"sin_cruce pk={curr_pk:.5g} vl={curr_vl:.5g} c={curr_c:.5g}"
 
-    # ── Score ─────────────────────────────────────────────────
-    score   = 0
+    # Pine: close > open (bull candle) / close < open (bear candle)
+    bull_candle = curr_c > curr_o
+    bear_candle = curr_c < curr_o
+
+    # ── BUILD SIGNAL ──────────────────────────────────────────
     reasons = []
+    score   = 0
 
-    score  += 2
-    pk_v    = float(pk_ser[-1]) if not np.isnan(pk_ser[-1]) else price
-    vl_v    = float(vl_ser[-1]) if not np.isnan(vl_ser[-1]) else price
-    reasons.append(f"ZZ{'↑' if long_zz else '↓'}{(pk_v if long_zz else vl_v):.5g}")
+    # ── LONG ──────────────────────────────────────────────────
+    if long_cross and institucional_vol and bull_candle:
+        sl = float(curr_vl)           # Pine: sl = valley
+        tp = curr_c + (curr_c - sl) * rr  # Pine: tp = close + (close-sl)*tp_mult
 
-    score += 1
-    reasons.append(f"HMA{'↑' if long_zz else '↓'}{hma5[-1]:.5g}")
+        if sl <= 0 or sl >= curr_c:
+            _sig_cache[symbol] = (last_ts, None)
+            return None, f"sl_invalido sl={sl:.6f} c={curr_c:.6f}"
 
-    score += 1
-    reasons.append(f"FT{ft5:+.0f}")
+        score   = 2
+        reasons = [
+            f"CROSS↑{curr_pk:.5g}",
+            f"VOL{vol_ratio:.1f}x",
+            "BULL🕯️",
+        ]
 
-    # 15m confirmation (vectorized too)
-    if ohlcv_15m:
-        c15 = ohlcv_15m.get("close")
-        h15 = ohlcv_15m.get("high")
-        l15 = ohlcv_15m.get("low")
-        o15 = ohlcv_15m.get("open")
-        v15 = ohlcv_15m.get("volume")
-        if c15 is not None and len(c15) > max(hma_len, ft_period * 3):
-            hma15      = _hma_v(c15, hma_len)
-            hb15, hd15 = _hma_direction(hma15, c15)
-            ft15       = _future_trend_v(o15, c15, v15, ft_period)
-            if (long_zz  and hb15 and ft15 > 0) or \
-               (short_zz and hd15 and ft15 < 0):
-                score += 1
-                reasons.append("MTF✓")
+        # Optional: 15m confirmation
+        if ohlcv_15m:
+            c15 = ohlcv_15m.get("close")
+            h15 = ohlcv_15m.get("high")
+            if c15 is not None and len(c15) > pivot_len * 4 + 5:
+                pk15 = _pivot_series_v(_f(h15), pivot_len, is_high=True)
+                if not np.isnan(pk15[-2]) and float(c15[-2]) > float(pk15[-2]):
+                    score += 1
+                    reasons.append("15M✓")
 
-    vol_ratio = vol_last / vol_ma if vol_ma > 0 else 0.
-    if vol_last > vol_ma * 1.2:
-        score += 1
-        reasons.append(f"VOL{vol_ratio:.1f}x")
+        if score < min_score:
+            _sig_cache[symbol] = (last_ts, None)
+            return None, f"score={score}"
 
-    if score < min_score:
-        _sig_cache[symbol] = (last_close_ts, None)
-        return None, f"score={score}"
+        sig = Signal(
+            symbol=symbol, side="BUY",
+            price=curr_c, sl=round(sl, 8), tp=round(tp, 8),
+            atr_5m=atr_val, peak=float(curr_pk), valley=float(curr_vl),
+            score=score, vol_ratio=round(vol_ratio, 2),
+            reasons=reasons, st_bull_15m=True,
+        )
+        _sig_cache[symbol] = (last_ts, sig)
+        return sig, "ok"
 
-    # ── SL / TP ───────────────────────────────────────────────
-    sl_dist = atr_val * atr_mult
-    tp_dist = sl_dist * rr
+    # ── SHORT ─────────────────────────────────────────────────
+    if short_cross and institucional_vol and bear_candle:
+        sl = float(curr_pk)           # Pine: sl = peak
+        tp = curr_c - (sl - curr_c) * rr  # Pine: tp = close - (sl-close)*tp_mult
 
-    sig = Signal(
-        symbol=symbol,
-        side="BUY" if long_zz else "SELL",
-        price=price,
-        sl=round((price - sl_dist) if long_zz else (price + sl_dist), 8),
-        tp=round((price + tp_dist) if long_zz else (price - tp_dist), 8),
-        atr_5m=atr_val, peak=pk_v, valley=vl_v,
-        hma_val=float(hma5[-1]), ft_val=ft5,
-        score=score, vol_ratio=round(vol_ratio, 2),
-        reasons=reasons,
-        st_bull_15m=long_zz,
-    )
-    _sig_cache[symbol] = (last_close_ts, sig)
-    return sig, "ok"
+        if sl <= 0 or sl <= curr_c:
+            _sig_cache[symbol] = (last_ts, None)
+            return None, f"sl_invalido sl={sl:.6f} c={curr_c:.6f}"
+
+        score   = 2
+        reasons = [
+            f"CROSS↓{curr_vl:.5g}",
+            f"VOL{vol_ratio:.1f}x",
+            "BEAR🕯️",
+        ]
+
+        if ohlcv_15m:
+            c15 = ohlcv_15m.get("close")
+            l15 = ohlcv_15m.get("low")
+            if c15 is not None and len(c15) > pivot_len * 4 + 5:
+                vl15 = _pivot_series_v(_f(l15), pivot_len, is_high=False)
+                if not np.isnan(vl15[-2]) and float(c15[-2]) < float(vl15[-2]):
+                    score += 1
+                    reasons.append("15M✓")
+
+        if score < min_score:
+            _sig_cache[symbol] = (last_ts, None)
+            return None, f"score={score}"
+
+        sig = Signal(
+            symbol=symbol, side="SELL",
+            price=curr_c, sl=round(sl, 8), tp=round(tp, 8),
+            atr_5m=atr_val, peak=float(curr_pk), valley=float(curr_vl),
+            score=score, vol_ratio=round(vol_ratio, 2),
+            reasons=reasons, st_bull_15m=False,
+        )
+        _sig_cache[symbol] = (last_ts, sig)
+        return sig, "ok"
+
+    # ── Rejection reason (crossover present but other conditions failed) ──
+    if long_cross:
+        if not institucional_vol:
+            r = f"vol_bajo_{vol_ratio:.2f}x"
+        else:
+            r = "no_bull_candle"
+    elif short_cross:
+        if not institucional_vol:
+            r = f"vol_bajo_{vol_ratio:.2f}x"
+        else:
+            r = "no_bear_candle"
+    else:
+        r = "sin_cruce"
+
+    _sig_cache[symbol] = (last_ts, None)
+    return None, r
 
 
 def clear_signal_cache(symbol: str) -> None:
-    """Call when trade is opened/closed to force recompute."""
     _sig_cache.pop(symbol, None)
 
 
 # ─────────────────────────────────────────────────────────────
-# EXIT LOGIC (vectorizado)
+# EXIT LOGIC — pivot break (matches Pine trail exit)
 # ─────────────────────────────────────────────────────────────
 
 def check_trail_exit(
@@ -398,56 +321,40 @@ def check_trail_exit(
     ohlcv_15m:  dict | None,
     trade_side: str,
     pivot_len:  int   = 5,
-    hma_len:    int   = 50,
-    ft_period:  int   = 25,
+    hma_len:    int   = 50,   # unused, kept for compat
+    ft_period:  int   = 25,   # unused, kept for compat
     peak_r:     float = 0.,
-    # compat
-    st_period:float=3., st_mult:float=3., rsi_period:int=14,
-    zz_deviation:float=0.5,
+    **kwargs,
 ) -> str | None:
     """
-    Exit cascade:
-    1. HMA flip 5m  (más rápido: 1-2 velas)
-    2. FutureTrend flip (flujo de órdenes)
-    3. HMA flip 15m
-    4. Pivot break contrario
+    Exit when price crosses back through the opposing pivot level.
+    Mirrors Pine: strategy.exit(..., trail_price=..., trail_offset=...)
+    Only activates after peak_r >= 1.0 (breakeven territory).
     """
-    h5 = ohlcv_5m["high"]; l5 = ohlcv_5m["low"]
-    c5 = ohlcv_5m["close"]; o5 = ohlcv_5m["open"]
-    v5 = ohlcv_5m["volume"]
-
-    if len(c5) < hma_len + 3:
+    if not ohlcv_5m or peak_r < 1.0:
         return None
 
-    # 1. HMA 5m flip (vectorized)
-    hma5      = _hma_v(c5, hma_len)
-    hb5, hd5  = _hma_direction(hma5, c5)
-    if trade_side == "BUY"  and hd5: return "HMA5_FLIP"
-    if trade_side == "SELL" and hb5: return "HMA5_FLIP"
+    c5 = ohlcv_5m.get("close")
+    h5 = ohlcv_5m.get("high")
+    l5 = ohlcv_5m.get("low")
 
-    # 2. FutureTrend flip
-    if len(c5) > ft_period * 3:
-        ft5 = _future_trend_v(o5, c5, v5, ft_period)
-        if trade_side == "BUY"  and ft5 < 0: return "FT_FLIP"
-        if trade_side == "SELL" and ft5 > 0: return "FT_FLIP"
+    if c5 is None or len(c5) < pivot_len * 4 + 5:
+        return None
 
-    # 3. HMA 15m flip
-    if ohlcv_15m:
-        c15 = ohlcv_15m.get("close")
-        if c15 is not None and len(c15) > hma_len + 3:
-            hma15     = _hma_v(c15, hma_len)
-            hb15,hd15 = _hma_direction(hma15, c15)
-            if trade_side == "BUY"  and hd15: return "HMA15_FLIP"
-            if trade_side == "SELL" and hb15: return "HMA15_FLIP"
+    curr_c = float(c5[-2])
+    prev_c = float(c5[-3])
 
-    # 4. Pivot break contrario (vectorized)
-    if len(c5) > pivot_len * 4:
-        price = float(c5[-1])
-        if trade_side == "BUY":
-            vl = _pivot_series_v(l5, pivot_len, False)
-            if not np.isnan(vl[-1]) and price < vl[-1]: return "PIVOT_BREAK"
-        if trade_side == "SELL":
-            pk = _pivot_series_v(h5, pivot_len, True)
-            if not np.isnan(pk[-1]) and price > pk[-1]: return "PIVOT_BREAK"
+    if trade_side == "BUY":
+        # Exit if price breaks back below valley
+        vl = _pivot_series_v(_f(l5), pivot_len, is_high=False)
+        vl_now = vl[-2] if not np.isnan(vl[-2]) else float('nan')
+        if not np.isnan(vl_now) and prev_c > vl_now and curr_c < vl_now:
+            return "TRAIL_VALLEY"
+    else:
+        # Exit if price breaks back above peak
+        pk = _pivot_series_v(_f(h5), pivot_len, is_high=True)
+        pk_now = pk[-2] if not np.isnan(pk[-2]) else float('nan')
+        if not np.isnan(pk_now) and prev_c < pk_now and curr_c > pk_now:
+            return "TRAIL_PEAK"
 
     return None
