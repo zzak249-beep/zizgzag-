@@ -201,25 +201,33 @@ async def main_loop() -> None:
         f"Esto toma ~2-3 min. Se notificará cuando esté listo."
     )
 
-    warmed = await warmup_all(
-        _active_symbols,
-        tf_5m=cfg.timeframe,
-        tf_15m=cfg.timeframe_slow,
-        batch=8,  # conservative concurrency for cold fetch
-    )
+    # ── WARMUP PHASE — retry until ≥30% of symbols are warm ──────
+    MIN_WARM_PCT = 0.30
+    warmup_attempt = 0
+    warmed = 0
 
-    # ── Retry warmup if success rate is too low ─────────────────
-    if warmed < len(_active_symbols) * 0.5:
-        logger.warning(f"[WARMUP] Solo {warmed}/{len(_active_symbols)} — reintentando en 30s...")
-        await asyncio.sleep(30)
-        warmed2 = await warmup_all(
+    while warmed < len(_active_symbols) * MIN_WARM_PCT:
+        warmup_attempt += 1
+        wait_s = min(30 * warmup_attempt, 180)  # 30s, 60s, 90s… cap at 3 min
+
+        if warmup_attempt > 1:
+            logger.warning(
+                f"[WARMUP] Intento {warmup_attempt}: solo {warmed}/{len(_active_symbols)} "
+                f"calentados. Reintentando en {wait_s}s (BingX lento o Railway incident)…"
+            )
+            await notifier.notify(
+                f"⚠️ Warmup parcial ({warmed}/{len(_active_symbols)}).\n"
+                f"Reintentando en {wait_s}s…"
+            )
+            await asyncio.sleep(wait_s)
+
+        warmed = await warmup_all(
             _active_symbols,
             tf_5m=cfg.timeframe,
             tf_15m=cfg.timeframe_slow,
-            batch=5,  # even more conservative on retry
+            batch=max(3, 8 - warmup_attempt),  # lower concurrency each retry
         )
-        warmed = max(warmed, warmed2)
-        logger.info(f"[WARMUP] Retry: {warmed}/{len(_active_symbols)} calentados")
+        logger.info(f"[WARMUP] Intento {warmup_attempt}: {warmed}/{len(_active_symbols)} OK")
 
     _warmed_up = True
 
