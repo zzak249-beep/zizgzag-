@@ -1,0 +1,83 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════
+// SNIPER BOT V26.1 — Webhook Edition
+// Añade este script a TradingView como indicador auxiliar
+// NO como strategy (para evitar look-ahead bias en vivo)
+// ══════════════════════════════════════════════════════════════
+indicator("Sniper Webhook V26.1", overlay=true)
+
+// ── Inputs ──────────────────────────────────────────────────
+pivot_len = input.int(5,   "ZigZag depth")
+vol_mult  = input.float(1.5, "Vol multiplier")
+atr_len   = input.int(14,  "ATR length")
+
+// ── Indicadores ──────────────────────────────────────────────
+ema7   = ta.ema(close, 7)
+ema17  = ta.ema(close, 17)
+hull   = ta.hma(close, 50)
+atr_v  = ta.atr(atr_len)
+
+vol_ma      = ta.sma(volume, 20)
+is_inst_vol = volume > (vol_ma * vol_mult)
+
+// ── Pivotes (se confirman N velas después — sin look-ahead) ──
+ph = ta.pivothigh(high, pivot_len, pivot_len)
+pl = ta.pivotlow(low,  pivot_len, pivot_len)
+var float peak   = na
+var float valley = na
+if not na(ph) => peak   := ph
+if not na(pl) => valley := pl
+
+// ── STC ──────────────────────────────────────────────────────
+stc_calc(src, len, f, s) =>
+    macd  = ta.ema(src, f) - ta.ema(src, s)
+    stoch = ta.stoch(macd, macd, macd, len) / 100
+    ta.stoch(stoch, stoch, stoch, len)
+stc_val = stc_calc(close, 10, 23, 50)
+slope7  = ema7 - ema7[1]
+
+// ── Señales APEX ─────────────────────────────────────────────
+// IMPORTANTE: usa barstate.isconfirmed para evitar look-ahead
+long_apex  = barstate.isconfirmed and
+     ta.crossover(ema7, ema17) and close > peak    and
+     is_inst_vol and close > hull and
+     stc_val > stc_val[1] and slope7 > 0
+
+short_apex = barstate.isconfirmed and
+     ta.crossunder(ema7, ema17) and close < valley and
+     is_inst_vol and close < hull and
+     stc_val < stc_val[1] and slope7 < 0
+
+// ── Alertas ──────────────────────────────────────────────────
+// El mensaje JSON va en el campo "Message" de la alerta en TradingView
+// Reemplaza YOUR_SECRET con el valor de WEBHOOK_SECRET de tu .env
+
+alertcondition(long_apex,  "LONG APEX",  "LONG")
+alertcondition(short_apex, "SHORT APEX", "SHORT")
+
+// ── Plots ────────────────────────────────────────────────────
+plot(peak,   "Liq High", color.new(color.lime, 40), style=plot.style_linebr)
+plot(valley, "Liq Low",  color.new(color.red,  40), style=plot.style_linebr)
+plot(ema7,   "EMA7",     color.yellow, linewidth=1)
+plot(ema17,  "EMA17",    color.orange, linewidth=1)
+plot(hull,   "Hull",     color.aqua,   linewidth=2)
+bgcolor(is_inst_vol ? color.new(color.purple, 92) : na)
+
+// ══════════════════════════════════════════════════════════════
+// CONFIGURACIÓN DE ALERTAS EN TRADINGVIEW:
+//
+// 1. Clic derecho en el gráfico → "Add alert"
+// 2. Condition: "Sniper Webhook V26.1" → "LONG APEX"
+// 3. Actions: "Webhook URL" → https://TU-APP.railway.app/webhook
+// 4. Message (JSON):
+//    {
+//      "secret":  "TU_WEBHOOK_SECRET",
+//      "action":  "BUY",
+//      "symbol":  "{{ticker}}-USDT",
+//      "atr":     "{{plot_1}}"
+//    }
+//
+// Repite para SHORT con action: "SELL"
+// Para cierre manual:
+//    {"secret":"...","action":"CLOSE","symbol":"{{ticker}}-USDT","atr":"1"}
+// ══════════════════════════════════════════════════════════════
