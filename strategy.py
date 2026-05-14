@@ -1,360 +1,188 @@
-# -*- coding: utf-8 -*-
-"""strategy.py -- Phantom Edge Bot v6 — ZigZag Institutional Elite V6.
-Matches Pine Script EXACTLY:
-  LONG:  ta.crossover(close, peak)  + volume > vol_ma*vol_mult + close > open
-  SHORT: ta.crossunder(close, valley) + volume > vol_ma*vol_mult + close < open
-  SL:    valley (long) / peak (short)  ← pivot level, NOT ATR
-  TP:    close + (close-sl)*rr
 """
-from __future__ import annotations
+ZigZag Channel Fade — Motor de señales
+Basado en investigación: 3m genera 7-10 rupturas/día, con trigger 0.5×ATR → 1-2 señales netas
+Canal tiene ~3-4×ATR de ancho → RR real ~1.5:1 con SL de 2×ATR
+"""
+import logging
 import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple, List
+import config
+
+log = logging.getLogger("strategy")
 
 
-# ─────────────────────────────────────────────────────────────
-# DATACLASS
-# ─────────────────────────────────────────────────────────────
-
-@dataclass
-class Signal:
-    symbol:    str
-    side:      str
-    price:     float
-    sl:        float
-    tp:        float
-    atr_5m:    float
-    peak:      float
-    valley:    float
-    score:     int
-    vol_ratio: float
-    reasons:   list = field(default_factory=list)
-    # compat aliases
-    atr:       float = 0.0
-    zz_high:   float = 0.0
-    zz_low:    float = 0.0
-    hma_val:   float = 0.0
-    ft_val:    float = 0.0
-    zz_trend:  str   = "FLAT"
-    st_bull_15m: bool = True
-    delta1:    float = 0.0
-    delta2:    float = 0.0
-
-    def __post_init__(self):
-        self.atr     = self.atr_5m
-        self.zz_high = self.peak
-        self.zz_low  = self.valley
-        self.delta1  = self.peak
-        self.delta2  = self.valley
+def parse_klines(raw: list) -> Tuple[np.ndarray,...]:
+    if not raw:
+        return (np.array([]),)*5
+    O,H,L,C,V=[],[],[],[],[]
+    for k in raw:
+        try:
+            if isinstance(k, dict):
+                o=float(k.get("open",  k.get("o",0)))
+                h=float(k.get("high",  k.get("h",0)))
+                l=float(k.get("low",   k.get("l",0)))
+                c=float(k.get("close", k.get("c",0)))
+                v=float(k.get("volume",k.get("v",0)))
+            elif isinstance(k,(list,tuple)) and len(k)>=6:
+                o,h,l,c,v=float(k[1]),float(k[2]),float(k[3]),float(k[4]),float(k[5])
+            else: continue
+            if h<=0 or c<=0 or h<l: continue
+            O.append(o);H.append(h);L.append(l);C.append(c);V.append(v)
+        except: continue
+    return np.array(O),np.array(H),np.array(L),np.array(C),np.array(V)
 
 
-# ─────────────────────────────────────────────────────────────
-# CACHE (evita recomputar si misma vela)
-# ─────────────────────────────────────────────────────────────
-_sig_cache: dict[str, tuple[float, Optional[Signal]]] = {}
+def calc_atr(H,L,C,p=14):
+    if len(C)<p+1: return 0.0
+    tr=np.maximum(H[1:]-L[1:],np.maximum(np.abs(H[1:]-C[:-1]),np.abs(L[1:]-C[:-1])))
+    v=np.mean(tr[:p])
+    for i in range(p,len(tr)): v=(v*(p-1)+tr[i])/p
+    return float(v)
+
+def calc_ema(C,p):
+    if len(C)<2: return np.full(len(C),float(C[0]))
+    e=np.empty(len(C)); e[0]=float(C[0]); k=2.0/(p+1)
+    for i in range(1,len(C)): e[i]=C[i]*k+e[i-1]*(1-k)
+    return e
+
+def calc_rsi(C,p=14):
+    if len(C)<p+1: return 50.0
+    d=np.diff(C.astype(float))
+    g=np.where(d>0,d,0.); l=np.where(d<0,-d,0.)
+    ag=np.mean(g[:p]); al=np.mean(l[:p])
+    for i in range(p,len(d)):
+        ag=(ag*(p-1)+g[i])/p; al=(al*(p-1)+l[i])/p
+    return 100. if al==0 else float(100-100/(1+ag/al))
+
+def find_pivots(H,L,pl):
+    ph,plv=[],[]
+    n=len(H)
+    for i in range(pl,n-pl):
+        if H[i]>=np.max(H[i-pl:i+pl+1]): ph.append((float(H[i]),i))
+        if L[i]<=np.min(L[i-pl:i+pl+1]): plv.append((float(L[i]),i))
+    return ph,plv
 
 
-# ─────────────────────────────────────────────────────────────
-# INDICADORES VECTORIZADOS
-# ─────────────────────────────────────────────────────────────
-
-def _f(a) -> np.ndarray:
-    return np.nan_to_num(np.asarray(a, dtype=np.float64), nan=0., posinf=0., neginf=0.)
-
-
-def _pivot_series_v(arr: np.ndarray, n: int, is_high: bool) -> np.ndarray:
+class ChannelFadeSignal:
     """
-    ta.pivothigh / ta.pivotlow + forward-fill (Pine 'var float peak = na').
-    Vectorized via sliding_window_view — O(n) instead of O(n×2p).
+    Reglas base (siempre activas):
+      SHORT: close >= verde + ATR×trigger  →  TP=rojo,  SL=entry+2×ATR
+      LONG:  close <= rojo  - ATR×trigger  →  TP=verde, SL=entry-2×ATR
+    
+    Filtros opcionales (via env var):
+      USE_EMA_FILTER  → SHORT solo si close<EMA, LONG solo si close>EMA
+      USE_RSI_FILTER  → SHORT si RSI>60, LONG si RSI<40
+      USE_VOL_FILTER  → solo si vol > 1.3×media20
     """
-    L = len(arr)
-    if L < 2 * n + 1:
-        return np.full(L, np.nan)
 
-    wins = sliding_window_view(arr, 2 * n + 1)
-    ctr  = arr[n : L - n]
-    ref  = wins.max(axis=1) if is_high else wins.min(axis=1)
+    def compute(self, opens, highs, lows, closes, volumes) -> Optional[dict]:
+        n = len(closes)
+        MIN = config.PIVOT_LEN*2 + config.ATR_LEN + 3
+        if n < MIN:
+            log.debug(f"✗ pocas velas {n}<{MIN}")
+            return None
 
-    confirmed        = np.where(ctr == ref, ctr, np.nan)
-    result           = np.full(L, np.nan)
-    result[n : L-n]  = confirmed
+        # Excluir última vela (BingX siempre incluye la vela en curso)
+        H=highs[:-1]; L=lows[:-1]; C=closes[:-1]; O=opens[:-1]; V=volumes[:-1]
+        if len(C) < MIN-1: return None
 
-    # Forward-fill (Pine: var float peak = na / if not na(ph): peak := ph)
-    cur = np.nan
-    for i in range(L):
-        if not np.isnan(result[i]):
-            cur = result[i]
-        result[i] = cur
-    return result
+        # ── ATR ──────────────────────────────────────────────────────
+        atr = calc_atr(H,L,C,config.ATR_LEN)
+        if atr <= 0:
+            log.debug("✗ ATR=0")
+            return None
 
+        # ── Canal ZigZag ─────────────────────────────────────────────
+        ph,plv = find_pivots(H,L,config.PIVOT_LEN)
+        if not ph or not plv:
+            log.debug(f"✗ sin pivots: ph={len(ph)} plv={len(plv)}")
+            return None
 
-def _atr_v(h, l, c, p: int = 14) -> float:
-    h, l, c = _f(h), _f(l), _f(c)
-    prev     = np.roll(c, 1); prev[0] = c[0]
-    tr       = np.maximum(h - l, np.maximum(np.abs(h - prev), np.abs(l - prev)))
-    if len(tr) < p:
-        return float(np.mean(h - l)) + 1e-12
-    atr = tr[:p].mean()
-    for x in tr[p:]:
-        atr = (atr * (p - 1) + x) / p
-    return max(float(atr), 1e-12)
+        green = ph[-1][0]   # último máximo local confirmado
+        red   = plv[-1][0]  # último mínimo local confirmado
 
+        if green <= red:
+            log.debug(f"✗ canal inválido green={green:.4g}<=red={red:.4g}")
+            return None
 
-def _in_dead_session() -> bool:
-    """Pine Script doesn't filter sessions — always False to match behavior."""
-    return False
+        canal = green - red
+        if canal < atr * config.MIN_CANAL_ATR:
+            log.debug(f"✗ canal estrecho {canal:.4g}<{atr*config.MIN_CANAL_ATR:.4g}")
+            return None
 
+        close = float(C[-1])
+        short_trig = green + atr * config.ATR_TRIGGER_MULT
+        long_trig  = red   - atr * config.ATR_TRIGGER_MULT
 
-# ─────────────────────────────────────────────────────────────
-# SEÑAL PRINCIPAL  (Pine Script exact match)
-# ─────────────────────────────────────────────────────────────
+        # ── Filtros opcionales ────────────────────────────────────────
+        rsi = 50.0
+        if config.USE_RSI_FILTER:
+            rsi = calc_rsi(C, config.RSI_PERIOD)
 
-def get_signal(
-    ohlcv_5m:     dict,
-    ohlcv_15m:    dict | None,
-    ohlcv_1h:     dict | None,
-    symbol:       str,
-    open_syms:    set   = None,
-    pivot_len:    int   = 5,
-    atr_period:   int   = 14,
-    atr_mult:     float = 2.0,   # kept for R-distance calc in pos_manager
-    rr:           float = 2.0,   # Pine: tp_mult = 2.0
-    min_vol_mult: float = 1.5,   # Pine: vol_mult = 1.5
-    hma_len:      int   = 50,    # unused (kept for compat)
-    ft_period:    int   = 25,    # unused (kept for compat)
-    min_atr_pct:  float = 0.0,   # optional pre-filter
-    min_score:    int   = 2,
-    # compat kwargs (ignored)
-    **kwargs,
-) -> tuple[Signal | None, str]:
+        ema_val = 0.0
+        if config.USE_EMA_FILTER:
+            ema_val = float(calc_ema(C, config.EMA_PERIOD)[-1])
 
-    if open_syms is None:
-        open_syms = set()
-    if not ohlcv_5m:
-        return None, "no_data"
+        vol_ratio = 1.0
+        if config.USE_VOL_FILTER:
+            vm = np.mean(V[-20:]) if len(V)>=20 else np.mean(V)
+            vol_ratio = float(V[-1]/vm) if vm>0 else 1.0
+            if vol_ratio < config.VOL_MULT:
+                log.debug(f"✗ vol bajo {vol_ratio:.2f}x<{config.VOL_MULT}x")
+                return None
 
-    c5 = ohlcv_5m.get("close")
-    h5 = ohlcv_5m.get("high")
-    l5 = ohlcv_5m.get("low")
-    o5 = ohlcv_5m.get("open")
-    v5 = ohlcv_5m.get("volume")
+        # ── SHORT ─────────────────────────────────────────────────────
+        if close >= short_trig:
+            ema_ok  = (not config.USE_EMA_FILTER) or (close < ema_val)
+            rsi_ok  = (not config.USE_RSI_FILTER) or (rsi > config.RSI_SHORT_MIN)
+            if ema_ok and rsi_ok:
+                sl = close + atr * config.SL_ATR_MULT
+                tp = red
+                if tp < close < sl and (close - tp) > 0:
+                    rr = abs(tp-close)/abs(sl-close)
+                    log.info(f"🔴 SHORT green={green:.6g} trig={short_trig:.6g} "
+                             f"close={close:.6g} canal={canal:.4g} ATR={atr:.4g} RR=1:{rr:.1f}"
+                             + (f" RSI={rsi:.1f}" if config.USE_RSI_FILTER else "")
+                             + (f" EMA={ema_val:.4g}" if config.USE_EMA_FILTER else ""))
+                    return dict(side="SELL", entry=close, sl=sl, tp=tp, atr=atr,
+                                green=green, red=red, canal_width=canal,
+                                trigger=short_trig, rsi=rsi, vol_ratio=vol_ratio)
+            else:
+                log.debug(f"✗ SHORT filtrado ema_ok={ema_ok} rsi_ok={rsi_ok} RSI={rsi:.1f}")
 
-    if c5 is None or len(c5) < pivot_len * 4 + 5:
-        return None, f"bars_{0 if c5 is None else len(c5)}"
+        # ── LONG ──────────────────────────────────────────────────────
+        if close <= long_trig:
+            ema_ok  = (not config.USE_EMA_FILTER) or (close > ema_val)
+            rsi_ok  = (not config.USE_RSI_FILTER) or (rsi < config.RSI_LONG_MAX)
+            if ema_ok and rsi_ok:
+                sl = close - atr * config.SL_ATR_MULT
+                tp = green
+                if sl < close < tp and (tp - close) > 0:
+                    rr = abs(tp-close)/abs(close-sl)
+                    log.info(f"🟢 LONG red={red:.6g} trig={long_trig:.6g} "
+                             f"close={close:.6g} canal={canal:.4g} ATR={atr:.4g} RR=1:{rr:.1f}"
+                             + (f" RSI={rsi:.1f}" if config.USE_RSI_FILTER else "")
+                             + (f" EMA={ema_val:.4g}" if config.USE_EMA_FILTER else ""))
+                    return dict(side="BUY", entry=close, sl=sl, tp=tp, atr=atr,
+                                green=green, red=red, canal_width=canal,
+                                trigger=long_trig, rsi=rsi, vol_ratio=vol_ratio)
+            else:
+                log.debug(f"✗ LONG filtrado ema_ok={ema_ok} rsi_ok={rsi_ok} RSI={rsi:.1f}")
 
-    # ── Cache: skip if same candle ────────────────────────────
-    last_ts = hash((float(c5[-1]), float(c5[-2]), float(c5[-3])))
-    cached  = _sig_cache.get(symbol)
-    if cached and cached[0] == last_ts:
-        sig = cached[1]
-        return (sig, "ok") if sig else (None, "cached_none")
-
-    price = float(c5[-1])
-    if price <= 0:
-        return None, "precio_cero"
-
-    # ── ATR (for R-distance in pos_manager only) ──────────────
-    atr_val = _atr_v(h5, l5, c5, atr_period)
-
-    # ── Pine: vol_ma = ta.sma(volume, 20) ────────────────────
-    # Pine checks current bar volume (v5[-1] = closed or forming candle)
-    # We use the second-to-last as reference SMA so current bar can spike
-    if len(v5) < 22:
-        return None, "vol_insuf"
-    vol_ma   = float(np.mean(v5[-21:-1]))   # SMA of last 20 closed bars
-    vol_last = float(v5[-2])                # last CLOSED bar (not forming)
-    if vol_ma <= 0:
-        return None, "vol_ma_cero"
-    vol_ratio = vol_last / vol_ma
-
-    # Pine: institucional_vol = volume > (vol_ma * vol_mult)
-    institucional_vol = vol_ratio >= min_vol_mult
-
-    # ── ATR pct pre-filter (optional, avoid flat pairs) ───────
-    if min_atr_pct > 0 and atr_val / price * 100 < min_atr_pct:
-        _sig_cache[symbol] = (last_ts, None)
-        return None, "plano"
-
-    # ── ZigZag: pivot series (forward-filled) ────────────────
-    pk_ser = _pivot_series_v(_f(h5), pivot_len, is_high=True)
-    vl_ser = _pivot_series_v(_f(l5), pivot_len, is_high=False)
-
-    # Pine: ta.crossover(close, peak)  → prev <= peak AND curr > peak
-    # We use -2/-3 because -1 is the forming candle, -2 is last closed
-    # The "current" candle we evaluate is the LAST CLOSED bar (index -2)
-    curr_c   = float(c5[-2])
-    prev_c   = float(c5[-3])
-    curr_o   = float(o5[-2])
-    curr_pk  = pk_ser[-2] if not np.isnan(pk_ser[-2]) else pk_ser[-1]
-    curr_vl  = vl_ser[-2] if not np.isnan(vl_ser[-2]) else vl_ser[-1]
-    prev_pk  = pk_ser[-3] if not np.isnan(pk_ser[-3]) else curr_pk
-    prev_vl  = vl_ser[-3] if not np.isnan(vl_ser[-3]) else curr_vl
-
-    if np.isnan(curr_pk) or np.isnan(curr_vl):
-        _sig_cache[symbol] = (last_ts, None)
-        return None, "no_pivot"
-
-    # Pine crossover/crossunder
-    long_cross  = (prev_c <= prev_pk) and (curr_c > curr_pk)
-    short_cross = (prev_c >= prev_vl) and (curr_c < curr_vl)
-
-    if not long_cross and not short_cross:
-        _sig_cache[symbol] = (last_ts, None)
-        return None, f"sin_cruce pk={curr_pk:.5g} vl={curr_vl:.5g} c={curr_c:.5g}"
-
-    # Pine: close > open (bull candle) / close < open (bear candle)
-    bull_candle = curr_c > curr_o
-    bear_candle = curr_c < curr_o
-
-    # ── BUILD SIGNAL ──────────────────────────────────────────
-    reasons = []
-    score   = 0
-
-    # ── LONG ──────────────────────────────────────────────────
-    if long_cross and institucional_vol and bull_candle:
-        sl = float(curr_vl)           # Pine: sl = valley
-        tp = curr_c + (curr_c - sl) * rr  # Pine: tp = close + (close-sl)*tp_mult
-
-        if sl <= 0 or sl >= curr_c:
-            _sig_cache[symbol] = (last_ts, None)
-            return None, f"sl_invalido sl={sl:.6f} c={curr_c:.6f}"
-
-        score   = 2
-        reasons = [
-            f"CROSS↑{curr_pk:.5g}",
-            f"VOL{vol_ratio:.1f}x",
-            "BULL🕯️",
-        ]
-
-        # Optional: 15m confirmation
-        if ohlcv_15m:
-            c15 = ohlcv_15m.get("close")
-            h15 = ohlcv_15m.get("high")
-            if c15 is not None and len(c15) > pivot_len * 4 + 5:
-                pk15 = _pivot_series_v(_f(h15), pivot_len, is_high=True)
-                if not np.isnan(pk15[-2]) and float(c15[-2]) > float(pk15[-2]):
-                    score += 1
-                    reasons.append("15M✓")
-
-        if score < min_score:
-            _sig_cache[symbol] = (last_ts, None)
-            return None, f"score={score}"
-
-        sig = Signal(
-            symbol=symbol, side="BUY",
-            price=curr_c, sl=round(sl, 8), tp=round(tp, 8),
-            atr_5m=atr_val, peak=float(curr_pk), valley=float(curr_vl),
-            score=score, vol_ratio=round(vol_ratio, 2),
-            reasons=reasons, st_bull_15m=True,
-        )
-        _sig_cache[symbol] = (last_ts, sig)
-        return sig, "ok"
-
-    # ── SHORT ─────────────────────────────────────────────────
-    if short_cross and institucional_vol and bear_candle:
-        sl = float(curr_pk)           # Pine: sl = peak
-        tp = curr_c - (sl - curr_c) * rr  # Pine: tp = close - (sl-close)*tp_mult
-
-        if sl <= 0 or sl <= curr_c:
-            _sig_cache[symbol] = (last_ts, None)
-            return None, f"sl_invalido sl={sl:.6f} c={curr_c:.6f}"
-
-        score   = 2
-        reasons = [
-            f"CROSS↓{curr_vl:.5g}",
-            f"VOL{vol_ratio:.1f}x",
-            "BEAR🕯️",
-        ]
-
-        if ohlcv_15m:
-            c15 = ohlcv_15m.get("close")
-            l15 = ohlcv_15m.get("low")
-            if c15 is not None and len(c15) > pivot_len * 4 + 5:
-                vl15 = _pivot_series_v(_f(l15), pivot_len, is_high=False)
-                if not np.isnan(vl15[-2]) and float(c15[-2]) < float(vl15[-2]):
-                    score += 1
-                    reasons.append("15M✓")
-
-        if score < min_score:
-            _sig_cache[symbol] = (last_ts, None)
-            return None, f"score={score}"
-
-        sig = Signal(
-            symbol=symbol, side="SELL",
-            price=curr_c, sl=round(sl, 8), tp=round(tp, 8),
-            atr_5m=atr_val, peak=float(curr_pk), valley=float(curr_vl),
-            score=score, vol_ratio=round(vol_ratio, 2),
-            reasons=reasons, st_bull_15m=False,
-        )
-        _sig_cache[symbol] = (last_ts, sig)
-        return sig, "ok"
-
-    # ── Rejection reason (crossover present but other conditions failed) ──
-    if long_cross:
-        if not institucional_vol:
-            r = f"vol_bajo_{vol_ratio:.2f}x"
-        else:
-            r = "no_bull_candle"
-    elif short_cross:
-        if not institucional_vol:
-            r = f"vol_bajo_{vol_ratio:.2f}x"
-        else:
-            r = "no_bear_candle"
-    else:
-        r = "sin_cruce"
-
-    _sig_cache[symbol] = (last_ts, None)
-    return None, r
-
-
-def clear_signal_cache(symbol: str) -> None:
-    _sig_cache.pop(symbol, None)
-
-
-# ─────────────────────────────────────────────────────────────
-# EXIT LOGIC — pivot break (matches Pine trail exit)
-# ─────────────────────────────────────────────────────────────
-
-def check_trail_exit(
-    ohlcv_5m:   dict,
-    ohlcv_15m:  dict | None,
-    trade_side: str,
-    pivot_len:  int   = 5,
-    hma_len:    int   = 50,   # unused, kept for compat
-    ft_period:  int   = 25,   # unused, kept for compat
-    peak_r:     float = 0.,
-    **kwargs,
-) -> str | None:
-    """
-    Exit when price crosses back through the opposing pivot level.
-    Mirrors Pine: strategy.exit(..., trail_price=..., trail_offset=...)
-    Only activates after peak_r >= 1.0 (breakeven territory).
-    """
-    if not ohlcv_5m or peak_r < 1.0:
+        log.debug(f"· {close:.6g} | verde={green:.6g}(+ATR→{short_trig:.6g}) "
+                  f"rojo={red:.6g}(-ATR→{long_trig:.6g}) dentro_canal={red<close<green}")
         return None
 
-    c5 = ohlcv_5m.get("close")
-    h5 = ohlcv_5m.get("high")
-    l5 = ohlcv_5m.get("low")
 
-    if c5 is None or len(c5) < pivot_len * 4 + 5:
-        return None
-
-    curr_c = float(c5[-2])
-    prev_c = float(c5[-3])
-
-    if trade_side == "BUY":
-        # Exit if price breaks back below valley
-        vl = _pivot_series_v(_f(l5), pivot_len, is_high=False)
-        vl_now = vl[-2] if not np.isnan(vl[-2]) else float('nan')
-        if not np.isnan(vl_now) and prev_c > vl_now and curr_c < vl_now:
-            return "TRAIL_VALLEY"
-    else:
-        # Exit if price breaks back above peak
-        pk = _pivot_series_v(_f(h5), pivot_len, is_high=True)
-        pk_now = pk[-2] if not np.isnan(pk[-2]) else float('nan')
-        if not np.isnan(pk_now) and prev_c < pk_now and curr_c > pk_now:
-            return "TRAIL_PEAK"
-
-    return None
+class ExplosionScorer:
+    def score(self, ticker, daily_klines):
+        try:
+            pc = abs(float(ticker.get("priceChangePercent",0)))
+            qv = float(ticker.get("quoteVolume",0))
+            vs = 1.0
+            if len(daily_klines)>=2:
+                def _v(k): return float(k.get("volume",0)) if isinstance(k,dict) else (float(k[5]) if isinstance(k,(list,tuple)) and len(k)>5 else 0.)
+                avg=np.mean([_v(k) for k in daily_klines[:-1]])
+                vs=_v(daily_klines[-1])/avg if avg>0 else 1.
+            return pc*2 + vs*3 + min(qv/1e7,5)
+        except: return 0.0
