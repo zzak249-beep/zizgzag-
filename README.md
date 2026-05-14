@@ -1,203 +1,72 @@
-# 🎯 Sniper Bot V26.1 — Institutional Apex
+# 🧠 Sniper Turbo Markov Bot
 
-Bot de trading automático: TradingView → Railway → BingX Futures + Telegram
+Implementación en Python del Pine Script "Sniper Bot V48.7: Turbo Markov" para BingX Futures.
 
----
+## ¿Por qué 8 pares y no más?
 
-## ⚠️ ADVERTENCIA IMPORTANTE
+| Pares | Problema |
+|-------|----------|
+| 1-5   | Pocas oportunidades, el filtro density no tiene referencia estadística |
+| **6-10**  | **✅ Óptimo: volumen consistente, pivotes limpios, Markov significativo** |
+| 11-20 | El filtro density pierde significado (escalas de volumen muy distintas) |
+| 500+  | Ruido total, fees destruyen cualquier edge, imposible gestionar riesgo |
 
-Estás operando con **apalancamiento real (10x)**. Con $8 de capital tienes $80 de exposición.
-Un movimiento en contra del 10% liquida toda la posición. Opera con responsabilidad.
+Los **8 pares por defecto** tienen el mayor volumen en BingX, lo que hace que el detector de volumen spike (`density`) sea estadísticamente válido.
 
----
-
-## 🏗️ Arquitectura
+## La ventaja real: Cadena de Markov
 
 ```
-TradingView (señal)
-    │  Webhook JSON
-    ▼
-Railway (FastAPI server)
-    │  Calcula SL/TP/size con ATR
-    ├──▶ BingX Futures API (ejecuta orden)
-    └──▶ Telegram (notifica detalles)
+Estado actual  →  Probabilidad del próximo estado
+─────────────────────────────────────────────────
+BULL           →  P(BULL)=62%  P(BEAR)=18%  P(NEUTRAL)=20%
+BEAR           →  P(BULL)=21%  P(BEAR)=58%  P(NEUTRAL)=21%
+NEUTRAL        →  P(BULL)=35%  P(BEAR)=33%  P(NEUTRAL)=32%
 ```
 
----
+El bot solo opera cuando la probabilidad histórica de éxito supera el 40%. Esto elimina entradas en mercados transitorios y opera solo en tendencias con respaldo estadístico.
 
-## 🚀 Instalación paso a paso
+## Lógica de entrada (exacta del Pine Script)
 
-### PASO 1 — Fork y clona este repositorio
+```
+LONG:  low < pivot_low  AND close < VWAP AND slope > +30 AND vol > avg×2 AND P(BULL) > 40%
+SHORT: high > pivot_high AND close > VWAP AND slope < -30 AND vol > avg×2 AND P(BEAR) > 40%
+```
+
+- **Dip buy**: precio toca soporte (pivot low) con volumen explosivo, momentum positivo
+- **Fade breakout**: precio rompe resistencia (pivot high) con volumen explosivo, momentum negativo
+
+## Instalación rápida
 
 ```bash
-git clone https://github.com/TU_USUARIO/sniper-bot.git
-cd sniper-bot
+git clone https://github.com/tu-usuario/markov-bot.git
+cd markov-bot
+cp .env.example .env
+# Edita .env con tus claves
+python bot.py   # modo simulado por defecto
 ```
 
-### PASO 2 — Configura BingX API
+## Deploy en Railway
 
-1. Entra a [BingX](https://bingx.com) → perfil → API Management
-2. Crea nueva API Key con permisos: **Futures Trading** (NO retiros)
-3. Añade la IP de Railway a la whitelist (o deja vacío para todas)
-4. Copia `API Key` y `Secret Key`
+1. Push a GitHub
+2. New Project → Deploy from GitHub repo
+3. Variables de entorno (ver `.env.example`)
+4. Railway detecta el `Dockerfile` automáticamente
 
-### PASO 3 — Configura Telegram Bot
+## Variables clave
 
-1. Abre Telegram → busca `@BotFather`
-2. Envía `/newbot` y sigue las instrucciones
-3. Copia el **token** (formato: `123456:ABCdef...`)
-4. Para obtener tu `CHAT_ID`:
-   - Envía cualquier mensaje a tu bot
-   - Visita: `https://api.telegram.org/botTU_TOKEN/getUpdates`
-   - Busca `"chat":{"id":XXXXXXXXX}` → ese es tu chat_id
+| Variable | Recomendado | Descripción |
+|----------|-------------|-------------|
+| `LIVE_TRADING` | `false` → 30 días sim → `true` | Modo real |
+| `TIMEFRAME` | `15m` | 15m = óptimo Markov (historia suficiente) |
+| `MARKOV_LOOKBACK` | `200` | Ventana histórica para matriz de transición |
+| `MARKOV_BULL_MIN` | `40.0` | % mínimo P(BULL) para entrar LONG |
+| `SLOPE_MIN` | `30.0` | Pendiente mínima normalizada |
+| `DENSITY_MULT` | `2.0` | Volumen debe ser 2× la media |
+| `LEVERAGE` | `3` | No subir antes de 30 días live |
+| `RISK_PCT` | `1.5` | % del balance por trade |
 
-### PASO 4 — Despliega en Railway
+## ⚠️ Advertencia
 
-1. Ve a [railway.app](https://railway.app) → New Project → Deploy from GitHub
-2. Conecta este repositorio
-3. En **Variables** (Settings → Variables), añade:
-
-```
-BINGX_API_KEY        = tu_api_key
-BINGX_API_SECRET     = tu_api_secret
-TELEGRAM_BOT_TOKEN   = 123456:ABCdef...
-TELEGRAM_CHAT_ID     = -100XXXXXXXXX
-WEBHOOK_SECRET       = una_clave_secreta_larga_y_aleatoria
-CAPITAL_USDT         = 8
-APALANCAMIENTO       = 10
-RIESGO_PCT           = 1.0
-RATIO_RR             = 3.0
-```
-
-4. Railway detecta el `Procfile` y despliega automáticamente
-5. Copia la URL pública: `https://TU-APP.up.railway.app`
-
-### PASO 5 — Verifica que funciona
-
-```bash
-curl https://TU-APP.up.railway.app/health
-# Respuesta: {"status":"ok","posicion_abierta":false}
-```
-
-### PASO 6 — Configura TradingView
-
-1. Carga el script `tradingview_script.pine` como indicador
-2. Crea alerta para LONG:
-   - Condition: `LONG APEX`
-   - Webhook URL: `https://TU-APP.up.railway.app/webhook`
-   - Message:
-   ```json
-   {
-     "secret": "tu_webhook_secret",
-     "action": "BUY",
-     "symbol": "BTC-USDT",
-     "atr": "{{plot_1}}"
-   }
-   ```
-3. Crea alerta para SHORT (igual pero `"action": "SELL"`)
-4. Repite para cada par que quieras monitorear
-
----
-
-## 📱 Mensajes Telegram
-
-**Al entrar:**
-```
-🟢 NUEVA OPERACIÓN — BTC-USDT
-━━━━━━━━━━━━━━━━━━━━
-📌 Dirección: LONG 🚀
-💰 Entrada:   $67,234.5000
-🛑 Stop Loss: $66,890.2000  (0.512%)
-🎯 Take Profit: $68,267.4000  (1.536%)
-━━━━━━━━━━━━━━━━━━━━
-💼 Tamaño posición: $80.00
-⚡ Apalancamiento: 10x
-🎲 Riesgo máximo: $0.8000
-📊 R:R objetivo: 1:3.0
-📈 ATR usado: 344.210000
-━━━━━━━━━━━━━━━━━━━━
-🤖 Sniper Bot V26.1 | BingX Futures
-```
-
-**Al cerrar:**
-```
-✅ OPERACIÓN CERRADA — BTC-USDT
-━━━━━━━━━━━━━━━━━━━━
-📌 Fue: LONG
-💵 PnL realizado: GANANCIA: +$2.4000 USDT
-━━━━━━━━━━━━━━━━━━━━
-🤖 Sniper Bot V26.1 | BingX Futures
-```
-
----
-
-## 🔗 Endpoints del servidor
-
-| Método | Ruta | Descripción |
-|--------|------|-------------|
-| GET | `/health` | Estado del bot |
-| POST | `/webhook` | Recibe señales de TradingView |
-
----
-
-## 💡 Pares soportados
-
-El bot soporta **todos los perpetuos USDT de BingX**. Ejemplos:
-`BTC-USDT`, `ETH-USDT`, `SOL-USDT`, `DOGE-USDT`, `XRP-USDT`, `BNB-USDT`, etc.
-
-El símbolo se envía dinámicamente desde TradingView con `{{ticker}}-USDT`
-
----
-
-## ⚙️ Parámetros configurables
-
-| Variable | Default | Descripción |
-|----------|---------|-------------|
-| `CAPITAL_USDT` | 8 | Capital base en USDT |
-| `APALANCAMIENTO` | 10 | Multiplicador (máx recomendado: 10x) |
-| `RIESGO_PCT` | 1.0 | % del capital apalancado por trade |
-| `RATIO_RR` | 3.0 | Ratio riesgo:recompensa (TP = SL × 3) |
-
----
-
-## 🛡️ Protecciones integradas
-
-- ✅ Solo 1 posición abierta a la vez
-- ✅ SL basado en ATR (no en pivotes variables)
-- ✅ Validación HMAC del webhook secret
-- ✅ Timeout en todas las llamadas API (10s)
-- ✅ Logging completo de todas las operaciones
-- ✅ Notificación Telegram en errores críticos
-- ✅ `barstate.isconfirmed` para evitar señales prematuras
-
----
-
-## 📁 Estructura del proyecto
-
-```
-sniper-bot/
-├── app/
-│   ├── __init__.py
-│   ├── main.py        # Servidor FastAPI + webhook
-│   ├── bingx.py       # Cliente BingX Futures API
-│   ├── risk.py        # Motor de gestión de riesgo
-│   ├── telegram.py    # Notificaciones
-│   └── state.py       # Estado en memoria
-├── tradingview_script.pine  # Script para TradingView
-├── requirements.txt
-├── Procfile           # Comando de inicio Railway
-├── .env.example       # Variables de entorno (plantilla)
-└── .gitignore
-```
-
----
-
-## ⚠️ Gestión de riesgo con $8 capital
-
-Con $8 × 10x = $80 de exposición:
-
-- Riesgo por trade: 1% de $80 = **$0.80**
-- Para llegar a TP (1:3): ganancia de **$2.40**
-- Máx drawdown tolerable: ~6-8 trades perdidos consecutivos
-
-**Recomendación:** Empieza en modo paper trading (cuenta demo de BingX) antes de operar real.
+Operar futuros con apalancamiento implica riesgo de pérdida total del capital.
+Ejecuta mínimo 30 días en modo `LIVE_TRADING=false` antes de activar trades reales.
+El win rate mínimo con comisiones de BingX y leverage 3× es ~35%.
