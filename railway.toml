@@ -1,0 +1,21 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python main.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+[environments.production]
+[environments.production.variables]
+LOG_LEVEL = "INFO"
+SCAN_INTERVAL_SECONDS = "120"
+MAX_OPEN_POSITIONS = "3"
+LEVERAGE = "5"
+RISK_PER_TRADE_PCT = "2.0"
+SESSION_FILTER = "true"
+USE_KELLY = "true"
+SYMBOLS = "GWEIUSDT,BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,AVAXUSDT,LINKUSDT,ARBUSDT"
+PRIMARY_TF = "2h"
+CONFIRM_TF = "4h"
