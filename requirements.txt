@@ -1,9 +1,0 @@
-ccxt==4.3.57
-pandas==2.2.2
-numpy==1.26.4
-pandas-ta==0.3.14b
-python-telegram-bot==21.3
-python-dotenv==1.0.1
-aiohttp==3.9.5
-colorlog==6.8.2
-requests==2.31.0
