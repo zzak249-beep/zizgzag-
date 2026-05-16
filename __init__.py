@@ -1,1 +1,1 @@
-# Sniper Bot V26.1
+# Sniper Bot package
