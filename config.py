@@ -1,51 +1,70 @@
+"""
+config.py — Carga y valida todas las variables de entorno.
+"""
 import os
+from dotenv import load_dotenv
 
-# ── BINGX API
-BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
-BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
-BASE_URL         = "https://open-api.bingx.com"
+load_dotenv()
 
-# ── TELEGRAM
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ── TIMEFRAME
-# Investigación: 3m → 7-10 rupturas/día, con trigger 0.5×ATR → 1-2 señales/día/par
-# 1m → 70-85 rupturas/día (mucho ruido), necesita más filtros
-TIMEFRAME    = os.getenv("TIMEFRAME",     "3m")
-KLINE_LIMIT  = int(os.getenv("KLINE_LIMIT", "150"))  # 150×3m = 7.5h historial
-CANDLE_SLEEP = int(os.getenv("CANDLE_SLEEP", "30"))   # cada 30s para no perder cruces
+def _require(key: str) -> str:
+    val = os.getenv(key)
+    if not val:
+        raise EnvironmentError(f"Variable de entorno requerida no encontrada: {key}")
+    return val
 
-# ── ZIGZAG CANAL
-PIVOT_LEN        = int(os.getenv("PIVOT_LEN",         "5"))
-ATR_LEN          = int(os.getenv("ATR_LEN",           "14"))
-ATR_TRIGGER_MULT = float(os.getenv("ATR_TRIGGER_MULT", "0.5"))  # SHORT si >green+0.5ATR
-SL_ATR_MULT      = float(os.getenv("SL_ATR_MULT",      "2.0"))  # SL = 2×ATR
-MIN_CANAL_ATR    = float(os.getenv("MIN_CANAL_ATR",    "1.5"))  # canal mínimo 1.5×ATR
-COOLDOWN_BARS    = int(os.getenv("COOLDOWN_BARS",      "10"))   # velas entre señales mismo par
 
-# ── FILTROS (OFF por defecto → señales inmediatas; activar uno a uno)
-USE_EMA_FILTER    = os.getenv("USE_EMA_FILTER",    "false").lower() == "true"
-EMA_PERIOD        = int(os.getenv("EMA_PERIOD",    "50"))
+class Config:
+    # --- Binance ---
+    BINANCE_API_KEY: str  = _require("BINANCE_API_KEY")
+    BINANCE_SECRET_KEY: str = _require("BINANCE_SECRET_KEY")
+    TESTNET: bool         = os.getenv("TESTNET", "false").lower() == "true"
 
-USE_RSI_FILTER    = os.getenv("USE_RSI_FILTER",    "false").lower() == "true"
-RSI_PERIOD        = int(os.getenv("RSI_PERIOD",    "14"))
-RSI_SHORT_MIN     = float(os.getenv("RSI_SHORT_MIN","60"))
-RSI_LONG_MAX      = float(os.getenv("RSI_LONG_MAX", "40"))
+    # --- Telegram ---
+    TELEGRAM_TOKEN: str   = _require("TELEGRAM_TOKEN")
+    TELEGRAM_CHAT_ID: str = _require("TELEGRAM_CHAT_ID")
 
-USE_VOL_FILTER    = os.getenv("USE_VOL_FILTER",    "false").lower() == "true"
-VOL_MULT          = float(os.getenv("VOL_MULT",    "1.3"))
+    # --- Trading ---
+    SYMBOLS: list         = [s.strip() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")]
+    TIMEFRAME: str        = os.getenv("TIMEFRAME", "15m")
+    LEVERAGE: int         = int(os.getenv("LEVERAGE", "5"))
+    RISK_PER_TRADE: float = float(os.getenv("RISK_PER_TRADE", "1.5"))
 
-# ── TRAILING STOP
-TRAIL_PCT = float(os.getenv("TRAIL_PCT", "50"))  # mover SL a BE cuando PnL=50% TP
+    # --- Motor Markov ---
+    SLOPE_MIN: float       = float(os.getenv("SLOPE_MIN", "30.0"))
+    LOOKBACK_MARKOV: int   = int(os.getenv("LOOKBACK_MARKOV", "200"))
+    PROB_THRESHOLD: float  = float(os.getenv("PROB_THRESHOLD", "40.0"))
 
-# ── RIESGO
-LEVERAGE       = int(os.getenv("LEVERAGE",       "10"))
-RISK_PCT       = float(os.getenv("RISK_PCT",      "1.5"))
-MAX_POSITIONS  = int(os.getenv("MAX_POSITIONS",   "5"))
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS","5.0"))
+    # --- ADX Adaptativo ---
+    ADX_LEN: int    = int(os.getenv("ADX_LEN", "14"))
+    ADX_TREND: int  = int(os.getenv("ADX_TREND", "25"))
+    ADX_RANGE: int  = int(os.getenv("ADX_RANGE", "20"))
 
-# ── SCANNER (investigación: óptimo 10-15 pares)
-TOP_PAIRS     = int(os.getenv("TOP_PAIRS",    "15"))
-MIN_QUOTE_VOL = float(os.getenv("MIN_QUOTE_VOL","50000000"))  # 50M USDT/día
-MIN_PRICE_USDT= float(os.getenv("MIN_PRICE_USDT","0.0001"))
+    # --- Filtros institucionales ---
+    RVOL_MIN: float    = float(os.getenv("RVOL_MIN", "1.5"))
+    POC_LOOKBACK: int  = int(os.getenv("POC_LOOKBACK", "50"))
+    PIVOT_LEN: int     = int(os.getenv("PIVOT_LEN", "4"))
+
+    # --- Triple barrera ---
+    ATR_MULT_TP: float   = float(os.getenv("ATR_MULT_TP", "2.0"))
+    ATR_MULT_SL: float   = float(os.getenv("ATR_MULT_SL", "1.2"))
+    MAX_BARS_HOLD: int   = int(os.getenv("MAX_BARS_HOLD", "20"))
+
+    # --- Kotegawa ---
+    DIP_PCT: float      = float(os.getenv("DIP_PCT", "20.0"))
+    MA_LEN: int         = int(os.getenv("MA_LEN", "25"))
+    RSI_LEN: int        = int(os.getenv("RSI_LEN", "14"))
+    RSI_OVERSOLD: float = float(os.getenv("RSI_OVERSOLD", "24.0"))
+    BB_LEN: int         = int(os.getenv("BB_LEN", "20"))
+    BB_MULT: float      = float(os.getenv("BB_MULT", "2.0"))
+
+    # --- Riesgo global ---
+    MAX_DAILY_LOSS_PCT: float  = float(os.getenv("MAX_DAILY_LOSS_PCT", "3.0"))
+    MAX_OPEN_POSITIONS: int    = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
+    LOOP_INTERVAL: int         = int(os.getenv("LOOP_INTERVAL", "60"))
+
+    def __repr__(self) -> str:
+        return (
+            f"<Config symbols={self.SYMBOLS} tf={self.TIMEFRAME} "
+            f"lev={self.LEVERAGE}x testnet={self.TESTNET}>"
+        )

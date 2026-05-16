@@ -1,72 +1,159 @@
-# 🧠 Sniper Turbo Markov Bot
+# 🎯 Sniper Bot V49 — Híbrido [Markov + Kotegawa]
 
-Implementación en Python del Pine Script "Sniper Bot V48.7: Turbo Markov" para BingX Futures.
+Bot algorítmico de trading para **Binance Futures (USDT-M)** con notificaciones en **Telegram**, desplegable en **Railway** en minutos.
 
-## ¿Por qué 8 pares y no más?
+---
 
-| Pares | Problema |
-|-------|----------|
-| 1-5   | Pocas oportunidades, el filtro density no tiene referencia estadística |
-| **6-10**  | **✅ Óptimo: volumen consistente, pivotes limpios, Markov significativo** |
-| 11-20 | El filtro density pierde significado (escalas de volumen muy distintas) |
-| 500+  | Ruido total, fees destruyen cualquier edge, imposible gestionar riesgo |
+## 🧠 Ventaja competitiva
 
-Los **8 pares por defecto** tienen el mayor volumen en BingX, lo que hace que el detector de volumen spike (`density`) sea estadísticamente válido.
+| Capa | Tecnología | Ventaja |
+|---|---|---|
+| **Motor Markov** | Matriz de transición 3×3 sliding | Probabilidad estadística de continuación de estado |
+| **ADX Adaptativo** | Régimen detection V50.1 | Parámetros dinámicos según volatilidad |
+| **Filtros institucionales** | VWAP + RVOL + POC | Detecta flujo de dinero inteligente |
+| **Kotegawa Dip** | MA25 + RSI + BB | Confluencia de reversión a la media |
+| **STC Oscillator** | Schaff Trend Cycle | Evita entradas en sobrecompra/sobreventa extrema |
+| **Kelly Fraccional** | 1/4 Kelly criterion | Sizing matemáticamente óptimo |
+| **Triple Barrera** | TP + SL + Tiempo | Exit multi-dimensión estilo ML |
 
-## La ventaja real: Cadena de Markov
+La señal requiere **≥55 puntos** de un scoring compuesto de 100. Dos capas independientes deben converger para activar una entrada.
 
-```
-Estado actual  →  Probabilidad del próximo estado
-─────────────────────────────────────────────────
-BULL           →  P(BULL)=62%  P(BEAR)=18%  P(NEUTRAL)=20%
-BEAR           →  P(BULL)=21%  P(BEAR)=58%  P(NEUTRAL)=21%
-NEUTRAL        →  P(BULL)=35%  P(BEAR)=33%  P(NEUTRAL)=32%
-```
+---
 
-El bot solo opera cuando la probabilidad histórica de éxito supera el 40%. Esto elimina entradas en mercados transitorios y opera solo en tendencias con respaldo estadístico.
-
-## Lógica de entrada (exacta del Pine Script)
+## 🗂 Estructura del proyecto
 
 ```
-LONG:  low < pivot_low  AND close < VWAP AND slope > +30 AND vol > avg×2 AND P(BULL) > 40%
-SHORT: high > pivot_high AND close > VWAP AND slope < -30 AND vol > avg×2 AND P(BEAR) > 40%
+sniper-bot/
+├── main.py                  # Bucle principal async
+├── config.py                # Variables de entorno
+├── requirements.txt
+├── Procfile                 # Railway worker
+├── railway.json
+├── .env.example
+└── bot/
+    ├── indicators.py        # EMA, ATR, ADX, VWAP, RVOL, POC, STC, RSI, BB, Pivots
+    ├── markov.py            # Motor Markov con ventana deslizante
+    ├── strategy.py          # Fusión Sniper V49 + Kotegawa
+    ├── risk_manager.py      # Kelly + Triple Barrera + DD guard
+    ├── binance_client.py    # Binance Futures async (TP/SL automáticos)
+    ├── telegram_notifier.py # Mensajes ricos en Telegram
+    └── utils.py             # Logging con colores
 ```
 
-- **Dip buy**: precio toca soporte (pivot low) con volumen explosivo, momentum positivo
-- **Fade breakout**: precio rompe resistencia (pivot high) con volumen explosivo, momentum negativo
+---
 
-## Instalación rápida
+## ⚙️ Configuración paso a paso
 
+### 1. Clonar el repositorio
 ```bash
-git clone https://github.com/tu-usuario/markov-bot.git
-cd markov-bot
-cp .env.example .env
-# Edita .env con tus claves
-python bot.py   # modo simulado por defecto
+git clone https://github.com/TU_USUARIO/sniper-bot.git
+cd sniper-bot
 ```
 
-## Deploy en Railway
+### 2. Credenciales Binance Futures
+1. Ve a [Binance → Gestión de API](https://www.binance.com/es/my/settings/api-management)
+2. Crea una nueva API Key con permisos:
+   - ✅ **Leer**
+   - ✅ **Trading de futuros**
+   - ❌ **NO** habilites retiradas
+3. Restringe la IP a la IP de tu servidor Railway (opcional pero recomendado)
 
-1. Push a GitHub
-2. New Project → Deploy from GitHub repo
-3. Variables de entorno (ver `.env.example`)
-4. Railway detecta el `Dockerfile` automáticamente
+### 3. Bot de Telegram
+```bash
+# 1. Habla con @BotFather en Telegram → /newbot → guarda el TOKEN
+# 2. Habla con @userinfobot → guarda tu CHAT_ID
+# O usa: https://api.telegram.org/bot<TOKEN>/getUpdates
+```
 
-## Variables clave
+### 4. Variables de entorno (local)
+```bash
+cp .env.example .env
+# Edita .env con tus credenciales reales
+```
 
-| Variable | Recomendado | Descripción |
-|----------|-------------|-------------|
-| `LIVE_TRADING` | `false` → 30 días sim → `true` | Modo real |
-| `TIMEFRAME` | `15m` | 15m = óptimo Markov (historia suficiente) |
-| `MARKOV_LOOKBACK` | `200` | Ventana histórica para matriz de transición |
-| `MARKOV_BULL_MIN` | `40.0` | % mínimo P(BULL) para entrar LONG |
-| `SLOPE_MIN` | `30.0` | Pendiente mínima normalizada |
-| `DENSITY_MULT` | `2.0` | Volumen debe ser 2× la media |
-| `LEVERAGE` | `3` | No subir antes de 30 días live |
-| `RISK_PCT` | `1.5` | % del balance por trade |
+---
 
-## ⚠️ Advertencia
+## 🚀 Deploy en Railway
 
-Operar futuros con apalancamiento implica riesgo de pérdida total del capital.
-Ejecuta mínimo 30 días en modo `LIVE_TRADING=false` antes de activar trades reales.
-El win rate mínimo con comisiones de BingX y leverage 3× es ~35%.
+### Opción A — GitHub (recomendado)
+1. Sube el proyecto a GitHub
+2. En [railway.app](https://railway.app) → **New Project → Deploy from GitHub**
+3. Selecciona el repositorio
+4. En **Variables** agrega todas las del `.env.example`
+5. Railway detecta el `Procfile` y despliega automáticamente
+
+### Opción B — Railway CLI
+```bash
+npm install -g @railway/cli
+railway login
+railway init
+railway up
+railway variables set BINANCE_API_KEY=... TELEGRAM_TOKEN=... # etc.
+```
+
+### Variables obligatorias en Railway
+```
+BINANCE_API_KEY
+BINANCE_SECRET_KEY
+TELEGRAM_TOKEN
+TELEGRAM_CHAT_ID
+```
+
+---
+
+## 🧪 Paper Trading primero (OBLIGATORIO)
+
+```env
+TESTNET=true
+```
+
+Binance Futures Testnet: https://testnet.binancefuture.com
+
+**Valida durante al menos 2 semanas antes de usar dinero real.**
+
+---
+
+## 📊 Mensajes Telegram
+
+| Evento | Contenido |
+|---|---|
+| 🚀 Arranque | Config, modo, pares, leverage |
+| 📈📉 Entrada | Precio, qty, TP, SL, régimen, ADX, probs Markov, RVOL, STC, VWAP, POC, RSI, score total, razones |
+| ✅❌ Salida | Motivo (TP/SL/Tiempo), PnL USDT, PnL %, balance |
+| 💓 Heartbeat | Cada hora: balance, PnL diario, DD, estado por par |
+| ⚠️ Error | Stack trace truncado |
+
+---
+
+## ⚠️ Avisos de riesgo
+
+> **El trading con apalancamiento puede resultar en pérdida total del capital.**
+> Este software se proporciona sin garantías. Úsalo bajo tu propia responsabilidad.
+> Empieza siempre con capital que puedas permitirte perder.
+
+**Ajustes conservadores recomendados para empezar:**
+```env
+LEVERAGE=3
+RISK_PER_TRADE=1.0
+MAX_DAILY_LOSS_PCT=2.0
+ATR_MULT_TP=2.5
+ATR_MULT_SL=1.0
+```
+
+---
+
+## 🔧 Ajuste de parámetros
+
+| Parámetro | Valor base | Mercado alcista | Mercado lateral |
+|---|---|---|---|
+| `PROB_THRESHOLD` | 40% | 35% | 50% |
+| `RVOL_MIN` | 1.5x | 1.3x | 2.0x |
+| `ATR_MULT_TP` | 2.0 | 2.5 | 1.5 |
+| `ADX_TREND` | 25 | 20 | 30 |
+
+---
+
+## 📋 Logs
+
+Los logs se guardan en `logs/bot.log` con rotación automática.
+En Railway puedes verlos en tiempo real desde el panel → **Deployments → View Logs**.

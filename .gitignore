@@ -1,10 +1,11 @@
 .env
-*.log
+logs/
 __pycache__/
 *.pyc
+*.pyo
+.DS_Store
+*.egg-info/
+dist/
+build/
 .venv/
 venv/
-/data/
-*.db
-.idea/
-.vscode/
