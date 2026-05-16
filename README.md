@@ -1,159 +1,147 @@
-# 🎯 Sniper Bot V49 — Híbrido [Markov + Kotegawa]
+# Sniper Bot V50 Ultimate
 
-Bot algorítmico de trading para **Binance Futures (USDT-M)** con notificaciones en **Telegram**, desplegable en **Railway** en minutos.
-
----
-
-## 🧠 Ventaja competitiva
-
-| Capa | Tecnología | Ventaja |
-|---|---|---|
-| **Motor Markov** | Matriz de transición 3×3 sliding | Probabilidad estadística de continuación de estado |
-| **ADX Adaptativo** | Régimen detection V50.1 | Parámetros dinámicos según volatilidad |
-| **Filtros institucionales** | VWAP + RVOL + POC | Detecta flujo de dinero inteligente |
-| **Kotegawa Dip** | MA25 + RSI + BB | Confluencia de reversión a la media |
-| **STC Oscillator** | Schaff Trend Cycle | Evita entradas en sobrecompra/sobreventa extrema |
-| **Kelly Fraccional** | 1/4 Kelly criterion | Sizing matemáticamente óptimo |
-| **Triple Barrera** | TP + SL + Tiempo | Exit multi-dimensión estilo ML |
-
-La señal requiere **≥55 puntos** de un scoring compuesto de 100. Dos capas independientes deben converger para activar una entrada.
+Bot algorítmico para **BingX Perpetual Futures** con:
+- Motor Markov 200 velas + ADX Slope Adaptativo + STC + POC (lógica V49)
+- Filtro de **Funding Rate** — evita operar contra el funding extremo
+- **Liquidation Map** — detecta zonas de stops acumulados y usa esas zonas como boost de señal
+- Señales completas en **Telegram** con score de confianza 0–100
+- Despliegue en **Railway** con reinicio automático
 
 ---
 
-## 🗂 Estructura del proyecto
+## Estructura
 
 ```
-sniper-bot/
-├── main.py                  # Bucle principal async
-├── config.py                # Variables de entorno
+sniper_v50/
+├── main.py           # Loop principal
+├── indicators.py     # Motor V50: Markov + Funding + Liq Map
+├── exchange.py       # Cliente BingX Perpetual (CCXT)
+├── telegram_bot.py   # Mensajes Telegram enriquecidos
+├── config.py         # Configuración central
 ├── requirements.txt
-├── Procfile                 # Railway worker
-├── railway.json
-├── .env.example
-└── bot/
-    ├── indicators.py        # EMA, ATR, ADX, VWAP, RVOL, POC, STC, RSI, BB, Pivots
-    ├── markov.py            # Motor Markov con ventana deslizante
-    ├── strategy.py          # Fusión Sniper V49 + Kotegawa
-    ├── risk_manager.py      # Kelly + Triple Barrera + DD guard
-    ├── binance_client.py    # Binance Futures async (TP/SL automáticos)
-    ├── telegram_notifier.py # Mensajes ricos en Telegram
-    └── utils.py             # Logging con colores
+├── Procfile          # Railway worker
+├── railway.toml      # Config Railway
+└── .env.example      # Variables de entorno
 ```
 
 ---
 
-## ⚙️ Configuración paso a paso
+## Setup local (prueba en paper primero)
 
-### 1. Clonar el repositorio
 ```bash
-git clone https://github.com/TU_USUARIO/sniper-bot.git
-cd sniper-bot
-```
-
-### 2. Credenciales Binance Futures
-1. Ve a [Binance → Gestión de API](https://www.binance.com/es/my/settings/api-management)
-2. Crea una nueva API Key con permisos:
-   - ✅ **Leer**
-   - ✅ **Trading de futuros**
-   - ❌ **NO** habilites retiradas
-3. Restringe la IP a la IP de tu servidor Railway (opcional pero recomendado)
-
-### 3. Bot de Telegram
-```bash
-# 1. Habla con @BotFather en Telegram → /newbot → guarda el TOKEN
-# 2. Habla con @userinfobot → guarda tu CHAT_ID
-# O usa: https://api.telegram.org/bot<TOKEN>/getUpdates
-```
-
-### 4. Variables de entorno (local)
-```bash
+git clone https://github.com/TU_USUARIO/sniper-bot-v50
+cd sniper-bot-v50
+pip install -r requirements.txt
 cp .env.example .env
-# Edita .env con tus credenciales reales
+# Edita .env con tus claves (MODE=paper para empezar)
+python main.py
 ```
 
 ---
 
-## 🚀 Deploy en Railway
+## Variables de entorno
 
-### Opción A — GitHub (recomendado)
-1. Sube el proyecto a GitHub
-2. En [railway.app](https://railway.app) → **New Project → Deploy from GitHub**
+| Variable | Descripción | Ejemplo |
+|---|---|---|
+| `BINGX_API_KEY` | API Key de BingX | `abc123...` |
+| `BINGX_API_SECRET` | API Secret de BingX | `xyz789...` |
+| `TELEGRAM_BOT_TOKEN` | Token del bot Telegram | `123456:ABC...` |
+| `TELEGRAM_CHAT_ID` | Tu chat ID | `-100123456` |
+| `SYMBOL` | Par a operar | `BTC/USDT` |
+| `TIMEFRAME` | Temporalidad | `5m` |
+| `RISK_PCT` | % balance por trade | `2.0` |
+| `LEVERAGE` | Apalancamiento | `3` |
+| `MAX_TRADES_DAY` | Máx operaciones/día | `6` |
+| `MODE` | `paper` o `live` | `paper` |
+| `FUNDING_THRESHOLD` | % funding extremo | `0.01` |
+| `FUNDING_AVOID` | Evitar funding adverso | `true` |
+| `LIQ_LOOKBACK` | Velas para liq map | `100` |
+| `LIQ_MULTIPLIER` | ATR mult zona liq | `1.5` |
+
+---
+
+## Despliegue en Railway
+
+1. Sube el proyecto a un repo **privado** en GitHub
+2. Entra en [railway.app](https://railway.app) → **New Project → Deploy from GitHub**
 3. Selecciona el repositorio
-4. En **Variables** agrega todas las del `.env.example`
-5. Railway detecta el `Procfile` y despliega automáticamente
-
-### Opción B — Railway CLI
-```bash
-npm install -g @railway/cli
-railway login
-railway init
-railway up
-railway variables set BINANCE_API_KEY=... TELEGRAM_TOKEN=... # etc.
-```
-
-### Variables obligatorias en Railway
-```
-BINANCE_API_KEY
-BINANCE_SECRET_KEY
-TELEGRAM_TOKEN
-TELEGRAM_CHAT_ID
-```
+4. Ve a **Variables** → añade todas las variables del `.env`
+5. Railway detecta `Procfile` → ejecuta `python main.py`
+6. Si el proceso cae, se reinicia automático (`railway.toml`)
 
 ---
 
-## 🧪 Paper Trading primero (OBLIGATORIO)
+## Cómo obtener las claves
 
-```env
-TESTNET=true
-```
+### BingX API
+1. [bingx.com](https://bingx.com) → Cuenta → API Management
+2. Crear clave: permisos **Read + Trade** (nunca "Retiradas")
+3. Whitelistea la IP de Railway (o deja abierta solo para trade)
 
-Binance Futures Testnet: https://testnet.binancefuture.com
+### Telegram Bot Token
+1. Habla con [@BotFather](https://t.me/BotFather) → `/newbot`
+2. Copia el token
 
-**Valida durante al menos 2 semanas antes de usar dinero real.**
-
----
-
-## 📊 Mensajes Telegram
-
-| Evento | Contenido |
-|---|---|
-| 🚀 Arranque | Config, modo, pares, leverage |
-| 📈📉 Entrada | Precio, qty, TP, SL, régimen, ADX, probs Markov, RVOL, STC, VWAP, POC, RSI, score total, razones |
-| ✅❌ Salida | Motivo (TP/SL/Tiempo), PnL USDT, PnL %, balance |
-| 💓 Heartbeat | Cada hora: balance, PnL diario, DD, estado por par |
-| ⚠️ Error | Stack trace truncado |
+### Telegram Chat ID
+1. Habla con [@userinfobot](https://t.me/userinfobot)
+2. Copia tu `id`
 
 ---
 
-## ⚠️ Avisos de riesgo
+## Lógica de señales
 
-> **El trading con apalancamiento puede resultar en pérdida total del capital.**
-> Este software se proporciona sin garantías. Úsalo bajo tu propia responsabilidad.
-> Empieza siempre con capital que puedas permitirte perder.
+### LONG entra cuando (todos deben cumplirse):
+- `low` rompe el último valle (sweep de liquidez)
+- `close < VWAP`
+- Magic Slope > Slope Adaptativo (ADX)
+- RVOL > 1.5x
+- Prob Markov Bull > umbral
+- STC < 75 (no sobrecomprado)
+- Funding rate no adverso
+- No en zona de liquidación SHORT
 
-**Ajustes conservadores recomendados para empezar:**
-```env
-LEVERAGE=3
-RISK_PER_TRADE=1.0
-MAX_DAILY_LOSS_PCT=2.0
-ATR_MULT_TP=2.5
-ATR_MULT_SL=1.0
-```
+### SHORT entra cuando (todos deben cumplirse):
+- `high` rompe el último pico
+- `close > VWAP`
+- Magic Slope < -Slope Adaptativo
+- RVOL > 1.5x
+- Prob Markov Bear > umbral
+- STC > 25
+- Funding rate no adverso
+- No en zona de liquidación LONG
+
+### Score de confianza (0–100):
+- Base: probabilidad Markov (0–80)
+- +10 si hay boost de liquidation map
+- +10 si funding rate es favorable
+
+### Triple barrera de salida:
+- **TP**: entrada ± ATR14 × 2.0
+- **SL**: entrada ∓ ATR14 × 1.2
+- **Tiempo**: cierre forzado a las 20 velas
 
 ---
 
-## 🔧 Ajuste de parámetros
+## Cómo funciona el Funding Rate Filter
 
-| Parámetro | Valor base | Mercado alcista | Mercado lateral |
-|---|---|---|---|
-| `PROB_THRESHOLD` | 40% | 35% | 50% |
-| `RVOL_MIN` | 1.5x | 1.3x | 2.0x |
-| `ATR_MULT_TP` | 2.0 | 2.5 | 1.5 |
-| `ADX_TREND` | 25 | 20 | 30 |
+Los perpetual futures tienen un mecanismo de funding:
+- **Funding positivo** → longs pagan shorts → mercado sobrecargado de longs → sesgo bajista
+- **Funding negativo** → shorts pagan longs → mercado sobrecargado de shorts → sesgo alcista
+
+El bot evita abrir posiciones contra el funding extremo (configurable con `FUNDING_THRESHOLD`).
+También envía una alerta Telegram cuando el funding supera el umbral.
+
+## Cómo funciona el Liquidation Map
+
+Calcula zonas donde hay alta probabilidad de stops acumulados:
+- Usa pivots históricos ponderados por volumen
+- Cuando el precio entra en una zona de liquidación LONG (bajo), los stops se activan y pueden generar un movimiento alcista → boost para señales LONG
+- Cuando entra en zona SHORT (alto) → boost para señales SHORT
 
 ---
 
-## 📋 Logs
+## Advertencia
 
-Los logs se guardan en `logs/bot.log` con rotación automática.
-En Railway puedes verlos en tiempo real desde el panel → **Deployments → View Logs**.
+Operar con futuros apalancados conlleva riesgo de pérdida del capital.
+Empieza siempre con `MODE=paper` varios días antes de pasar a `live`.
+El bot no garantiza resultados. Úsalo bajo tu propia responsabilidad.

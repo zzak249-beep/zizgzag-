@@ -1,10 +1,7 @@
 [build]
-builder = "dockerfile"
-dockerfilePath = "Dockerfile"
+builder = "nixpacks"
 
 [deploy]
-restartPolicyType   = "always"
+startCommand = "python main.py"
+restartPolicyType = "always"
 restartPolicyMaxRetries = 10
-
-[volumes]
-mountPath = "/data"
