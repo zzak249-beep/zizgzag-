@@ -1,24 +1,16 @@
 FROM python:3.11-slim
 
-# System deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
+RUN apt-get update && apt-get install -y --no-install-recommends gcc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+RUN mkdir -p /data
 
-# Install Python deps first (layer caching)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir numpy==1.26.4 pandas==2.2.2 \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Copy source
-COPY . .
+COPY bot.py .
 
-# Create log directory
-RUN mkdir -p logs
-
-# Non-root user for security
-RUN useradd -m botuser && chown -R botuser:botuser /app
-USER botuser
-
-CMD ["python", "main.py"]
+CMD ["python", "-u", "bot.py"]
