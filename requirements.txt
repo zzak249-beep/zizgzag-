@@ -1,6 +1,0 @@
-numpy==1.26.4
-pandas==2.2.2
-requests==2.32.2
-websocket-client==1.8.0
-python-telegram-bot==20.7
-python-dotenv==1.0.1
