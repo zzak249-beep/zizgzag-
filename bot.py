@@ -40,14 +40,17 @@ SL_PCT           = float(os.environ.get("SL_PCT", "1.5"))
 TP_PCT           = float(os.environ.get("TP_PCT", "3.0"))
 MIN_SIGNAL_LEVEL = os.environ.get("MIN_SIGNAL_LEVEL", "LONG_FUEL")
 
-# Símbolos a escanear (añade o quita según prefieras)
-SYMBOLS = os.environ.get(
-    "SYMBOLS",
-    "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT"
-).split(",")
+# Símbolos manuales opcionales (si está vacío, se auto-descubren todos los de BingX)
+SYMBOLS_OVERRIDE = os.environ.get("SYMBOLS", "").strip()
+
+# Volumen mínimo en USDT en 24h para incluir un par (evita monedas sin liquidez)
+MIN_VOLUME_USDT = float(os.environ.get("MIN_VOLUME_USDT", "1000000"))  # 1M USDT por defecto
 
 # Intervalo de escaneo en segundos (3 minutos = 180s como el Pine)
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "180"))
+
+# Lista dinámica (se rellena al arrancar)
+SYMBOLS: list[str] = []
 
 # Timeframe para velas (3m)
 KLINE_INTERVAL = os.environ.get("KLINE_INTERVAL", "3m")
@@ -96,7 +99,57 @@ async def bingx_post(path: str, body: dict) -> dict:
                 raise Exception(f"BingX POST error: {data}")
             return data
 
-async def get_klines(symbol: str, interval: str = "3m", limit: int = 100) -> list[dict]:
+async def get_all_symbols(min_volume: float = 1_000_000) -> list[str]:
+    """
+    Obtiene todos los pares USDT perpetuos de BingX con volumen >= min_volume USDT/24h.
+    Devuelve lista ordenada por volumen descendente.
+    """
+    try:
+        # Endpoint público — no requiere firma
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                BINGX_BASE + "/openApi/swap/v2/quote/contracts",
+                headers={"Content-Type": "application/json"}
+            ) as r:
+                data = await r.json()
+
+        contracts = data.get("data", [])
+        usdt_pairs = [
+            c["symbol"] for c in contracts
+            if c.get("symbol", "").endswith("-USDT") and c.get("status", 1) == 1
+        ]
+
+        # Filtra por volumen: obtiene ticker 24h en batch
+        symbols_with_vol: list[tuple[str, float]] = []
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                BINGX_BASE + "/openApi/swap/v2/quote/ticker",
+                headers={"Content-Type": "application/json"}
+            ) as r:
+                ticker_data = await r.json()
+
+        tickers = {t["symbol"]: float(t.get("quoteVolume", 0))
+                   for t in ticker_data.get("data", [])
+                   if t.get("symbol", "").endswith("-USDT")}
+
+        for sym in usdt_pairs:
+            vol = tickers.get(sym, 0)
+            if vol >= min_volume:
+                symbols_with_vol.append((sym, vol))
+
+        # Ordena por volumen (mayor primero = mejores oportunidades primero)
+        symbols_with_vol.sort(key=lambda x: x[1], reverse=True)
+        result = [s for s, _ in symbols_with_vol]
+        log.info(f"Pares descubiertos: {len(result)} de {len(usdt_pairs)} total (vol≥{min_volume/1e6:.1f}M USDT)")
+        return result
+
+    except Exception as e:
+        log.error(f"Error obteniendo símbolos: {e}")
+        # Fallback a pares principales
+        return ["BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
+                "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "DOT-USDT", "LINK-USDT"]
+
+
     """
     Obtiene velas de BingX.
     Devuelve lista de dicts: open, high, low, close, volume (floats).
@@ -613,28 +666,82 @@ async def handle_signal(signal: str, symbol: str) -> None:
 # ══════════════════════════════════════════════════
 #  SCANNER — escanea todos los símbolos cada SCAN_INTERVAL
 # ══════════════════════════════════════════════════
+async def scan_symbol(symbol: str, semaphore: asyncio.Semaphore) -> Optional[tuple[str, str]]:
+    """Escanea un símbolo y devuelve (symbol, signal) o None."""
+    async with semaphore:
+        try:
+            candles     = await get_klines(symbol, KLINE_INTERVAL, limit=120)
+            htf_candles = await get_klines(symbol, HTF_INTERVAL,   limit=40)
+            signal = compute_signal(candles, htf_candles)
+            if signal:
+                return (symbol, signal)
+            return None
+        except Exception as e:
+            log.debug(f"Scanner skip {symbol}: {e}")
+            return None
+
 async def scanner_loop() -> None:
+    global SYMBOLS
     await asyncio.sleep(10)  # espera arranque
+
+    # ── Auto-descubrimiento de pares
+    if SYMBOLS_OVERRIDE:
+        SYMBOLS = [s.strip() for s in SYMBOLS_OVERRIDE.split(",") if s.strip()]
+        log.info(f"Usando símbolos manuales: {SYMBOLS}")
+    else:
+        SYMBOLS = await get_all_symbols(min_volume=MIN_VOLUME_USDT)
+
     await tg_send(
-        f"🔍 <b>Scanner activo</b>\n"
-        f"Símbolos: <code>{', '.join(SYMBOLS)}</code>\n"
-        f"Intervalo: <code>{KLINE_INTERVAL}</code> | cada <code>{SCAN_INTERVAL}s</code>\n"
-        f"Min señal: <code>{MIN_SIGNAL_LEVEL}</code>"
+        f"🔍 <b>Scanner activo — {len(SYMBOLS)} pares</b>\n"
+        f"Top 5: <code>{', '.join(SYMBOLS[:5])}</code>...\n"
+        f"TF: <code>{KLINE_INTERVAL}</code> | HTF: <code>{HTF_INTERVAL}</code>\n"
+        f"Ciclo: <code>{SCAN_INTERVAL}s</code> | Min señal: <code>{MIN_SIGNAL_LEVEL}</code>\n"
+        f"Vol mín: <code>{MIN_VOLUME_USDT/1e6:.1f}M USDT/24h</code>"
     )
+
+    # Refresca la lista de pares cada 6 horas
+    last_refresh = time.time()
+    REFRESH_INTERVAL = 6 * 3600
+
+    # Semáforo: máximo 10 peticiones simultáneas a BingX
+    semaphore = asyncio.Semaphore(10)
+
+    scan_count = 0
     while True:
-        for symbol in SYMBOLS:
-            try:
-                candles     = await get_klines(symbol, KLINE_INTERVAL, limit=120)
-                htf_candles = await get_klines(symbol, HTF_INTERVAL,   limit=40)
-                signal = compute_signal(candles, htf_candles)
-                if signal:
-                    log.info(f"Señal detectada: {signal} en {symbol}")
-                    await handle_signal(signal, symbol)
-                await asyncio.sleep(0.5)  # pausa entre símbolos para no saturar la API
-            except Exception as e:
-                log.error(f"Scanner error {symbol}: {e}")
-                await asyncio.sleep(2)
-        await asyncio.sleep(SCAN_INTERVAL)
+        # Refresca lista de pares periódicamente
+        if not SYMBOLS_OVERRIDE and (time.time() - last_refresh) > REFRESH_INTERVAL:
+            new_symbols = await get_all_symbols(min_volume=MIN_VOLUME_USDT)
+            if new_symbols:
+                added   = set(new_symbols) - set(SYMBOLS)
+                removed = set(SYMBOLS) - set(new_symbols)
+                SYMBOLS = new_symbols
+                last_refresh = time.time()
+                log.info(f"Lista actualizada: {len(SYMBOLS)} pares (+{len(added)} -{len(removed)})")
+
+        scan_count += 1
+        t0 = time.time()
+        log.info(f"Ciclo #{scan_count} — escaneando {len(SYMBOLS)} pares...")
+
+        # Escanea todos en paralelo (10 concurrentes)
+        tasks = [scan_symbol(sym, semaphore) for sym in SYMBOLS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        signals_found = []
+        for result in results:
+            if isinstance(result, tuple):
+                sym, sig = result
+                signals_found.append((sym, sig))
+                await handle_signal(sig, sym)
+
+        elapsed = time.time() - t0
+        if signals_found:
+            log.info(f"Ciclo #{scan_count} — {len(signals_found)} señales en {elapsed:.1f}s: {signals_found}")
+        else:
+            log.info(f"Ciclo #{scan_count} — sin señales ({elapsed:.1f}s)")
+
+        # Espera hasta el próximo ciclo
+        wait = max(0, SCAN_INTERVAL - elapsed)
+        await asyncio.sleep(wait)
 
 # ══════════════════════════════════════════════════
 #  MONITOR DE POSICIONES
@@ -713,7 +820,8 @@ async def health():
     return {
         "status": "running",
         "mode": "bingx_scanner",
-        "symbols": SYMBOLS,
+        "total_symbols": len(SYMBOLS),
+        "symbols_sample": SYMBOLS[:10],
         "scan_interval_s": SCAN_INTERVAL,
         "open_trades": len(open_trades),
         "trades": list(open_trades.keys()),
