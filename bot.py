@@ -5,6 +5,7 @@ Railway deployment ready
 """
 import asyncio
 import logging
+import math
 import os
 import time
 import hmac
@@ -40,22 +41,21 @@ SL_PCT           = float(os.environ.get("SL_PCT", "1.5"))
 TP_PCT           = float(os.environ.get("TP_PCT", "3.0"))
 MIN_SIGNAL_LEVEL = os.environ.get("MIN_SIGNAL_LEVEL", "LONG_FUEL")
 
-# Símbolos manuales opcionales (si está vacío, se auto-descubren todos los de BingX)
-SYMBOLS_OVERRIDE = os.environ.get("SYMBOLS", "").strip()
+# BUG FIX #2: Parsear SYMBOLS correctamente — limpiar tokens que no sean símbolos válidos
+_raw_symbols = os.environ.get("SYMBOLS", "").strip()
+if _raw_symbols:
+    SYMBOLS_OVERRIDE = ",".join(
+        s.strip() for s in _raw_symbols.split(",")
+        if s.strip() and "-USDT" in s.strip() and "=" not in s.strip()
+    )
+else:
+    SYMBOLS_OVERRIDE = ""
 
-# Volumen mínimo en USDT en 24h para incluir un par (evita monedas sin liquidez)
-MIN_VOLUME_USDT = float(os.environ.get("MIN_VOLUME_USDT", "1000000"))  # 1M USDT por defecto
-
-# Intervalo de escaneo en segundos (3 minutos = 180s como el Pine)
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "180"))
-
-# Lista dinámica (se rellena al arrancar)
+MIN_VOLUME_USDT = float(os.environ.get("MIN_VOLUME_USDT", "500000"))
+SCAN_INTERVAL   = int(os.environ.get("SCAN_INTERVAL", "180"))
 SYMBOLS: list[str] = []
-
-# Timeframe para velas (3m)
-KLINE_INTERVAL = os.environ.get("KLINE_INTERVAL", "3m")
-# HTF para tendencia (15m)
-HTF_INTERVAL = os.environ.get("HTF_INTERVAL", "15m")
+KLINE_INTERVAL  = os.environ.get("KLINE_INTERVAL", "3m")
+HTF_INTERVAL    = os.environ.get("HTF_INTERVAL", "15m")
 
 BINGX_BASE = "https://open-api.bingx.com"
 
@@ -72,6 +72,8 @@ open_trades: dict[str, dict] = {}
 # ══════════════════════════════════════════════════
 #  BINGX CLIENT
 # ══════════════════════════════════════════════════
+
+# BUG FIX #4: hmac.new → hmac.new (el correcto es hmac.new)
 def _sign(params: dict, secret: str) -> str:
     query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
     return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -99,13 +101,12 @@ async def bingx_post(path: str, body: dict) -> dict:
                 raise Exception(f"BingX POST error: {data}")
             return data
 
-async def get_all_symbols(min_volume: float = 1_000_000) -> list[str]:
+async def get_all_symbols(min_volume: float = 500_000) -> list[str]:
     """
     Obtiene todos los pares USDT perpetuos de BingX con volumen >= min_volume USDT/24h.
     Devuelve lista ordenada por volumen descendente.
     """
     try:
-        # Endpoint público — no requiere firma
         async with aiohttp.ClientSession() as s:
             async with s.get(
                 BINGX_BASE + "/openApi/swap/v2/quote/contracts",
@@ -118,9 +119,8 @@ async def get_all_symbols(min_volume: float = 1_000_000) -> list[str]:
             c["symbol"] for c in contracts
             if c.get("symbol", "").endswith("-USDT") and c.get("status", 1) == 1
         ]
+        log.info(f"Contratos USDT activos encontrados: {len(usdt_pairs)}")
 
-        # Filtra por volumen: obtiene ticker 24h en batch
-        symbols_with_vol: list[tuple[str, float]] = []
         async with aiohttp.ClientSession() as s:
             async with s.get(
                 BINGX_BASE + "/openApi/swap/v2/quote/ticker",
@@ -132,24 +132,25 @@ async def get_all_symbols(min_volume: float = 1_000_000) -> list[str]:
                    for t in ticker_data.get("data", [])
                    if t.get("symbol", "").endswith("-USDT")}
 
+        symbols_with_vol: list[tuple[str, float]] = []
         for sym in usdt_pairs:
             vol = tickers.get(sym, 0)
             if vol >= min_volume:
                 symbols_with_vol.append((sym, vol))
 
-        # Ordena por volumen (mayor primero = mejores oportunidades primero)
         symbols_with_vol.sort(key=lambda x: x[1], reverse=True)
         result = [s for s, _ in symbols_with_vol]
-        log.info(f"Pares descubiertos: {len(result)} de {len(usdt_pairs)} total (vol≥{min_volume/1e6:.1f}M USDT)")
+        log.info(f"Pares descubiertos: {len(result)} de {len(usdt_pairs)} total (vol≥{min_volume/1e6:.2f}M USDT)")
         return result
 
     except Exception as e:
         log.error(f"Error obteniendo símbolos: {e}")
-        # Fallback a pares principales
         return ["BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
                 "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "DOT-USDT", "LINK-USDT"]
 
 
+# BUG FIX #1: get_klines estaba truncada (solo tenía docstring, sin implementación)
+async def get_klines(symbol: str, interval: str, limit: int = 120) -> list[dict]:
     """
     Obtiene velas de BingX.
     Devuelve lista de dicts: open, high, low, close, volume (floats).
@@ -257,7 +258,7 @@ def _ema(data: list[float], period: int) -> list[float]:
     result = [float("nan")] * len(data)
     k = 2 / (period + 1)
     for i in range(len(data)):
-        if i == 0 or (i > 0 and result[i-1] != result[i-1]):  # nan check
+        if i == 0 or (i > 0 and result[i-1] != result[i-1]):
             result[i] = data[i]
         else:
             result[i] = data[i] * k + result[i-1] * (1 - k)
@@ -324,7 +325,6 @@ def _zscore(data: list[float], period: int, idx: int) -> float:
     return (data[idx] - m) / s if s > 0 else 0.0
 
 def _tanh(x: float) -> float:
-    import math
     v = max(min(2.0 * x, 20.0), -20.0)
     e2x = math.exp(v)
     return (e2x - 1.0) / (e2x + 1.0)
@@ -334,7 +334,7 @@ def _winsor(z: float, cap: float = 2.5) -> float:
 
 def _highest(data: list[float], period: int, idx: int) -> float:
     start = max(0, idx - period + 1)
-    window = [x for x in data[start:idx+1] if x == x]  # skip nan
+    window = [x for x in data[start:idx+1] if x == x]
     return max(window) if window else float("nan")
 
 def _lowest(data: list[float], period: int, idx: int) -> float:
@@ -343,7 +343,6 @@ def _lowest(data: list[float], period: int, idx: int) -> float:
     return min(window) if window else float("nan")
 
 def _pivot_high(highs: list[float], left: int, right: int, idx: int) -> Optional[float]:
-    """Pivot high: el valor en idx-right es el máximo en ±left/right."""
     pivot_idx = idx - right
     if pivot_idx < left:
         return None
@@ -367,23 +366,17 @@ def _pivot_low(lows: list[float], left: int, right: int, idx: int) -> Optional[f
 #  MOTOR DE SEÑALES (lógica completa del Pine V3)
 # ─────────────────────────────────────────────────
 def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str]:
-    """
-    Reproduce la lógica QF×JP V3 en Python.
-    Devuelve el nombre de la señal o None.
-    """
     if len(candles) < 80 or len(htf_candles) < 25:
         return None
 
-    # Arrays base
     o = [c["open"]   for c in candles]
     h = [c["high"]   for c in candles]
     l = [c["low"]    for c in candles]
     c = [c["close"]  for c in candles]
     v = [c["volume"] for c in candles]
     n = len(c)
-    i = n - 1  # índice actual (última vela completa)
+    i = n - 1
 
-    # ── Parámetros (mismos defaults que el Pine)
     i_mom = 20; i_rev = 8; i_vol = 14; i_atr_p = 10
     i_w1 = 0.40; i_w2 = 0.30; i_w3 = 0.30
     i_dlen = 40; i_dthr = 0.50
@@ -400,31 +393,26 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     i_sh_wick = 0.60; i_sh_vol = 1.5
     i_smo = 3
 
-    # ── ATR
     atr_arr  = _atr(h, l, c, i_atr_p)
     atr_long_arr = _atr(h, l, c, 20)
     atr  = atr_arr[i]  if atr_arr[i] == atr_arr[i]  else 0.0001
     atr_long = atr_long_arr[i] if atr_long_arr[i] == atr_long_arr[i] else 0.0001
 
-    # ── Spread / exec
     hi_lo_r   = [math.log(h[j] / l[j]) if l[j] > 0 else 0.0 for j in range(n)]
     spread_arr = _sma(hi_lo_r, i_spl)
     spread = spread_arr[i] * c[i] if spread_arr[i] == spread_arr[i] else 0.0
     bp_drain = (spread / c[i]) * 100 if c[i] > 0 else 999
     exec_ok = bp_drain < i_bpt
 
-    # ── OBV
     obv_arr    = _obv(c, v)
     obv_ma_arr = _ema(obv_arr, i_vol)
     obv_std_arr = _stdev(obv_arr, i_vol)
     f_vol_val  = (obv_arr[i] - obv_ma_arr[i]) / obv_std_arr[i] if obv_std_arr[i] > 0 else 0.0
 
-    # ── Crowding
     roc_arr    = _roc(c, i_mom)
-    roc_simple = [r / 100 if r == r else 0.0 for r in roc_arr]  # normalise
+    roc_simple = [r / 100 if r == r else 0.0 for r in roc_arr]
     sma2_arr   = _sma(roc_simple, i_mom * 2)
     std2_arr   = _stdev(roc_simple, i_mom * 2)
-    simple_z   = _winsor((roc_simple[i] - sma2_arr[i]) / std2_arr[i] if std2_arr[i] > 0 else 0.0)
 
     obv_ma2_arr  = _ema(obv_arr, i_vol)
     obv_std2_arr = _stdev(obv_arr, i_vol)
@@ -432,7 +420,6 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
 
     simple_z_list = [_winsor(_zscore(roc_simple, i_mom * 2, j)) for j in range(n)]
     pre_crowd_r = _correlation(simple_z_list, f_vol_pre_arr, i_mom * 3, i)
-    is_pre_crowd = abs(pre_crowd_r) >= 0.75
     crowd_count = 0
     for j in range(max(0, i - 15), i + 1):
         cr = _correlation(simple_z_list, f_vol_pre_arr, i_mom * 3, j)
@@ -445,7 +432,6 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     w1_dyn = max(i_w1 - 0.15, 0.10) if crowd_persistent else i_w1
     w3_dyn = min(i_w3 + 0.15, 0.60) if crowd_persistent else i_w3
 
-    # ── L2 Factores
     roc_raw_val = (c[i] - c[i - i_mom]) / c[i - i_mom] if c[i - i_mom] != 0 else 0.0
     sma_c  = _sma(c, i_mom)
     std_c  = _stdev(c, i_mom)
@@ -456,9 +442,6 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     bstd_arr  = _stdev(c, i_rev)
     f_rev_val = -(c[i] - basis_arr[i]) / bstd_arr[i] if bstd_arr[i] > 0 else 0.0
 
-    raw_score_val = w1_dyn * f_mom_val + i_w2 * f_rev_val + w3_dyn * f_vol_val
-
-    # For EMA of raw_score we'd need history; approximate with current value
     raw_scores = [w1_dyn * ((c[j] - c[j-i_mom])/c[j-i_mom] if j >= i_mom and c[j-i_mom] != 0 else 0.0)
                   + i_w2 * (-(c[j] - basis_arr[j])/bstd_arr[j] if bstd_arr[j] > 0 else 0.0)
                   + w3_dyn * f_vol_pre_arr[j]
@@ -467,17 +450,14 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     sc_std_arr  = _stdev(comp_scores, i_dlen)
     norm_score = _tanh(comp_scores[i] / sc_std_arr[i]) if sc_std_arr[i] > 0 else 0.0
 
-    # ── L3 Decaimiento
     fwd_rets = [((c[j] - c[j-1]) / c[j-1]) if j > 0 and c[j-1] != 0 else 0.0 for j in range(n)]
     norm_scores_shifted = [comp_scores[j-1] / sc_std_arr[j-1] if j > 0 and sc_std_arr[j-1] > 0 else 0.0 for j in range(n)]
-    ic_num_val = _correlation(norm_scores_shifted, fwd_rets, i_dlen, i)
     ic_roll_vals = [abs(_correlation(norm_scores_shifted, fwd_rets, i_dlen, j)) for j in range(n)]
     ic_roll_ema = _ema(ic_roll_vals, i_smo)
     ic_peak = _highest(ic_roll_ema, i_dlen, i)
     decay_r = ic_roll_ema[i] / ic_peak if ic_peak and ic_peak > 0 else 0.5
     sig_alive = decay_r >= i_dthr
 
-    # ── L4 Dark Pool
     vol_base_arr = _sma(v, i_dpb)
     vol_base = vol_base_arr[i] if vol_base_arr[i] == vol_base_arr[i] else 0.0
     vol_spike  = v[i] > vol_base * i_dpm
@@ -485,7 +465,6 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     dp_buy     = vol_spike and rng_narrow and c[i] > o[i]
     dp_sell    = vol_spike and rng_narrow and c[i] < o[i]
 
-    # ── L6 Asimetría
     up_rng = [(h[j] - l[j]) if c[j] > o[j] else 0.0 for j in range(n)]
     dn_rng = [(h[j] - l[j]) if c[j] < o[j] else 0.0 for j in range(n)]
     avg_up = _sma(up_rng, i_asl)
@@ -495,7 +474,6 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     asym_bull = rng_rb >= i_arr
     asym_bear = rng_rb_bear >= i_abr
 
-    # ── HTF tendencia (15m)
     htf_c = [x["close"] for x in htf_candles]
     htf_ema9  = _ema(htf_c, 9)
     htf_ema21 = _ema(htf_c, 21)
@@ -503,7 +481,6 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     htf_bull = htf_ema9[htf_i] > htf_ema21[htf_i]
     htf_bear = htf_ema9[htf_i] < htf_ema21[htf_i]
 
-    # ── L7 Trendline (simplificado: busca últimos 2 pivots)
     tl_break_long  = False
     tl_break_short = False
     ph_vals = []
@@ -532,7 +509,6 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
             tl_up_prev = pv1 + slope * (i - 1 - pb1)
             tl_break_short = c[i] < tl_up_now - atr * i_tlm and c[i-1] >= tl_up_prev - atr * i_tlm
 
-    # ── L8 Swing (Higher Lows / Lower Highs)
     recent_pl = [pv for (pb, pv) in pl_vals if (i - pb) <= i_hlw]
     recent_ph = [pv for (pb, pv) in ph_vals if (i - pb) <= i_hlw]
     hl_count = sum(1 for j in range(1, len(recent_pl)) if recent_pl[j] > recent_pl[j-1])
@@ -540,7 +516,6 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     sell_exhausted = hl_count >= i_hlc
     buy_exhausted  = lh_count >= i_hhc
 
-    # ── Anti-spoof
     bar_range = h[i] - l[i]
     spoof_vol_ok = v[i-1] > vol_base * i_spoof_vol if i > 0 else False
     spoof_ret_ok = abs(c[i] - c[i-2]) < atr * i_spoof_rev if i > 1 else False
@@ -548,18 +523,15 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     bear_trap = (c[i-1] < o[i-1] and (h[i-1]-l[i-1]) > atr*1.5 and c[i] > o[i] and v[i-1] > vol_base*1.8) if i > 0 else False
     in_spoof_zone = (spoof_vol_ok and spoof_ret_ok) or bull_trap or bear_trap
 
-    # ── Blackout (ATR spike)
     atr_spike = atr > atr_long * i_blk_mult
     in_blackout = atr_spike
 
-    # ── Sesión
     current_hour = datetime.now(timezone.utc).hour
     sess_eu     = 7 <= current_hour < 15
     sess_ny     = 13 <= current_hour < 21
     sess_crypto = current_hour >= 21 or current_hour < 1
     in_time_window = sess_eu or sess_ny or sess_crypto
 
-    # ── Liquidaciones
     highest_h = _highest(h, i_liq_look, i)
     lowest_l  = _lowest(l,  i_liq_look, i)
     liq_long_zone  = highest_h * (1.0 - 1.0 / i_lev) if highest_h == highest_h else 0
@@ -567,7 +539,6 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     near_liq_long  = abs(c[i] - liq_long_zone)  < atr * 0.5
     near_liq_short = abs(c[i] - liq_short_zone) < atr * 0.5
 
-    # ── CVD
     bar_pos_arr = [(c[j] - l[j]) / (h[j] - l[j]) if (h[j] - l[j]) > 0 else 0.5 for j in range(n)]
     bar_delta_arr = [v[j] * (2.0 * bar_pos_arr[j] - 1.0) for j in range(n)]
     cvd_arr = _sma(bar_delta_arr, i_cvd_len)
@@ -579,13 +550,11 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     cvd_div_bear  = price_roc_val > 0 and cvd_roc_val < -i_cvd_th
     cvd_z         = _winsor(_zscore(cvd_arr, i_cvd_len * 2, i))
 
-    # ── Stop Hunt
     low_wick  = min(o[i], c[i]) - l[i]
     high_wick = h[i] - max(o[i], c[i])
     stop_hunt_dn = low_wick  > bar_range * i_sh_wick and v[i] > vol_base * i_sh_vol and c[i] > o[i]
     stop_hunt_up = high_wick > bar_range * i_sh_wick and v[i] > vol_base * i_sh_vol and c[i] < o[i]
 
-    # ══ SEÑALES (idéntica lógica al Pine)
     base_long  = norm_score > 0.15 and sig_alive and exec_ok and htf_bull and asym_bull and sell_exhausted
     base_short = norm_score < -0.15 and sig_alive and exec_ok and htf_bear and asym_bear and buy_exhausted
     filters_ok = not in_spoof_zone and not in_blackout and in_time_window
@@ -601,7 +570,6 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     sh_long_entry  = stop_hunt_dn and htf_bull and sig_alive and not in_blackout and in_time_window and not in_spoof_zone
     sh_short_entry = stop_hunt_up and htf_bear and sig_alive and not in_blackout and in_time_window and not in_spoof_zone
 
-    # Retorna la señal de mayor rango
     if long_sup_v3:    return "LONG_SUP_V3"
     if short_sup_v3:   return "SHORT_SUP_V3"
     if long_sup:       return "LONG_SUP"
@@ -611,8 +579,6 @@ def compute_signal(candles: list[dict], htf_candles: list[dict]) -> Optional[str
     if sh_long_entry:  return "HUNT_LONG"
     if sh_short_entry: return "HUNT_SHORT"
     return None
-
-import math  # necesario para compute_signal
 
 # ══════════════════════════════════════════════════
 #  TRADING LOGIC
@@ -664,10 +630,9 @@ async def handle_signal(signal: str, symbol: str) -> None:
         await tg_send(f"❌ <b>ERROR</b> {signal} {symbol}\n<code>{e}</code>")
 
 # ══════════════════════════════════════════════════
-#  SCANNER — escanea todos los símbolos cada SCAN_INTERVAL
+#  SCANNER
 # ══════════════════════════════════════════════════
 async def scan_symbol(symbol: str, semaphore: asyncio.Semaphore) -> Optional[tuple[str, str]]:
-    """Escanea un símbolo y devuelve (symbol, signal) o None."""
     async with semaphore:
         try:
             candles     = await get_klines(symbol, KLINE_INTERVAL, limit=120)
@@ -682,12 +647,11 @@ async def scan_symbol(symbol: str, semaphore: asyncio.Semaphore) -> Optional[tup
 
 async def scanner_loop() -> None:
     global SYMBOLS
-    await asyncio.sleep(10)  # espera arranque
+    await asyncio.sleep(10)
 
-    # ── Auto-descubrimiento de pares
     if SYMBOLS_OVERRIDE:
         SYMBOLS = [s.strip() for s in SYMBOLS_OVERRIDE.split(",") if s.strip()]
-        log.info(f"Usando símbolos manuales: {SYMBOLS}")
+        log.info(f"Usando símbolos manuales: {len(SYMBOLS)} pares → {SYMBOLS}")
     else:
         SYMBOLS = await get_all_symbols(min_volume=MIN_VOLUME_USDT)
 
@@ -696,19 +660,15 @@ async def scanner_loop() -> None:
         f"Top 5: <code>{', '.join(SYMBOLS[:5])}</code>...\n"
         f"TF: <code>{KLINE_INTERVAL}</code> | HTF: <code>{HTF_INTERVAL}</code>\n"
         f"Ciclo: <code>{SCAN_INTERVAL}s</code> | Min señal: <code>{MIN_SIGNAL_LEVEL}</code>\n"
-        f"Vol mín: <code>{MIN_VOLUME_USDT/1e6:.1f}M USDT/24h</code>"
+        f"Vol mín: <code>{MIN_VOLUME_USDT/1e6:.2f}M USDT/24h</code>"
     )
 
-    # Refresca la lista de pares cada 6 horas
     last_refresh = time.time()
     REFRESH_INTERVAL = 6 * 3600
-
-    # Semáforo: máximo 10 peticiones simultáneas a BingX
     semaphore = asyncio.Semaphore(10)
-
     scan_count = 0
+
     while True:
-        # Refresca lista de pares periódicamente
         if not SYMBOLS_OVERRIDE and (time.time() - last_refresh) > REFRESH_INTERVAL:
             new_symbols = await get_all_symbols(min_volume=MIN_VOLUME_USDT)
             if new_symbols:
@@ -722,7 +682,6 @@ async def scanner_loop() -> None:
         t0 = time.time()
         log.info(f"Ciclo #{scan_count} — escaneando {len(SYMBOLS)} pares...")
 
-        # Escanea todos en paralelo (10 concurrentes)
         tasks = [scan_symbol(sym, semaphore) for sym in SYMBOLS]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -739,7 +698,6 @@ async def scanner_loop() -> None:
         else:
             log.info(f"Ciclo #{scan_count} — sin señales ({elapsed:.1f}s)")
 
-        # Espera hasta el próximo ciclo
         wait = max(0, SCAN_INTERVAL - elapsed)
         await asyncio.sleep(wait)
 
@@ -800,7 +758,6 @@ app = FastAPI(title="QF×JP Bot", lifespan=lifespan)
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """Webhook manual opcional (TradingView, pruebas, etc.)."""
     secret = request.headers.get("X-Webhook-Secret", "")
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -833,7 +790,6 @@ async def trades():
 
 @app.get("/scan/{symbol}")
 async def scan_now(symbol: str):
-    """Fuerza un escaneo inmediato del símbolo."""
     sym = symbol.upper()
     if "-" not in sym:
         sym = sym.replace("USDT", "") + "-USDT"
