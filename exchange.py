@@ -1,5 +1,7 @@
 """
-BingX Perpetual Futures — REST connector
+BingX Perpetual Futures — REST connector v3.2
+FIX: Retry con backoff exponencial para error 100410 (rate limit disabled period)
+FIX: Rate limiter interno para no superar ~20 req/s en klines
 """
 import asyncio
 import hashlib
@@ -7,6 +9,7 @@ import hmac
 import json
 import logging
 import time
+from collections import deque
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -16,6 +19,28 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 BASE_URL = "https://open-api.bingx.com"
+
+# ── Rate limiter global ───────────────────────────────────────
+# BingX permite ~20 req/s en klines; usamos 8 req/s por seguridad
+_KLINES_WINDOW  = 1.0   # segundos
+_KLINES_MAX_REQ = 8     # máximo de peticiones por ventana
+_klines_times: deque = deque()
+_klines_lock = asyncio.Lock()
+
+
+async def _klines_throttle():
+    """Limita las llamadas a klines a _KLINES_MAX_REQ por _KLINES_WINDOW segundos."""
+    async with _klines_lock:
+        now = time.monotonic()
+        # Limpiar timestamps fuera de la ventana
+        while _klines_times and now - _klines_times[0] > _KLINES_WINDOW:
+            _klines_times.popleft()
+        if len(_klines_times) >= _KLINES_MAX_REQ:
+            wait = _KLINES_WINDOW - (now - _klines_times[0]) + 0.05
+            if wait > 0:
+                logger.debug(f"Throttle klines: esperando {wait:.2f}s")
+                await asyncio.sleep(wait)
+        _klines_times.append(time.monotonic())
 
 
 class BingXClient:
@@ -28,7 +53,8 @@ class BingXClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                headers={"X-BX-APIKEY": self.api_key}
+                headers={"X-BX-APIKEY": self.api_key},
+                connector=aiohttp.TCPConnector(limit=50),
             )
         return self._session
 
@@ -36,79 +62,116 @@ class BingXClient:
         qs = urlencode(sorted(params.items()))
         return hmac.new(self.secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
-    async def _get(self, path: str, params: dict = None) -> dict:
+    async def _get(self, path: str, params: dict = None,
+                   retries: int = 4, is_klines: bool = False) -> dict:
+        """
+        GET con reintentos y backoff.
+        Código 100410 = endpoint en "disabled period" → espera larga y reintenta.
+        """
         params = params or {}
-        params["timestamp"] = int(time.time() * 1000)
-        params["signature"] = self._sign(params)
-        sess = await self._get_session()
-        async with sess.get(BASE_URL + path, params=params) as r:
-            data = await r.json()
-            if data.get("code", 0) != 0:
-                raise RuntimeError(f"BingX GET error {path}: {data}")
-            return data
+        if is_klines:
+            await _klines_throttle()
 
-    async def _post(self, path: str, params: dict = None) -> dict:
+        for attempt in range(retries):
+            params["timestamp"] = int(time.time() * 1000)
+            params["signature"] = self._sign(params)
+            sess = await self._get_session()
+            try:
+                async with sess.get(BASE_URL + path, params=params,
+                                    timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    data = await r.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"BingX network error {path}: {e}")
+
+            code = data.get("code", 0)
+            if code == 0:
+                return data
+
+            # 100410 = rate limit "disabled period" — esperar más tiempo
+            if code == 100410:
+                # El timestamp en msg indica cuándo se desbloquea, pero usamos
+                # backoff progresivo: 15s, 30s, 60s, 120s
+                wait_s = [15, 30, 60, 120][min(attempt, 3)]
+                logger.warning(
+                    f"[100410] Rate limit en {path} — esperando {wait_s}s "
+                    f"(intento {attempt+1}/{retries})"
+                )
+                await asyncio.sleep(wait_s)
+                continue
+
+            # 100001 = timestamp out of sync — reintento rápido
+            if code == 100001:
+                await asyncio.sleep(1)
+                continue
+
+            raise RuntimeError(f"BingX GET error {path}: {data}")
+
+        raise RuntimeError(f"BingX: demasiados reintentos en {path}")
+
+    async def _post(self, path: str, params: dict = None,
+                    retries: int = 3) -> dict:
         params = params or {}
-        params["timestamp"] = int(time.time() * 1000)
-        params["signature"] = self._sign(params)
-        sess = await self._get_session()
-        async with sess.post(BASE_URL + path, params=params) as r:
-            data = await r.json()
-            if data.get("code", 0) != 0:
-                raise RuntimeError(f"BingX POST error {path}: {data}")
-            return data
+        for attempt in range(retries):
+            params["timestamp"] = int(time.time() * 1000)
+            params["signature"] = self._sign(params)
+            sess = await self._get_session()
+            try:
+                async with sess.post(BASE_URL + path, params=params,
+                                     timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    data = await r.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"BingX POST network error {path}: {e}")
+
+            code = data.get("code", 0)
+            if code == 0:
+                return data
+            if code == 100410:
+                wait_s = [15, 30, 60][min(attempt, 2)]
+                logger.warning(f"[100410] Rate limit POST {path} — esperando {wait_s}s")
+                await asyncio.sleep(wait_s)
+                continue
+            raise RuntimeError(f"BingX POST error {path}: {data}")
+
+        raise RuntimeError(f"BingX POST: demasiados reintentos en {path}")
 
     # ── Market data ──────────────────────────────────────────
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        """
-        BingX puede devolver klines como:
-          - lista de listas: [[open_time, open, high, low, close, volume], ...]
-          - lista de dicts:  [{"open": ..., "close": ..., ...}, ...]
-        Este método maneja ambos formatos.
-        """
         data = await self._get(
             "/openApi/swap/v2/quote/klines",
-            {"symbol": symbol, "interval": interval, "limit": limit}
+            {"symbol": symbol, "interval": interval, "limit": limit},
+            is_klines=True,
         )
         rows = data.get("data", [])
-
         if not rows:
             raise RuntimeError(f"No klines data for {symbol}")
 
-        # Detectar formato
         first = rows[0]
-
         if isinstance(first, dict):
-            # Formato dict — los keys pueden variar entre versiones de la API
-            # Intentar mapeo estándar
             df = pd.DataFrame(rows)
             df.columns = [c.lower() for c in df.columns]
-
-            # Renombrar columnas comunes de BingX
             rename_map = {
                 'opentime': 'open_time', 'o': 'open', 'h': 'high',
                 'l': 'low', 'c': 'close', 'v': 'volume',
                 'time': 'open_time', 't': 'open_time',
             }
             df = df.rename(columns=rename_map)
-
-            # Asegurar columnas necesarias
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 if col not in df.columns:
-                    raise RuntimeError(f"Columna '{col}' no encontrada en klines. Cols: {list(df.columns)}")
-
+                    raise RuntimeError(f"Columna '{col}' no encontrada. Cols: {list(df.columns)}")
         elif isinstance(first, (list, tuple)):
-            # Formato lista [open_time, open, high, low, close, volume]
             df = pd.DataFrame(rows, columns=['open_time', 'open', 'high', 'low', 'close', 'volume'])
-
         else:
             raise RuntimeError(f"Formato klines desconocido: {type(first)}")
 
-        # Convertir a float
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
 
-        # Índice temporal
         if 'open_time' in df.columns:
             df['open_time'] = pd.to_numeric(df['open_time'], errors='coerce')
             df.set_index('open_time', inplace=True)
@@ -116,7 +179,7 @@ class BingXClient:
             df.index = range(len(df))
 
         df = df[['open', 'high', 'low', 'close', 'volume']].copy()
-        df = df[df['close'] > 0].reset_index(drop=True)  # eliminar filas vacías
+        df = df[df['close'] > 0].reset_index(drop=True)
         return df
 
     async def get_ticker(self, symbol: str) -> dict:
@@ -124,15 +187,14 @@ class BingXClient:
         return data["data"]
 
     async def get_all_symbols(self) -> list:
-        """Retorna lista de todos los símbolos de futuros perpetuos disponibles"""
         data = await self._get("/openApi/swap/v2/quote/contracts")
         contracts = data.get("data", [])
-        symbols = []
-        for c in contracts:
-            sym = c.get("symbol") or c.get("contractId", "")
-            if sym and "USDT" in sym:
-                symbols.append(sym)
-        return symbols
+        return [
+            c.get("symbol") or c.get("contractId", "")
+            for c in contracts
+            if (c.get("symbol") or c.get("contractId", "")) and
+               "USDT" in (c.get("symbol") or c.get("contractId", ""))
+        ]
 
     async def get_balance(self) -> float:
         data = await self._get("/openApi/swap/v2/user/balance")

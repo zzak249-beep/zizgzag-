@@ -1,11 +1,16 @@
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 """
-QF Machine × JP Fusion — Signal Engine v3.1
-FIXES: 
-  - Todos los bool/scalar correctos (no más Series ambiguas)
-  - Modo HUNT: opera con Score>threshold Y Decay>threshold (sin exigir 6 capas)
-  - Klines fix: acepta dict o list desde BingX
+QF Machine × JP Fusion — Signal Engine v3.2
+MEJORAS v3.2:
+  - CVD es ahora FILTRO OBLIGATORIO en todas las tiers (antes solo puntuaba)
+  - Reglas CVD exactas del sistema:
+      LONG OK  → (cvd_rising OR cvd_bull_div) AND NOT cvd_bear_div
+      SHORT OK → (NOT cvd_rising OR cvd_bear_div) AND NOT cvd_bull_div
+  - Bear divergence = NEVER ENTER LONG (el smart money sale mientras precio sube)
+  - HUNT mode también exige CVD alineado
+  - Score threshold para STD subido a >0.15 (igual que antes)
+  - Decaimiento threshold en config (por defecto 0.50)
 """
 import numpy as np
 import pandas as pd
@@ -195,30 +200,46 @@ class QFSignalEngine:
 
     # ── L8 Swings ────────────────────────────────────────────
     def _l8_swings(self, df):
-        c  = self.c
+        c = self.c
         pl = self._pivotlow(df['low'],   c['pll'], c['plr'])
         ph = self._pivothigh(df['high'], c['phl'], c['phr'])
-        rpl = pl.dropna().tail(c['hlw'])
-        rph = ph.dropna().tail(c['hlw'])
-        hl_count = int(sum(float(rpl.iloc[i])>float(rpl.iloc[i-1]) for i in range(1,len(rpl))))
-        lh_count = int(sum(float(rph.iloc[i])<float(rph.iloc[i-1]) for i in range(1,len(rph))))
-        last_sl  = float(rpl.iloc[-1]) if len(rpl)>0 else np.nan
-        last_sh  = float(rph.iloc[-1]) if len(rph)>0 else np.nan
+
+        pl_vals = pl.dropna()
+        ph_vals = ph.dropna()
+        n = min(c['hlw'], len(df))
+
+        hl_count = lh_count = 0
+        last_sl = last_sh = np.nan
+
+        if len(pl_vals) >= 2:
+            recent = pl_vals.iloc[-c['hlc']-2:]
+            hl_count = int((recent.diff().dropna() > 0).sum())
+            last_sl = float(pl_vals.iloc[-1])
+
+        if len(ph_vals) >= 2:
+            recent = ph_vals.iloc[-c['hhc']-2:]
+            lh_count = int((recent.diff().dropna() < 0).sum())
+            last_sh = float(ph_vals.iloc[-1])
+
+        sell_exhausted = bool(hl_count >= c['hlc'])
+        buy_exhausted  = bool(lh_count >= c['hhc'])
+
         return {
-            'sell_exhausted': bool(hl_count>=c['hlc']),
-            'buy_exhausted':  bool(lh_count>=c['hhc']),
-            'last_sl': last_sl, 'last_sh': last_sh,
-            'hl_count': hl_count, 'lh_count': lh_count,
+            'sell_exhausted': sell_exhausted,
+            'buy_exhausted':  buy_exhausted,
+            'hl_count': hl_count,
+            'lh_count': lh_count,
+            'last_sl':  last_sl,
+            'last_sh':  last_sh,
         }
 
     # ── L9 FVG ───────────────────────────────────────────────
     def _l9_fvg(self, df, atr):
         c = self.c
-        bull = (df['low'] > df['high'].shift(2)) & \
-               ((df['low']-df['high'].shift(2)) > atr*c['fvg_min'])
-        bear = (df['high'] < df['low'].shift(2)) & \
-               ((df['low'].shift(2)-df['high']) > atr*c['fvg_min'])
-        n = min(c['fvg_bars'], len(df))
+        lo = df['low']; hi = df['high']
+        bull = (lo.shift(-1) > hi.shift(1)) & ((lo.shift(-1)-hi.shift(1)) > atr*c['fvg_min'])
+        bear = (hi.shift(-1) < lo.shift(1)) & ((lo.shift(1)-hi.shift(-1)) > atr*c['fvg_min'])
+        n    = min(c['fvg_bars'], len(df))
         in_bull = in_bear = False
         rb = bull.iloc[-n:]
         if rb.any():
@@ -265,20 +286,53 @@ class QFSignalEngine:
 
     # ── L11 CVD ──────────────────────────────────────────────
     def _l11_cvd(self, df):
+        """
+        CVD Delta mejorado:
+        - cvd_rising:   CVD > su EMA (presión compradora neta)
+        - cvd_bull_div: precio baja pero CVD sube → ACUMULACIÓN OCULTA (señal fuerte LONG)
+        - cvd_bear_div: precio sube pero CVD baja → DISTRIBUCIÓN (señal NUNCA entrar LONG)
+        - cvd_strength: fuerza normalizada del CVD (0-1)
+        """
         c = self.c
-        hl   = df['high']-df['low']
+        hl   = df['high'] - df['low']
         bvol = ((df['close']-df['low'])/hl.replace(0,np.nan)).fillna(0.5)*df['volume']
         svol = ((df['high']-df['close'])/hl.replace(0,np.nan)).fillna(0.5)*df['volume']
-        cvd  = (bvol-svol).cumsum()
+        cvd  = (bvol - svol).cumsum()
         cema = self._ema(cvd, c['cvd_len'])
-        cv   = float(cvd.iloc[-1]); ce = float(cema.iloc[-1])
-        cp   = float(df['close'].iloc[-1])
-        cpp  = float(df['close'].iloc[-c['cvd_div']])
-        cvp  = float(cvd.iloc[-c['cvd_div']])
+
+        cv  = float(cvd.iloc[-1])
+        ce  = float(cema.iloc[-1])
+        cp  = float(df['close'].iloc[-1])
+
+        # Ventana de divergencia
+        div_window = c['cvd_div']
+        cpp = float(df['close'].iloc[-div_window])
+        cvp = float(cvd.iloc[-div_window])
+
+        # Divergencia más robusta: ventana más larga (2× cvd_div) para confirmar
+        div_window2 = min(div_window * 2, len(df) - 1)
+        cpp2 = float(df['close'].iloc[-div_window2])
+        cvp2 = float(cvd.iloc[-div_window2])
+
+        cvd_rising   = bool(cv > ce)
+        cvd_bull_div = bool(cp < cpp and cv > cvp)   # precio baja, CVD sube
+        cvd_bear_div = bool(cp > cpp and cv < cvp)   # precio sube, CVD baja
+
+        # Divergencia confirmada en ventana más larga (señal más fiable)
+        cvd_bull_div_strong = bool(cvd_bull_div and cp < cpp2 and cv > cvp2)
+        cvd_bear_div_strong = bool(cvd_bear_div and cp > cpp2 and cv < cvp2)
+
+        # Fuerza CVD normalizada
+        cvd_std = float(cvd.rolling(c['cvd_len']).std().iloc[-1]) or 1.0
+        cvd_strength = float(np.clip((cv - ce) / cvd_std, -3, 3))
+
         return {
-            'cvd_rising':   bool(cv > ce),
-            'cvd_bull_div': bool(cp < cpp and cv > cvp),
-            'cvd_bear_div': bool(cp > cpp and cv < cvp),
+            'cvd_rising':          cvd_rising,
+            'cvd_bull_div':        cvd_bull_div,
+            'cvd_bear_div':        cvd_bear_div,
+            'cvd_bull_div_strong': cvd_bull_div_strong,
+            'cvd_bear_div_strong': cvd_bear_div_strong,
+            'cvd_strength':        round(cvd_strength, 2),
         }
 
     # ── L12 Squeeze ──────────────────────────────────────────
@@ -315,7 +369,7 @@ class QFSignalEngine:
     # ── MAIN COMPUTE ─────────────────────────────────────────
     def compute(self, df: pd.DataFrame, df_htf: pd.DataFrame) -> SignalResult:
         if len(df) < 100:
-            return SignalResult("FLAT","NONE",0,0.0,np.nan,float(df['close'].iloc[-1]),{})
+            return SignalResult("FLAT","NONE",0,0.0,float('nan'),float(df['close'].iloc[-1]),{})
 
         c = self.c
 
@@ -342,8 +396,24 @@ class QFSignalEngine:
         tl_l     = bool(l7['tl_break_long']); tl_s = bool(l7['tl_break_short'])
         sell_ex  = bool(l8['sell_exhausted']); buy_ex = bool(l8['buy_exhausted'])
         hb       = bool(htf['htf_bull']); hs = bool(htf['htf_bear'])
-        cvd_up   = bool(l11['cvd_rising'])
-        cvd_bd   = bool(l11['cvd_bull_div']); cvd_sd = bool(l11['cvd_bear_div'])
+
+        # CVD ─ GATE OBLIGATORIO ──────────────────────────────
+        cvd_up       = bool(l11['cvd_rising'])
+        cvd_bd       = bool(l11['cvd_bull_div'])
+        cvd_sd       = bool(l11['cvd_bear_div'])
+        cvd_bd_str   = bool(l11['cvd_bull_div_strong'])
+        cvd_sd_str   = bool(l11['cvd_bear_div_strong'])
+        cvd_strength = float(l11['cvd_strength'])
+
+        # ── Reglas CVD (del sistema de trading) ──────────────
+        # LONG: CVD debe ser alcista O mostrar acumulación oculta
+        #       NUNCA entrar LONG si hay divergencia bajista
+        cvd_long_ok  = (cvd_up or cvd_bd) and not cvd_sd
+
+        # SHORT: CVD debe ser bajista O mostrar distribución oculta
+        #        NUNCA entrar SHORT si hay divergencia alcista (acumulación)
+        cvd_short_ok = (not cvd_up or cvd_sd) and not cvd_bd
+
         sq_b     = bool(l12['sq_bull']); sq_s = bool(l12['sq_bear'])
         bfvg     = bool(l9['in_bull_fvg']); sfvg = bool(l9['in_bear_fvg'])
         bob      = bool(l10['in_bull_ob']); sob = bool(l10['in_bear_ob'])
@@ -353,35 +423,56 @@ class QFSignalEngine:
         sl_l  = float(l8['last_sl']) if not np.isnan(l8['last_sl']) else entry - atr_v*2
         sl_s_ = float(l8['last_sh']) if not np.isnan(l8['last_sh']) else entry + atr_v*2
 
-        # ── Señales completas (requieren muchas capas) ────────
-        long_std  = ns>0.15 and alive and exec_ok and hb and ab and sell_ex
+        # ── Señales completas (CVD ahora obligatorio en todas) ─
+        long_std  = ns>0.15 and alive and exec_ok and hb and ab and sell_ex and cvd_long_ok
         long_fuel = long_std and (tl_l or sq_b or ((bfvg or bob) and cvd_up))
-        long_sup  = long_fuel and (dp_buy or cvd_bd)
+        long_sup  = long_fuel and (dp_buy or cvd_bd_str)  # div fuerte = SUPREMA
 
-        short_std  = ns<-0.15 and alive and exec_ok and hs and as_ and buy_ex
+        short_std  = ns<-0.15 and alive and exec_ok and hs and as_ and buy_ex and cvd_short_ok
         short_fuel = short_std and (tl_s or sq_s or ((sfvg or sob) and not cvd_up))
-        short_sup  = short_fuel and (dp_sell or cvd_sd)
+        short_sup  = short_fuel and (dp_sell or cvd_sd_str)
 
-        # ── Conviction ────────────────────────────────────────
-        lc = int(sum([ns>0.15,alive,exec_ok,hb,ab,sell_ex,tl_l,dp_buy,cvd_up,(sq_b or bfvg or bob)]))
-        sc = int(sum([ns<-0.15,alive,exec_ok,hs,as_,buy_ex,tl_s,dp_sell,not cvd_up,(sq_s or sfvg or sob)]))
+        # ── Conviction (incluye CVD como capa) ───────────────
+        lc = int(sum([
+            ns > 0.15, alive, exec_ok, hb, ab, sell_ex,
+            tl_l, dp_buy,
+            cvd_up or cvd_bd,   # CVD alcista O acumulación
+            sq_b or bfvg or bob,
+        ]))
+        sc = int(sum([
+            ns < -0.15, alive, exec_ok, hs, as_, buy_ex,
+            tl_s, dp_sell,
+            not cvd_up or cvd_sd,  # CVD bajista O distribución
+            sq_s or sfvg or sob,
+        ]))
 
         det = {
-            'norm_score': round(ns*100,1), 'decay_pct': round(decay_val*100,1),
-            'f_mom': round(float(l2['f_mom'].iloc[-1])*100,1),
-            'f_rev': round(float(l2['f_rev'].iloc[-1])*100,1),
-            'f_vol': round(float(l2['f_vol'].iloc[-1])*100,1),
-            'htf_bull': hb, 'htf_bear': hs, 'sig_alive': alive,
-            'exec_ok': exec_ok, 'asym_bull': ab, 'asym_bear': as_,
-            'tl_long': tl_l, 'tl_short': tl_s,
+            'norm_score':  round(ns*100, 1),
+            'decay_pct':   round(decay_val*100, 1),
+            'f_mom':       round(float(l2['f_mom'].iloc[-1])*100, 1),
+            'f_rev':       round(float(l2['f_rev'].iloc[-1])*100, 1),
+            'f_vol':       round(float(l2['f_vol'].iloc[-1])*100, 1),
+            'htf_bull':    hb, 'htf_bear': hs,
+            'sig_alive':   alive,
+            'exec_ok':     exec_ok,
+            'asym_bull':   ab, 'asym_bear': as_,
+            'tl_long':     tl_l, 'tl_short': tl_s,
             'sell_exhausted': sell_ex, 'buy_exhausted': buy_ex,
-            'hl_count': l8['hl_count'],
+            'hl_count':    l8['hl_count'],
             'in_bull_fvg': bfvg, 'in_bear_fvg': sfvg,
-            'in_bull_ob': bob, 'in_bear_ob': sob,
-            'cvd_rising': cvd_up, 'cvd_bull_div': cvd_bd, 'cvd_bear_div': cvd_sd,
-            'sq_bull': sq_b, 'sq_bear': sq_s, 'sq_on': bool(l12['sq_on']),
-            'dp_buy': dp_buy, 'dp_sell': dp_sell,
-            'atr': round(atr_v, 6),
+            'in_bull_ob':  bob,  'in_bear_ob':  sob,
+            # CVD detallado
+            'cvd_rising':          cvd_up,
+            'cvd_bull_div':        cvd_bd,
+            'cvd_bear_div':        cvd_sd,
+            'cvd_bull_div_strong': cvd_bd_str,
+            'cvd_bear_div_strong': cvd_sd_str,
+            'cvd_strength':        cvd_strength,
+            'cvd_long_ok':         cvd_long_ok,
+            'cvd_short_ok':        cvd_short_ok,
+            'sq_bull':  sq_b, 'sq_bear': sq_s, 'sq_on': bool(l12['sq_on']),
+            'dp_buy':   dp_buy, 'dp_sell': dp_sell,
+            'atr':      round(atr_v, 6),
         }
 
         # ── Señales completas primero ─────────────────────────
@@ -392,15 +483,16 @@ class QFSignalEngine:
         if short_fuel: return SignalResult("SHORT", "FUEL",    sc, ns, sl_s_, entry, det)
         if short_std:  return SignalResult("SHORT", "STD",     sc, ns, sl_s_, entry, det)
 
-        # ── HUNT MODE: Score + Decay suficientes ──────────────
-        # Opera cuando Score y Decay superan umbrales aunque no se cumplan todas las capas
-        hunt_score_thr = float(c.get('hunt_score_thr', 0.08))   # ~8/100
-        hunt_decay_thr = float(c.get('hunt_decay_thr', 0.35))   # 35%
+        # ── HUNT MODE: Score + Decay + CVD OBLIGATORIO ────────
+        # Captura setups cuando Score y Decay son altos Y el CVD confirma dirección.
+        # Sin CVD alineado, el HUNT no dispara (evita entrar contra el smart money).
+        hunt_score_thr = float(c.get('hunt_score_thr', 0.08))
+        hunt_decay_thr = float(c.get('hunt_decay_thr', 0.35))
 
-        if decay_val >= hunt_decay_thr:
-            if ns > hunt_score_thr:
+        if alive and decay_val >= hunt_decay_thr:
+            if ns > hunt_score_thr and cvd_long_ok:
                 return SignalResult("LONG",  "HUNT_LONG",  lc, ns, sl_l,  entry, det)
-            if ns < -hunt_score_thr:
+            if ns < -hunt_score_thr and cvd_short_ok:
                 return SignalResult("SHORT", "HUNT_SHORT", sc, ns, sl_s_, entry, det)
 
-        return SignalResult("FLAT","NONE", max(lc,sc), ns, np.nan, entry, {})
+        return SignalResult("FLAT","NONE", max(lc,sc), ns, float('nan'), entry, {**det})
