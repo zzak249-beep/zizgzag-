@@ -1,142 +1,168 @@
-# QF×JP Crypto Bot
+# QF Machine × JP Fusion Bot v3 🤖
 
-Bot de trading automático para BingX con señales desde TradingView y notificaciones en Telegram.
+Bot de trading algorítmico para criptomonedas. Porta la lógica del indicador Pine Script (12 capas) a Python para operar en BingX con señales en Telegram.
 
-## Arquitectura
+> ⚠️ **PAPER MODE activo por defecto.** El bot NO opera con dinero real hasta que cambies `PAPER_MODE=false` explícitamente.
+
+---
+
+## 🏗 Arquitectura
 
 ```
-TradingView (Pine Script)
-    │ Alerta webhook JSON
-    ▼
-Railway (FastAPI bot)
-    ├── BingX API → ejecuta órdenes reales
-    └── Telegram → notificaciones en tiempo real
+src/
+├── main.py          ← Orquestador principal (loop de trading)
+├── signals.py       ← Motor de señales (12 capas, port del Pine Script)
+├── exchange.py      ← Conector BingX REST API
+├── risk.py          ← Gestión de riesgo y circuit breakers
+├── positions.py     ← Tracker de posiciones abiertas
+├── telegram_bot.py  ← Bot de Telegram (señales + comandos)
+├── config.py        ← Todos los parámetros configurables
+└── backtest.py      ← Backtester sobre datos históricos CSV
 ```
 
 ---
 
-## Paso 1 — Clonar y configurar
+## ⚡ Setup rápido (Railway)
+
+### 1. Fork / sube a GitHub
 
 ```bash
-git clone https://github.com/TU_USUARIO/qfjp-bot.git
-cd qfjp-bot
-cp .env.example .env
-# Edita .env con tus claves reales
+git init
+git add .
+git commit -m "QF Bot v3 initial"
+git remote add origin https://github.com/TU_USUARIO/qf-bot.git
+git push -u origin main
+```
+
+### 2. Crea proyecto en Railway
+
+1. railway.app → New Project → Deploy from GitHub
+2. Selecciona tu repo
+3. Railway detecta el `Dockerfile` automáticamente
+
+### 3. Variables de entorno en Railway
+
+En tu proyecto → **Variables** → añade:
+
+| Variable | Valor |
+|---|---|
+| `BINGX_API_KEY` | Tu API key de BingX |
+| `BINGX_SECRET` | Tu secret de BingX |
+| `TELEGRAM_TOKEN` | Token de @BotFather |
+| `TELEGRAM_CHAT_ID` | Tu Chat ID (ver abajo) |
+| `PAPER_MODE` | `true` (¡no cambies hasta validar!) |
+| `MIN_CONVICTION` | `6` |
+| `LOOP_SECONDS` | `30` |
+| `TRAIL_ATR` | `1.5` |
+
+### 4. Obtener API Keys de BingX
+
+1. BingX → Cuenta → Gestión de API
+2. Crear API → habilitar **Futuros Perpetuos**
+3. Habilitar: Lectura ✅ | Trading ✅ | Retiro ❌ (NUNCA)
+4. IP whitelist: añade la IP de tu servidor Railway (opcional pero recomendado)
+
+### 5. Obtener Telegram Token y Chat ID
+
+```bash
+# 1. Habla con @BotFather → /newbot → sigue instrucciones → guarda el token
+
+# 2. Obtén tu Chat ID:
+curl "https://api.telegram.org/bot<TOKEN>/getUpdates"
+# Manda un mensaje a tu bot y busca "chat":{"id": XXXX}
 ```
 
 ---
 
-## Paso 2 — Obtener claves BingX
+## 🧪 Backtest antes de operar
 
-1. Ve a [BingX → API Management](https://bingx.com/en-us/account/api/)
-2. Crea una API Key con permisos: **Read + Trade** (NO withdraw)
-3. Añade la IP de Railway en la whitelist (o deja vacío para cualquier IP)
-4. Copia `API Key` y `Secret Key` en el `.env`
+```bash
+# Instalar dependencias
+pip install -r requirements.txt
 
----
+# Descargar datos históricos de BingX (CSV)
+# o exportar desde TradingView: Símbolo → Exportar datos CSV
 
-## Paso 3 — Crear bot de Telegram
+# Ejecutar backtest
+python src/backtest.py \
+  --file3m  datos/BTCUSDT_3m.csv \
+  --conviction 6 \
+  --out logs/bt_result.json
 
-1. Habla con [@BotFather](https://t.me/BotFather) en Telegram
-2. Escribe `/newbot` y sigue las instrucciones
-3. Copia el token en `TELEGRAM_TOKEN`
-4. Envía un mensaje a tu bot, luego visita:
-   ```
-   https://api.telegram.org/bot<TU_TOKEN>/getUpdates
-   ```
-5. Copia el `chat.id` en `TELEGRAM_CHAT_ID`
+# Resultado:
+# ══════════════════════════════════════════
+#   total_trades     : 87
+#   win_rate_pct     : 58.6
+#   total_pnl        : +234.50
+#   max_drawdown_pct : 8.2
+#   profit_factor    : 1.74
+# ══════════════════════════════════════════
+```
 
----
+**Criterios mínimos para pasar a paper trading:**
+- Win rate > 50%
+- Profit factor > 1.3
+- Max drawdown < 15%
 
-## Paso 4 — Deploy en Railway
-
-1. Ve a [railway.app](https://railway.app) → New Project → Deploy from GitHub
-2. Selecciona tu repo
-3. En **Variables**, añade todas las del `.env.example` con sus valores reales:
-   - `BINGX_API_KEY`
-   - `BINGX_API_SECRET`
-   - `TELEGRAM_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-   - `WEBHOOK_SECRET`
-   - `TRADE_SIZE_USDT`
-   - `MAX_OPEN_TRADES`
-   - `SL_PCT`
-   - `TP_PCT`
-   - `MIN_SIGNAL_LEVEL`
-4. Railway desplegará automáticamente y te dará una URL tipo:
-   ```
-   https://qfjp-bot-production.up.railway.app
-   ```
-5. Verifica que funciona:
-   ```
-   https://TU_URL/health
-   ```
+**Criterios mínimos para pasar a live:**
+- Paper trading rentable durante ≥ 3 semanas
+- Al menos 30 operaciones en paper
+- Win rate estable > 52%
 
 ---
 
-## Paso 5 — Configurar alertas en TradingView
+## 📱 Comandos Telegram
 
-1. Abre el gráfico con el script **QF×JP Crypto V3** cargado
-2. Crea una alerta para cada señal que quieras operar
-3. En **Webhook URL** pon:
-   ```
-   https://TU_URL_RAILWAY/webhook
-   ```
-4. En **Message** pon exactamente el JSON de la alerta. El script ya lo genera automáticamente en el `alertcondition`. Ejemplo para LONG_SUP_V3:
-   ```json
-   {"signal":"LONG_SUP_V3","symbol":"{{ticker}}","price":"{{close}}","tf":"3"}
-   ```
-5. En el header de la alerta añade:
-   - Header: `X-Webhook-Secret` = el valor de tu `WEBHOOK_SECRET`
-
-   > En TradingView Pro/Pro+ puedes añadir headers personalizados en las alertas webhook.
+| Comando | Función |
+|---|---|
+| `/start` | Panel principal con botones |
+| `/status` | Equity, PnL, drawdown, circuit breaker |
+| `/pause` | Detiene nuevas entradas (posiciones abiertas siguen) |
+| `/resume` | Reanuda el bot |
+| `/reset` | Desbloquea circuit breaker manualmente |
+| `/mode` | Muestra modo paper vs live |
+| `/help` | Lista de comandos |
 
 ---
 
-## Paso 6 — Probar en paper trading primero
+## 🛡 Gestión de Riesgo (config.py)
 
-Antes de operar con dinero real:
-1. Pon `TRADE_SIZE_USDT=1` en Railway
-2. Usa la cuenta demo de BingX (cambia el endpoint en `bot.py` a `open-api.bingx.com/demo`)
-3. Observa durante al menos 1 semana
-
----
-
-## Niveles de señal y riesgo
-
-| Señal | Nivel | Descripción | Operar? |
-|---|---|---|---|
-| HUNT_LONG/SHORT | ⚡ 1 | Caza de stops detectada | Solo con experiencia |
-| LONG/SHORT_FUEL | ▲▼ 2 | Ruptura TL + agotamiento | Mínimo recomendado |
-| LONG/SHORT_SUP | ★ 3 | + Dark Pool confirmado | Buena convicción |
-| LONG/SHORT_SUP_V3 | ★★ 4 | + CVD + Zona liq. segura | Máxima convicción |
-
-Configura `MIN_SIGNAL_LEVEL=LONG_FUEL` para operar solo niveles 2+.
-
----
-
-## Endpoints del bot
-
-| Endpoint | Método | Descripción |
+| Parámetro | Default | Descripción |
 |---|---|---|
-| `/webhook` | POST | Recibe señales de TradingView |
-| `/health` | GET | Estado del bot y trades abiertos |
-| `/trades` | GET | Detalle de posiciones abiertas |
+| `leverage` | 5x | Apalancamiento (empieza con 3-5x) |
+| `risk_pct_suprema` | 1.5% | Riesgo por op. señal SUPREMA |
+| `risk_pct_fuel` | 1.0% | Riesgo por op. señal FUEL |
+| `risk_pct_std` | 0.5% | Riesgo por op. señal STD |
+| `max_daily_loss_pct` | 3% | Circuit breaker diario |
+| `max_drawdown_pct` | 15% | Circuit breaker permanente |
+| `max_consecutive_losses` | 4 | Pause tras N pérdidas seguidas |
+| `max_daily_trades` | 10 | Máximo trades por día |
 
 ---
 
-## Gestión de riesgo incorporada
+## 📊 Señales — Niveles de calidad
 
-- **SL automático** en cada orden (BingX lo gestiona en servidor)
-- **TP automático** en cada orden
-- **Límite de posiciones simultáneas** (`MAX_OPEN_TRADES`)
-- **Límite de capital por trade** (`TRADE_SIZE_USDT` o 20% del balance disponible, el menor)
-- **Timeout de 3 horas**: cierra automáticamente si la posición lleva demasiado tiempo abierta
-- **Filtro de señales por nivel mínimo** (`MIN_SIGNAL_LEVEL`)
-- **Sin duplicados**: no abre dos posiciones en el mismo símbolo en la misma dirección
+| Tier | Condición | Emoji Telegram |
+|---|---|---|
+| **SUPREMA** | FUEL + Dark Pool ó CVD div. | ⭐⭐⭐ |
+| **FUEL** | STD + TL break ó Squeeze ó FVG/OB + CVD | 🔥 |
+| **STD** | 6 capas base alineadas | ▶️ |
+
+Con `MIN_CONVICTION=6` sólo se ejecutan señales con ≥6/10 filtros activos.
 
 ---
 
-## Advertencia
+## 🔧 Ajustes recomendados por capital
 
-Este bot opera con dinero real. El trading de criptomonedas conlleva riesgo de pérdida total del capital. Úsalo bajo tu propia responsabilidad, siempre con capital que puedas permitirte perder, y después de testear en demo.
+| Capital | Leverage | Risk/op | Símbolos |
+|---|---|---|---|
+| < $500 | 3x | 0.5% / 0.8% / 1.2% | 1 (BTC) |
+| $500-2K | 5x | 0.5% / 1.0% / 1.5% | 1-2 |
+| $2K-10K | 5-10x | 0.3% / 0.8% / 1.2% | 2-3 |
+| > $10K | Consult. prof. | < 0.5% | 2-4 |
+
+---
+
+## ⚠️ Disclaimer
+
+Este software es una herramienta de automatización. El trading de futuros de criptomonedas conlleva riesgo de pérdida total del capital. Valida siempre en paper trading antes de usar dinero real. El autor no es responsable de pérdidas.
