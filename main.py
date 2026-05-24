@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 """
 QF Machine × JP Fusion Bot v3.1 — Orquestador Principal
 Loop de trading + Scanner completo de mercado

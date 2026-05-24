@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 """
 QF Machine × JP Fusion — Signal Engine v3.1
 FIXES: 
@@ -291,7 +293,7 @@ class QFSignalEngine:
         kc_hi  = ke + c['sq_kcm']*ka
         kc_lo  = ke - c['sq_kcm']*ka
         sq_on  = (bb_hi < kc_hi) & (bb_lo > kc_lo)
-        sq_fire= ~sq_on & sq_on.shift(1).fillna(False)
+        sq_fire= ~sq_on & sq_on.shift(1).fillna(False).astype(bool)
         high_r = df['high'].rolling(n).max()
         low_r  = df['low'].rolling(n).min()
         mid    = ((high_r+low_r)/2 + basis)/2
