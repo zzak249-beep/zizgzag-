@@ -100,6 +100,16 @@ class QFBot:
             f"{'⚠️ DINERO REAL — cuida el riesgo' if not BOT_STATE['paper'] else '✅ Paper trading activo'}"
         )
 
+        # Sincronizar equity real con BingX al arrancar
+        try:
+            if not BOT_STATE["paper"]:
+                real_eq = await self.exchange.get_balance()
+                if real_eq > 0:
+                    self.risk.update_equity(real_eq)
+                    logger.info(f"Equity sincronizado: {real_eq:.2f} USDT")
+        except Exception as e:
+            logger.warning(f"No se pudo sincronizar equity: {e}")
+
         try:
             while True:
                 await self._tick()
