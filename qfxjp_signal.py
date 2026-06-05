@@ -13,7 +13,7 @@ import logging
 import math
 from dataclasses import dataclass
 from typing import Optional
-from .indicators import IndicatorResult, f_tanh
+from indicators import IndicatorResult, f_tanh
 
 logger = logging.getLogger(__name__)
 

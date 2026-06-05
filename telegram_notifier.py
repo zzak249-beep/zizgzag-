@@ -35,7 +35,7 @@ class TelegramNotifier:
     # ─── MENSAJES ESPECÍFICOS ─────────────────────────────────────────────────
 
     def signal_entry(self, signal, market_ctx=None) -> str:
-        from strategy.qfxjp_signal import SignalResult
+        from qfxjp_signal import SignalResult
         s: SignalResult = signal
         r = s.ind
 

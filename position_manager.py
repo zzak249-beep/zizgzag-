@@ -81,7 +81,7 @@ class PositionManager:
         Abre una posición con SL + TP0.5 (partial) + TP1.
         Returns True si se ejecutó.
         """
-        from strategy.qfxjp_signal import SignalResult
+        from qfxjp_signal import SignalResult
         s: SignalResult = signal
         cfg = self.cfg
 
