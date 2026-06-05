@@ -1,363 +1,279 @@
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
 """
-QF Machine × JP Fusion Bot v3.1 — Orquestador Principal
-Loop de trading + Scanner completo de mercado
+main.py — QF×JP v3.4 Bot — Orquestador Principal
+==================================================
+- Health check server (Railway requiere puerto abierto)
+- APScheduler cada 3 minutos
+- Ciclo completo: fetch candles → indicadores → score → trade
 """
-import asyncio
-import logging
-import os
-import time
-from datetime import datetime
-from pathlib import Path
+import logging, asyncio, os, sys, time
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-import pandas as pd
-
-from exchange     import BingXClient
-from signals      import QFSignalEngine
-from risk         import RiskManager
-from positions    import Position, PositionTracker
-from telegram_bot import TelegramNotifier
-from scanner      import QFScanner
-from config       import SIGNAL_CFG, RISK_CFG, SYMBOLS, HTF
+# ── CONFIG PRIMERO ─────────────────────────────────────────────────────────────
+import config as cfg
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    handlers=[
-        logging.FileHandler("logs/bot.log"),
-        logging.StreamHandler(),
-    ]
+    level=getattr(logging, cfg.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("QFBot")
+logger = logging.getLogger("main")
 
-BOT_STATE = {
-    "paused": False,
-    "paper":  os.getenv("PAPER_MODE", "true").lower() != "false",
-}
+# ── IMPORTS ───────────────────────────────────────────────────────────────────
+from bingx.client         import BingXClient, parse_klines
+from strategy.indicators  import QFJPIndicators
+from strategy.qfxjp_signal import QFJPScorer
+from trader.position_manager import PositionManager
+from trader.risk_manager   import RiskManager
+from notifications.telegram_notifier import TelegramNotifier
 
-# ── Config Scanner ────────────────────────────────────────────
-SCAN_CFG = {
-    "min_volume_usdt":    float(os.getenv("MIN_VOLUME", "200000")),
-    "scan_concurrency":   int(os.getenv("SCAN_CONCURRENCY", "20")),
-    "scan_cooldown_min":  float(os.getenv("SCAN_COOLDOWN_MIN", "15")),
-    "scan_min_conviction":int(os.getenv("SCAN_MIN_CONV", "1")),
-    # Intervalo entre scans completos (segundos)
-    "scan_interval_s":    int(os.getenv("SCAN_INTERVAL_S", "180")),
-    # Máx señales a notificar por scan
-    "scan_max_notify":    int(os.getenv("SCAN_MAX_NOTIFY", "3")),
-    # Resumen cada N scans
-    "summary_every":      int(os.getenv("SUMMARY_EVERY", "10")),
-}
+try:
+    from market_mechanics import MarketContextEngine
+    MECHANICS_OK = True
+except ImportError:
+    MECHANICS_OK = False
+    logger.warning("market_mechanics no disponible — continuando sin él")
 
 
-class QFBot:
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HEALTH CHECK SERVER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"QF x JP v3.4 BOT OK"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass  # silenciar logs HTTP
+
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", cfg.PORT), HealthHandler)
+    logger.info(f"Health check server en puerto {cfg.PORT}")
+    Thread(target=server.serve_forever, daemon=True).start()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BOT CORE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class QFJPBot:
     def __init__(self):
-        paper = BOT_STATE["paper"]
+        logger.info("Inicializando QF×JP v3.4 Bot...")
 
-        self.exchange = BingXClient(
-            api_key=os.environ["BINGX_API_KEY"],
-            secret=os.environ["BINGX_SECRET"],
-            paper=paper,
-        )
-        self.engine    = QFSignalEngine(SIGNAL_CFG)
-        self.risk      = RiskManager(RISK_CFG)
-        self.positions = PositionTracker()
-        self.tg        = TelegramNotifier(
-            token=os.environ["TELEGRAM_TOKEN"],
-            chat_id=os.environ["TELEGRAM_CHAT_ID"],
-            risk_manager=self.risk,
-            bot_state=BOT_STATE,
-        )
-        self.scanner = QFScanner(
-            exchange=self.exchange,
-            signal_engine=self.engine,
-            risk_manager=self.risk,
-            notifier=self.tg,
-            cfg=SCAN_CFG,
-        )
-        self._scan_count   = 0
-        self._last_scan_t  = 0.0
+        self.client  = BingXClient(cfg.BINGX_API_KEY, cfg.BINGX_SECRET_KEY, cfg.BINGX_BASE_URL)
+        self.tg      = TelegramNotifier(cfg.TELEGRAM_TOKEN, cfg.TELEGRAM_CHAT_ID)
+        self.risk_mgr = RiskManager(cfg, self.client)
+        self.pos_mgr  = PositionManager(self.client, cfg)
 
-    # ─────────────────────────────────────────────────────────
-    #  ARRANQUE
-    # ─────────────────────────────────────────────────────────
-    async def run(self):
-        await self.tg.start_polling()
+        # Un conjunto de indicadores + scorer por símbolo (estado persistente)
+        self.indicators: dict[str, QFJPIndicators] = {s: QFJPIndicators(cfg) for s in cfg.SYMBOLS}
+        self.scorers:    dict[str, QFJPScorer]     = {s: QFJPScorer(cfg)     for s in cfg.SYMBOLS}
 
-        mode = "📋 PAPER MODE" if BOT_STATE["paper"] else "💵 LIVE MODE"
-        min_vol = SCAN_CFG['min_volume_usdt']
-        await self.tg._send(
-            f"🤖 *QF Machine × JP Fusion Bot v3.1*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Modo: *{mode}*\n"
-            f"🔭 Scanner: todos los pares BingX (vol≥{min_vol/1000:.0f}K USDT)\n"
-            f"⚡ Concurrencia: `{SCAN_CFG['scan_concurrency']}`\n"
-            f"🔄 Ciclo scan: `{SCAN_CFG['scan_interval_s']}s`\n"
-            f"🎯 HUNT mode: Score≥`{SIGNAL_CFG.get('hunt_score_thr',0.08)*100:.0f}` "
-            f"Decay≥`{SIGNAL_CFG.get('hunt_decay_thr',0.35)*100:.0f}%`\n\n"
-            f"{'⚠️ DINERO REAL — cuida el riesgo' if not BOT_STATE['paper'] else '✅ Paper trading activo'}"
-        )
-
-        # Sincronizar equity real con BingX al arrancar
-        try:
-            if not BOT_STATE["paper"]:
-                real_eq = await self.exchange.get_balance()
-                if real_eq > 0:
-                    self.risk.update_equity(real_eq)
-                    logger.info(f"Equity sincronizado: {real_eq:.2f} USDT")
-        except Exception as e:
-            logger.warning(f"No se pudo sincronizar equity: {e}")
-
-        try:
-            while True:
-                await self._tick()
-                await asyncio.sleep(int(os.getenv("LOOP_SECONDS", "30")))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.exception(f"Error crítico: {e}")
-            await self.tg.send_alert(f"❌ Error crítico: {e}")
-        finally:
-            await self.tg.stop_polling()
-            await self.exchange.close()
-
-    # ─────────────────────────────────────────────────────────
-    #  TICK PRINCIPAL
-    # ─────────────────────────────────────────────────────────
-    async def _tick(self):
-        if BOT_STATE.get("paused"):
-            return
-
-        now = time.time()
-
-        # ── 1. Scanner de mercado ─────────────────────────────
-        if now - self._last_scan_t >= SCAN_CFG['scan_interval_s']:
-            await self._run_scanner()
-            self._last_scan_t = now
-
-        # ── 2. Gestionar posiciones abiertas ─────────────────
-        for symbol in list(self.positions.positions.keys()):
-            try:
-                await self._manage_open(symbol)
-            except Exception as e:
-                logger.error(f"Error gestionando {symbol}: {e}")
-
-        # ── 3. Abrir señales en SYMBOLS fijos (opcional) ─────
-        for symbol in SYMBOLS:
-            if not self.positions.has(symbol):
-                try:
-                    await self._process_symbol(symbol)
-                except Exception as e:
-                    logger.error(f"Error en {symbol}: {e}")
-
-    # ─────────────────────────────────────────────────────────
-    #  SCANNER — ciclo completo
-    # ─────────────────────────────────────────────────────────
-    async def _run_scanner(self):
-        self._scan_count += 1
-        can, reason = self.risk.check_circuit()
-
-        try:
-            hits = await self.scanner.run_scan()
-        except Exception as e:
-            logger.error(f"Error en scanner: {e}")
-            return
-
-        n_scanned = len(self.scanner._sent) + len(hits) + 1  # aprox
-
-        # Notificar top señales
-        if can and not BOT_STATE.get("paused"):
-            await self.scanner.notify_top_signals(
-                hits, max_notify=SCAN_CFG['scan_max_notify']
+        self.mechanics_engine = None
+        if MECHANICS_OK:
+            self.mechanics_engine = MarketContextEngine(
+                api_key    = cfg.BINGX_API_KEY,
+                secret_key = cfg.BINGX_SECRET_KEY,
+                enable_session      = True,
+                enable_funding      = True,
+                enable_oi           = True,
+                enable_liquidations = True,
             )
-            # Intentar operar las mejores señales del scanner
-            await self._execute_scanner_hits(hits)
 
-        # Resumen periódico
-        if self._scan_count % SCAN_CFG['summary_every'] == 1:
-            try:
-                symbols_scanned = await self.exchange.get_all_symbols()
-                n = len(symbols_scanned)
-            except Exception:
-                n = len(hits) * 10
-            await self.scanner.send_summary(hits, n, BOT_STATE["paper"])
+        self._cycle_count = 0
+        logger.info(f"Símbolos: {cfg.SYMBOLS}")
 
-    # ─────────────────────────────────────────────────────────
-    #  EJECUTAR HITS DEL SCANNER
-    # ─────────────────────────────────────────────────────────
-    async def _execute_scanner_hits(self, hits: list):
-        """
-        De las mejores señales del scanner, intenta abrir posición
-        en las que no tienen posición abierta ya.
-        Máximo MAX_OPEN_POSITIONS simultáneas.
-        """
-        max_pos = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
-        current = len(self.positions.positions)
+    # ─── FETCH CANDLES ────────────────────────────────────────────────────────
 
-        if current >= max_pos:
-            return
+    def _fetch_df(self, symbol: str, tf: str, limit: int = 300):
+        raw = self.client.get_klines_raw(symbol, tf, limit)
+        return parse_klines(raw)
 
-        min_tier_to_trade = os.getenv("MIN_TIER_TO_TRADE", "HUNT_LONG")
-        tier_rank = {
-            "SUPREMA": 5, "FUEL": 4, "STD": 3,
-            "HUNT_LONG": 2, "HUNT_SHORT": 2
+    def _fetch_all_tfs(self, symbol: str) -> dict:
+        """Fetches 3m, 15m, 1h, 1w, 1m candles."""
+        return {
+            "3m":  self._fetch_df(symbol, cfg.CANDLE_TF,  cfg.CANDLE_LIMIT),
+            "15m": self._fetch_df(symbol, cfg.HTF_15M_TF, 50),
+            "1h":  self._fetch_df(symbol, cfg.HTF_1H_TF,  50),
+            "1w":  self._fetch_df(symbol, cfg.HTF_W_TF,   20),
+            "1m":  self._fetch_df(symbol, cfg.HTF_1M_TF,  5),
         }
-        min_rank = tier_rank.get(min_tier_to_trade, 2)
 
-        for r in hits:
-            if current >= max_pos:
-                break
-            if self.positions.has(r.symbol):
-                continue
-            if tier_rank.get(r.tier, 0) < min_rank:
-                continue
+    # ─── CICLO PRINCIPAL ──────────────────────────────────────────────────────
 
-            can, reason = self.risk.check_circuit()
-            if not can:
-                break
+    def run_cycle(self):
+        self._cycle_count += 1
+        logger.info(f"═══ Ciclo #{self._cycle_count} ═══")
 
-            try:
-                await self._open_position_from_scan(r)
-                current += 1
-            except Exception as e:
-                logger.error(f"Error abriendo {r.symbol}: {e}")
-
-    async def _open_position_from_scan(self, r):
-        qty = self.risk.calc_position_size(
-            entry=r.entry, sl=r.sl,
-            tier=r.tier if r.tier not in ("HUNT_LONG","HUNT_SHORT") else "STD",
-            conviction=r.conviction,
-        )
-        if not qty or qty <= 0:
-            return
-
-        await self.exchange.set_leverage(r.symbol, RISK_CFG['leverage'])
-
-        side     = "BUY" if r.direction == "LONG" else "SELL"
-        pos_side = r.direction
-
-        order = await self.exchange.place_order(r.symbol, side, pos_side, qty)
-        await self.exchange.set_sl_tp(r.symbol, pos_side, r.sl, r.tp, qty)
-
-        pos = Position(
-            symbol=r.symbol, direction=r.direction, tier=r.tier,
-            entry=r.entry, sl=r.sl, tp=r.tp, qty=qty,
-            open_time=datetime.utcnow().isoformat(),
-            order_id=str(order.get("orderId","?")),
-            paper=BOT_STATE["paper"], trailing_sl=r.sl,
-        )
-        self.positions.open(pos)
-
-        # Notificar apertura
-        mode = "📋 PAPER" if BOT_STATE["paper"] else "💵 REAL"
-        rr   = abs(r.tp-r.entry)/abs(r.entry-r.sl) if abs(r.entry-r.sl)>0 else 0
-        await self.tg._send(
-            f"{'🎯' if 'HUNT' in r.tier else '🚀'} *APERTURA {r.tier}* — {mode}\n"
-            f"{'🟢' if r.direction=='LONG' else '🔴'} *{r.direction}* `{r.symbol}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Entrada: `{r.entry:.6f}`\n"
-            f"🛑 SL:      `{r.sl:.6f}`\n"
-            f"🎯 TP:      `{r.tp:.6f}`\n"
-            f"⚖️  R:R:     `{rr:.1f}x`\n"
-            f"📦 Qty:     `{qty:.6f}`\n"
-            f"🧠 Conv: {r.conviction}/10 | Score: {r.score*100:+.0f}"
-        )
-        logger.info(f"✅ {r.direction} {r.symbol} {r.tier} entry={r.entry:.6f} sl={r.sl:.6f} tp={r.tp:.6f}")
-
-    # ─────────────────────────────────────────────────────────
-    #  PROCESS SYMBOL (SYMBOLS fijos)
-    # ─────────────────────────────────────────────────────────
-    async def _process_symbol(self, symbol: str):
-        df_3m  = await self.exchange.get_klines(symbol, "3m",  limit=250)
-        df_htf = await self.exchange.get_klines(symbol, HTF,   limit=100)
-        if len(df_3m) < 100:
-            return
-
-        sig = self.engine.compute(df_3m, df_htf)
-        if sig.direction == "FLAT" or sig.tier == "NONE":
-            return
-
-        min_conv  = int(os.getenv("MIN_CONVICTION", "6"))
-        hunt_min  = int(os.getenv("HUNT_MIN_CONVICTION", "1"))
-        is_hunt   = sig.tier in ("HUNT_LONG","HUNT_SHORT")
-        threshold = hunt_min if is_hunt else min_conv
-        if sig.conviction < threshold:
-            return
-
-        qty = self.risk.calc_position_size(
-            entry=sig.entry_price, sl=sig.sl_price,
-            tier=sig.tier if not is_hunt else "STD",
-            conviction=sig.conviction,
-        )
-        if not qty or qty <= 0:
-            return
-
-        tp   = self.risk.calc_tp(sig.entry_price, sig.sl_price, sig.direction, sig.tier)
-        side = "BUY" if sig.direction == "LONG" else "SELL"
-
-        await self.exchange.set_leverage(symbol, RISK_CFG['leverage'])
-        order = await self.exchange.place_order(symbol, side, sig.direction, qty)
-        await self.exchange.set_sl_tp(symbol, sig.direction, sig.sl_price, tp, qty)
-
-        pos = Position(
-            symbol=symbol, direction=sig.direction, tier=sig.tier,
-            entry=sig.entry_price, sl=sig.sl_price, tp=tp, qty=qty,
-            open_time=datetime.utcnow().isoformat(),
-            order_id=str(order.get("orderId","?")),
-            paper=BOT_STATE["paper"], trailing_sl=sig.sl_price,
-        )
-        self.positions.open(pos)
-        await self.tg.send_signal(sig, symbol, qty, tp, BOT_STATE["paper"])
-
-    # ─────────────────────────────────────────────────────────
-    #  GESTIÓN POSICIÓN ABIERTA
-    # ─────────────────────────────────────────────────────────
-    async def _manage_open(self, symbol: str):
-        pos = self.positions.get(symbol)
-        if not pos:
-            return
-
-        try:
-            df = await self.exchange.get_klines(symbol, "3m", limit=50)
-        except Exception:
-            return
-
-        price = float(df['close'].iloc[-1])
-        atr   = float((df['high']-df['low']).rolling(10).mean().iloc[-1])
-
-        # Trailing stop
-        new_sl = self.positions.calc_trailing_sl(
-            pos, price, atr,
-            trail_atr_mult=float(os.getenv("TRAIL_ATR","1.5"))
-        )
-        if new_sl != pos.trailing_sl:
-            self.positions.update_trailing_sl(symbol, new_sl)
-
-        exit_reason = self.positions.check_exit(symbol, price)
-        if not exit_reason:
-            return
-
-        pnl = self.positions.calc_pnl(symbol, price)
-        if not BOT_STATE["paper"]:
-            await self.exchange.close_position(symbol, pos.direction, pos.qty)
-
-        self.risk.record_trade(pnl)
-
-        reason_txt = {"stop_loss": "Stop Loss 🛑", "take_profit": "Take Profit ✨"}.get(exit_reason, exit_reason)
-        await self.tg.send_trade_close(
-            symbol=symbol, direction=pos.direction, pnl=pnl,
-            entry=pos.entry, exit_price=price, reason=reason_txt,
-            paper=BOT_STATE["paper"],
-        )
-        self.positions.close(symbol)
-
-        can, reason = self.risk.check_circuit()
+        # 1. Verificar riesgo global
+        can, reason = self.risk_mgr.can_trade()
         if not can:
-            await self.tg.send_circuit_breaker(reason)
+            logger.warning(f"[Risk] No se puede operar: {reason}")
+            if self._cycle_count % 20 == 0:
+                self.tg.risk_alert(reason)
+            return
+
+        # 2. Balance
+        balance = self.risk_mgr.refresh()
+        if balance is None:
+            logger.error("No se pudo obtener balance — saltando ciclo")
+            return
+
+        # 3. Verificar posiciones abiertas
+        prices = {}
+        for s in cfg.SYMBOLS:
+            p = self.client.get_last_price(s)
+            if p: prices[s] = p
+        closed = self.pos_mgr.check_positions(prices)
+        for sym in closed:
+            self.tg.position_closed(sym, "?", 0.0, "cerrado externamente")
+
+        # 4. Scan de símbolos
+        scan_results = []
+        new_signals  = []
+
+        for symbol in cfg.SYMBOLS:
+            try:
+                result = self._analyze_symbol(symbol, balance)
+                scan_results.append(result)
+                if result.get("signal"):
+                    new_signals.append(result)
+            except Exception as e:
+                logger.error(f"[Bot] Error analizando {symbol}: {e}", exc_info=True)
+
+        # 5. Enviar resumen de scan cada 5 ciclos
+        if self._cycle_count % 5 == 0:
+            self.tg.scan_summary(scan_results)
+
+        # 6. Ejecutar señales
+        for result in new_signals:
+            signal = result["signal"]
+            if self.pos_mgr.open_count >= cfg.MAX_OPEN_TRADES:
+                logger.info(f"MAX_OPEN_TRADES alcanzado — saltando {signal.symbol}")
+                break
+            if self.pos_mgr.has_position(signal.symbol):
+                continue
+            ok = self.pos_mgr.open_position(signal, balance)
+            if ok:
+                self.tg.signal_entry(signal, result.get("ctx"))
+                logger.info(f"✅ Posición abierta: {signal.symbol} {signal.direction} [{signal.level}] score={signal.score}")
+
+        # 7. Reporte diario a las 00:05 UTC
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        if now.hour == 0 and now.minute < cfg.CYCLE_MINUTES:
+            stats = self.risk_mgr.get_stats()
+            self.tg.daily_report(stats, self.pos_mgr.get_positions_summary())
+
+    # ─── ANÁLISIS POR SÍMBOLO ─────────────────────────────────────────────────
+
+    def _analyze_symbol(self, symbol: str, balance: float) -> dict:
+        tfs = self._fetch_all_tfs(symbol)
+        df  = tfs["3m"]
+
+        if df is None or len(df) < 50:
+            return {"symbol": symbol, "sc_l": 0, "sc_s": 0, "ses": "?", "regime": "?"}
+
+        # Indicadores
+        ind = self.indicators[symbol].compute(
+            df, tfs["15m"], tfs["1h"], tfs["1w"], tfs["1m"]
+        )
+
+        # Score
+        signal = self.scorers[symbol].score(symbol, ind, balance)
+
+        # Market Mechanics (contexto de mercado)
+        ctx = None
+        if self.mechanics_engine:
+            try:
+                price = ind.price
+                ctx   = self.mechanics_engine.analyze(
+                    symbol, price, df,
+                    high = float(df["high"].iloc[-1]),
+                    low  = float(df["low"].iloc[-1]),
+                )
+                # Aplicar modificadores
+                if signal.is_valid:
+                    if not ctx.entry_allowed(signal.direction):
+                        logger.info(f"[Ctx] {symbol}: veto de market context — {ctx.veto_reason}")
+                        signal.direction = "NONE"
+                        signal.level     = "NONE"
+                    else:
+                        bonus = ctx.score_modifier + ctx.get_judas_bonus(signal.direction)
+                        signal.score = max(0, min(100, signal.score + bonus))
+                        logger.debug(f"[Ctx] {symbol}: bonus={bonus:+d} → score={signal.score}")
+            except Exception as e:
+                logger.warning(f"[Ctx] {symbol}: error en market context: {e}")
+
+        result = {
+            "symbol":  symbol,
+            "sc_l":    signal.score_long,
+            "sc_s":    signal.score_short,
+            "ses":     ind.ses_label,
+            "regime":  ind.regime,
+            "level":   signal.level if signal.is_valid else None,
+            "signal":  signal if signal.is_valid else None,
+            "ctx":     ctx,
+        }
+
+        logger.info(
+            f"[Scan] {symbol:12} "
+            f"L:{signal.score_long:3d} S:{signal.score_short:3d} "
+            f"| {ind.ses_label:4} | {ind.regime:8} "
+            f"| {signal.level if signal.is_valid else '----'}"
+        )
+
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SCHEDULER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    logger.info("╔══════════════════════════════════════╗")
+    logger.info("║   QF×JP v3.4 Bot  — Railway Ready    ║")
+    logger.info("╚══════════════════════════════════════╝")
+
+    # Health check server (Railway lo necesita)
+    start_health_server()
+
+    # Instanciar bot
+    bot = QFJPBot()
+
+    # Notificar inicio
+    bot.tg.bot_started(cfg.SYMBOLS, cfg)
+
+    # Primer ciclo inmediato
+    try:
+        bot.run_cycle()
+    except Exception as e:
+        logger.error(f"Error en primer ciclo: {e}", exc_info=True)
+
+    # Loop principal
+    interval = cfg.CYCLE_MINUTES * 60
+    logger.info(f"Ciclos cada {cfg.CYCLE_MINUTES} minutos")
+
+    while True:
+        try:
+            time.sleep(interval)
+            bot.run_cycle()
+        except KeyboardInterrupt:
+            logger.info("Bot detenido por el usuario")
+            bot.pos_mgr.close_all("shutdown")
+            bot.tg.send("🔴 *Bot DETENIDO* — Todas las posiciones cerradas")
+            break
+        except Exception as e:
+            logger.error(f"Error en ciclo: {e}", exc_info=True)
+            bot.tg.send(f"⚠️ Error en ciclo: `{str(e)[:200]}`")
+            time.sleep(30)
 
 
 if __name__ == "__main__":
-    bot = QFBot()
-    asyncio.run(bot.run())
+    main()
