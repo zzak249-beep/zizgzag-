@@ -171,7 +171,7 @@ class BacktestEngine:
             else:
                 trade.pnl_pct = (trade.entry - trade.exit_price) / trade.entry * 100
 
-        trade.exit_bar  = i if trade.result else start_bar
+        trade.exit_bar  = locals().get("i", start_bar)
         trade.bars_held = trade.exit_bar - start_bar
         return trade
 
@@ -278,9 +278,9 @@ class BacktestEngine:
         result.sup_levels    = sum(1 for t in trades if t.level == "SUP")
 
         # Profit Factor
-        gross_wins  = sum(wins)   if wins   else 0
-        gross_loss  = abs(sum(losses)) if losses else 0.001
-        result.profit_factor = gross_wins / gross_loss
+        gross_wins  = sum(wins)   if wins   else 0.0
+        gross_loss  = abs(sum(losses)) if losses else 0.0
+        result.profit_factor = gross_wins / max(gross_loss, 0.001)
 
         # Max Drawdown
         equity = np.cumsum([0] + pnls)
@@ -290,7 +290,8 @@ class BacktestEngine:
 
         # Sharpe (simplificado, sin tasa libre de riesgo)
         if len(pnls) > 1:
-            result.sharpe = float(np.mean(pnls) / np.std(pnls) * np.sqrt(252)) if np.std(pnls) > 0 else 0
+            std_pnl = float(np.std(pnls))
+            result.sharpe = float(np.mean(pnls) / std_pnl * np.sqrt(252 * 480)) if std_pnl > 0 else 0.0
 
         result.trades = trades
         return result
