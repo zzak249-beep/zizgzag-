@@ -1,10 +1,11 @@
 """
 QF×JP Crypto Bot — BingX Full Scanner + Telegram
-v4 — escanea TODOS los pares BingX con concurrencia máxima
-     + ranking por score + filtros de calidad mejorados
-     + gestión de riesgo avanzada
+v4.3 — escanea TODOS los pares BingX con concurrencia máxima
+       + ranking por score + filtros de calidad mejorados
+       + gestión de riesgo avanzada
+       + FIX: _sign() usa urllib.parse.urlencode (sin sorted) — BingX requiere orden original
 """
-import asyncio, logging, math, os, time, hmac, hashlib
+import asyncio, logging, math, os, time, hmac, hashlib, urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -89,17 +90,27 @@ last_scan_results: dict[str,dict] = {}   # último resultado de cada par
 scan_stats = {"cycles":0,"signals_total":0,"trades_opened":0,"errors":0}
 
 # ══════════════════════════════════════════════════
-#  BINGX
+#  BINGX — FIX: _sign sin sorted (BingX requiere orden original)
 # ══════════════════════════════════════════════════
-def _sign(p:dict)->str:
-    q="&".join(f"{k}={v}" for k,v in sorted(p.items()))
-    return hmac.new(BINGX_API_SECRET.encode(),q.encode(),hashlib.sha256).hexdigest()
+def _sign(params: dict) -> str:
+    """
+    HMAC-SHA256 sobre los parámetros en el orden en que se pasan.
+    BingX NO acepta params ordenados alfabéticamente — usar urlencode sin sorted.
+    """
+    query_string = urllib.parse.urlencode(params)
+    return hmac.new(
+        BINGX_API_SECRET.encode(),
+        query_string.encode(),
+        hashlib.sha256
+    ).hexdigest()
 
 def _h()->dict:
     return {"X-BX-APIKEY":BINGX_API_KEY,"Content-Type":"application/json"}
 
 async def bx_get(path:str,params:dict,session:aiohttp.ClientSession)->dict:
-    p=dict(params); p["timestamp"]=int(time.time()*1000); p["signature"]=_sign(p)
+    p=dict(params)
+    p["timestamp"]=int(time.time()*1000)
+    p["signature"]=_sign(p)
     async with session.get(BINGX_BASE+path,params=p,headers=_h(),
                            timeout=aiohttp.ClientTimeout(total=12)) as r:
         d=await r.json()
@@ -107,7 +118,9 @@ async def bx_get(path:str,params:dict,session:aiohttp.ClientSession)->dict:
     return d
 
 async def bx_post(path:str,body:dict)->dict:
-    b=dict(body); b["timestamp"]=int(time.time()*1000); b["signature"]=_sign(b)
+    b=dict(body)
+    b["timestamp"]=int(time.time()*1000)
+    b["signature"]=_sign(b)
     async with aiohttp.ClientSession() as s:
         async with s.post(BINGX_BASE+path,json=b,headers=_h(),
                           timeout=aiohttp.ClientTimeout(total=12)) as r:
@@ -181,8 +194,22 @@ async def get_price(sym:str)->float:
 async def get_balance()->float:
     async with aiohttp.ClientSession() as s:
         d=await bx_get("/openApi/swap/v2/user/balance",{},s)
-    for item in d["data"]["balance"]:
-        if item["asset"]=="USDT": return float(item["availableMargin"])
+    # Manejar múltiples estructuras de respuesta de BingX
+    raw=d.get("data",{})
+    # Estructura 1: {"data":{"balance":[{"asset":"USDT","availableMargin":"..."}]}}
+    if isinstance(raw,dict) and "balance" in raw:
+        for item in raw["balance"]:
+            if item.get("asset")=="USDT":
+                return float(item.get("availableMargin",0))
+    # Estructura 2: {"data":[{"asset":"USDT",...}]}
+    if isinstance(raw,list):
+        for item in raw:
+            if item.get("asset")=="USDT":
+                return float(item.get("availableMargin",0))
+    # Estructura 3: {"data":{"USDT":{"availableMargin":"..."}}}
+    if isinstance(raw,dict) and "USDT" in raw:
+        return float(raw["USDT"].get("availableMargin",0))
+    log.warning(f"get_balance: estructura desconocida: {str(raw)[:200]}")
     return 0.0
 
 async def get_open_pos(sym:str)->Optional[dict]:
@@ -579,7 +606,6 @@ async def scan_batch(symbols:list[str], sem:asyncio.Semaphore) -> list[tuple]:
     async def _scan_one(sym:str)->Optional[tuple]:
         async with sem:
             try:
-                # Sesión por request para evitar límites de conexión
                 async with aiohttp.ClientSession(
                     connector=aiohttp.TCPConnector(limit=1)
                 ) as session:
@@ -595,7 +621,6 @@ async def scan_batch(symbols:list[str], sem:asyncio.Semaphore) -> list[tuple]:
                     log.info(f"🎯 {sig} {sym} score={score:.3f} decay={decay:.0f}%")
                     return (sym,sig,dbg)
 
-                # Debug en log para pares con score relevante
                 if DEBUG_SIGNALS:
                     ns=dbg.get("norm_score",0)
                     if abs(ns)>0.12 and dbg.get("sig_alive",False):
@@ -626,12 +651,10 @@ async def scanner_loop()->None:
     global SYMBOLS
     await asyncio.sleep(5)
 
-    # Descubrir pares
     SYMBOLS=SYMBOLS_OVERRIDE if SYMBOLS_OVERRIDE else await get_all_symbols()
 
-    # Mensaje de inicio
     await tg(
-        f"🤖 <b>QF×JP Bot v4 — Scanner completo</b>\n"
+        f"🤖 <b>QF×JP Bot v4.3 — Scanner completo</b>\n"
         f"📊 <b>{len(SYMBOLS)} pares</b> | Vol≥<code>{MIN_VOLUME_USDT/1e3:.0f}K</code>\n"
         f"⚡ Concurrencia: <code>{CONCURRENCY}</code> | Ciclo: <code>{SCAN_INTERVAL}s</code>\n"
         f"🎯 Min señal: <code>{MIN_SIGNAL_LEVEL}</code> (rank≥{MIN_RANK})\n"
@@ -646,7 +669,6 @@ async def scanner_loop()->None:
     cycle=0; last_refresh=time.time()
 
     while True:
-        # Refrescar lista cada 4 horas
         if not SYMBOLS_OVERRIDE and (time.time()-last_refresh)>14400:
             new=await get_all_symbols()
             if new:
@@ -661,17 +683,14 @@ async def scanner_loop()->None:
         cycle+=1; scan_stats["cycles"]=cycle
         t0=time.time()
 
-        # Escanear todos los pares
         results=await scan_batch(SYMBOLS,sem)
         scan_stats["signals_total"]+=len(results)
 
-        # Ordenar por calidad: primero rank alto, luego score abs
         results.sort(key=lambda x:(
             -SIGNAL_RANK.get(x[1],0),
             -abs(x[2].get("norm_score",0))
         ))
 
-        # Ejecutar los mejores (respeta MAX_OPEN_TRADES)
         executed=0
         for sym,sig,dbg in results:
             if len(open_trades)>=MAX_OPEN_TRADES: break
@@ -680,18 +699,15 @@ async def scanner_loop()->None:
 
         elapsed=time.time()-t0
 
-        # Log resumen del ciclo
         log.info(f"━ Ciclo #{cycle} | {len(SYMBOLS)} pares | "
                  f"{len(results)} señales | {executed} trades | {elapsed:.1f}s ━")
 
-        # Resumen en Telegram si hay señales
         if results:
             top=[(s,sig,dbg.get("norm_score",0),dbg.get("decay_pct",0))
                  for s,sig,dbg in results]
             msg=fmt_cycle_summary(cycle,len(SYMBOLS),len(results),elapsed,top)
             if msg: await tg(msg)
         elif cycle%20==0:
-            # Cada 20 ciclos (~1h) envía top-5 mejores aunque no sean señales
             top5=sorted(
                 [(s,d["dbg"].get("norm_score",0),d["dbg"].get("decay_pct",0))
                  for s,d in last_scan_results.items()
@@ -750,7 +766,7 @@ async def lifespan(app):
     asyncio.create_task(monitor())
     yield
 
-app=FastAPI(title="QF×JP Bot v4",lifespan=lifespan)
+app=FastAPI(title="QF×JP Bot v4.3",lifespan=lifespan)
 
 @app.post("/webhook")
 async def webhook(request:Request):
@@ -769,7 +785,7 @@ async def webhook(request:Request):
 @app.get("/health")
 async def health():
     return {
-        "status":"running","v":"4",
+        "status":"running","v":"4.3",
         "symbols":len(SYMBOLS),"top10":SYMBOLS[:10],
         "open_trades":len(open_trades),
         "trades":list(open_trades.keys()),
@@ -785,6 +801,11 @@ async def health():
             "min_decay_trade":MIN_DECAY_TO_TRADE,
         }
     }
+
+@app.get("/json")
+async def health_json():
+    """Alias de /health para compatibilidad."""
+    return await health()
 
 @app.get("/trades")
 async def trades_view(): return {"open_trades":open_trades}
