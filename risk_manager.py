@@ -51,12 +51,14 @@ class RiskManager:
 
         qty = (risk_usdt * C.LEVERAGE) / risk_per_unit
 
-        # Notional cap: máx 500 USDT notional por trade
+        # Notional cap dinámico: STD=500, FUEL=750, SUP=1000 USDT
         notional = qty * entry
-        if notional > 500.0:
-            log.info("[sizing] %s notional clampeado %.2f+%.2f USDT (qty %s, entry=%s SL=%s)",
-                     tier, notional, 500.0, qty, entry, sl)
-            qty = 500.0 / entry
+        cap_map  = {"STD": 500.0, "FUEL": 750.0, "SUP": 1000.0}
+        cap      = cap_map.get(tier, 500.0)
+        if notional > cap:
+            log.info("[sizing] %s notional clampeado %.2f→%.2f USDT (qty %s, entry=%s SL=%s)",
+                     tier, notional, cap, qty, entry, sl)
+            qty = cap / entry
 
         log.info("[sizing] %s score=%.1f ks=%.2f risk=%.2f USDT qty=%s notional=%.2f USDT (entry=%s SL=%s)",
                  tier, score, kelly_f, risk_usdt, round(qty, 6), qty * entry, entry, sl)
