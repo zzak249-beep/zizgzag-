@@ -44,10 +44,10 @@ MIN_TIER   = os.getenv("MIN_TIER", "STD").upper()  # STD | FUEL | SUP
 
 # ── Entrada ───────────────────────────────────────────────────────────────────
 REQUIRE_TL_BREAK = _bool("REQUIRE_TL_BREAK", True)
-HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED", 2)
+HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED", 1)   # era 2 → más señales
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
-SCAN_INTERVAL   = _int("SCAN_INTERVAL", 180)
+SCAN_INTERVAL   = _int("SCAN_INTERVAL", 60)   # era 180s → 3x más rápido
 TOP_N_SYMBOLS   = _int("TOP_N_SYMBOLS", 0)
 BLACKLIST       = set(_list("BLACKLIST", ""))
 MIN_VOLUME_USDT = _float("MIN_VOLUME_USDT", 5_000_000.0)
