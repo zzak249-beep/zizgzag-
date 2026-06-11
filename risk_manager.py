@@ -1,60 +1,107 @@
 """
-Risk Manager — validates signals, computes position sizes.
+QF×JP Bot v6.4 — Risk Manager
+Kelly Criterion, límites diarios, daily drawdown.
 """
+import asyncio
 import logging
+import math
+from datetime import date
 
-log = logging.getLogger("qfjp.risk")
+import config as C
 
-TIER_RANK = {"NONE": -1, "PRE": 0, "STD": 1, "FUEL": 2, "SUP": 3}
+log = logging.getLogger("risk")
 
 
 class RiskManager:
-    def __init__(self, settings):
-        self.settings           = settings
-        self.last_reject_reason = ""
-        self.last_qty           = 0.0
+    def __init__(self):
+        self._today             = date.today()
+        self._daily_trades      = 0
+        self._daily_pnl         = 0.0
+        self._daily_loss_limit  = C.CAPITAL * 0.05
+        self._open_count        = 0
+        self._lock              = asyncio.Lock()
 
-    def can_trade(self, state, signal: dict) -> bool:
-        tier     = signal.get("tier", "NONE")
-        min_tier = self.settings.MIN_TIER
+    def _check_reset(self):
+        today = date.today()
+        if today != self._today:
+            self._today        = today
+            self._daily_trades = 0
+            self._daily_pnl    = 0.0
+            log.info("Daily stats reset for %s", today)
 
-        if tier == "NONE":
-            self.last_reject_reason = "No signal"
-            return False
+    # ── Kelly sizing ──────────────────────────────────────────────────────────
 
-        if TIER_RANK.get(tier, -1) < TIER_RANK.get(min_tier, 1):
-            self.last_reject_reason = f"Tier {tier} below minimum {min_tier}"
-            return False
+    def kelly_position_size(self, balance, entry, sl, score, tier):
+        self._check_reset()
+        if balance <= 0 or entry <= 0:
+            return 0.0
 
-        if tier == "PRE" and not self.settings.TRADE_PRE_SIGNALS:
-            self.last_reject_reason = "PRE signals disabled"
-            return False
+        risk_per_unit = abs(entry - sl)
+        if risk_per_unit < 1e-12:
+            return 0.0
 
-        if state.open_trades >= self.settings.MAX_OPEN_TRADES:
-            self.last_reject_reason = f"Max open trades ({self.settings.MAX_OPEN_TRADES}) reached"
-            return False
+        tier_mult  = {"STD": 1.0, "FUEL": 1.1, "SUP": 1.25}.get(tier, 1.0)
+        score_mult = 0.7 + 0.3 * (score / 100.0)
+        p  = min(C.KELLY_WIN_RATE * tier_mult * score_mult, 0.9)
+        rr = C.KELLY_RR
+        q  = 1.0 - p
 
-        if state.daily_trades >= self.settings.MAX_DAILY_TRADES:
-            self.last_reject_reason = f"Max daily trades ({self.settings.MAX_DAILY_TRADES}) reached"
-            return False
+        kelly_f  = max(0.0, (p * rr - q) / rr) * C.KELLY_FRACTION
+        risk_usdt = min(balance * kelly_f * (C.RISK_PCT / 100.0), balance * 0.03)
 
-        if state.circuit_broken:
-            self.last_reject_reason = "Circuit breaker active"
-            return False
+        qty = (risk_usdt * C.LEVERAGE) / risk_per_unit
 
-        # Avoid duplicate symbol trade
-        sym = signal.get("symbol", "")
-        if sym in state.open_symbols:
-            self.last_reject_reason = f"Already in trade for {sym}"
-            return False
+        # Notional cap: máx 500 USDT notional por trade
+        notional = qty * entry
+        if notional > 500.0:
+            log.info("[sizing] %s notional clampeado %.2f+%.2f USDT (qty %s, entry=%s SL=%s)",
+                     tier, notional, 500.0, qty, entry, sl)
+            qty = 500.0 / entry
 
-        self.last_reject_reason = ""
-        return True
+        log.info("[sizing] %s score=%.1f ks=%.2f risk=%.2f USDT qty=%s notional=%.2f USDT (entry=%s SL=%s)",
+                 tier, score, kelly_f, risk_usdt, round(qty, 6), qty * entry, entry, sl)
 
-    def compute_qty(self, price: float, contract_value: float) -> float:
-        capital  = self.settings.CAPITAL
-        risk_pct = self.settings.RISK_PCT / 100.0
-        leverage = self.settings.LEVERAGE
-        notional = capital * risk_pct * leverage
-        qty = notional / (price * max(contract_value, 0.001))
-        return max(0.01, round(qty, 2))
+        return round(qty, 6)
+
+    # ── Límites diarios ───────────────────────────────────────────────────────
+
+    async def can_trade(self):
+        async with self._lock:
+            self._check_reset()
+            if self._daily_trades >= C.MAX_DAILY_TRADES:
+                return False, f"daily_trades_limit({self._daily_trades}/{C.MAX_DAILY_TRADES})"
+            if self._open_count >= C.MAX_OPEN_TRADES:
+                return False, f"max_open_trades({self._open_count}/{C.MAX_OPEN_TRADES})"
+            if self._daily_pnl <= -self._daily_loss_limit:
+                return False, f"daily_drawdown_limit(pnl={self._daily_pnl:.2f})"
+            return True, "ok"
+
+    async def on_trade_opened(self):
+        async with self._lock:
+            self._daily_trades += 1
+            self._open_count   += 1
+
+    async def on_trade_closed(self, pnl: float):
+        async with self._lock:
+            self._open_count = max(0, self._open_count - 1)
+            self._daily_pnl += pnl
+
+    async def update_open_count(self, n: int):
+        async with self._lock:
+            self._open_count = n
+
+    def tier_ok(self, tier: str) -> bool:
+        hierarchy = {"NONE": -1, "STD": 0, "FUEL": 1, "SUP": 2}
+        return hierarchy.get(tier, -1) >= hierarchy.get(C.MIN_TIER, 0)
+
+    def status(self) -> dict:
+        self._check_reset()
+        return {
+            "date":             str(self._today),
+            "daily_trades":     self._daily_trades,
+            "max_daily_trades": C.MAX_DAILY_TRADES,
+            "open_positions":   self._open_count,
+            "max_open_trades":  C.MAX_OPEN_TRADES,
+            "daily_pnl":        round(self._daily_pnl, 2),
+            "daily_loss_limit": round(self._daily_loss_limit, 2),
+        }

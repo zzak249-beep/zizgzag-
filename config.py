@@ -1,86 +1,88 @@
 """
-QF×JP v3.5 PREDATOR — Multi-Symbol Scanner Config
-All values from environment variables.
+QF×JP Bot v6.4 — Config
+Variables via env vars. Defaults optimizados para estrategia SHORT.
 """
-from pydantic_settings import BaseSettings
-from pydantic import Field
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
+def _bool(k, d): return os.getenv(k, str(d)).strip().lower() in ("true","1","yes")
+def _float(k, d):
+    try: return float(os.getenv(k, str(d)))
+    except: return d
+def _int(k, d):
+    try: return int(os.getenv(k, str(d)))
+    except: return d
+def _list(k, d):
+    r = os.getenv(k, d).strip()
+    return [x.strip() for x in r.split(",") if x.strip()] if r else []
 
-class Settings(BaseSettings):
-    # ── BingX ─────────────────────────────────────────────────────────────
-    BINGX_API_KEY:    str = Field(..., description="BingX API Key")
-    BINGX_SECRET_KEY: str = Field(..., description="BingX Secret Key")
-    BINGX_BASE_URL:   str = "https://open-api.bingx.com"
+# ── BingX ─────────────────────────────────────────────────────────────────────
+BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
+BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
+BINGX_BASE_URL   = "https://open-api.bingx.com"
 
-    # ── Telegram ──────────────────────────────────────────────────────────
-    TELEGRAM_TOKEN:   str = Field(...)
-    TELEGRAM_CHAT_ID: str = Field(...)
+# ── Telegram ──────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # ── Scanner settings ──────────────────────────────────────────────────
-    TIMEFRAME:          str = "3m"    # candle interval: 1m 3m 5m 15m 1h
-    SCAN_INTERVAL:      int = 60      # seconds between full scans
-    MAX_SYMBOLS:        int = 80      # max perpetual pairs to scan (top by volume)
-    CONCURRENT_SCANS:   int = 10      # parallel symbol evaluations
-    MIN_VOLUME_USDT:    float = 500000  # min 24h volume to include symbol
+# ── Modo ──────────────────────────────────────────────────────────────────────
+MODE = os.getenv("MODE", "SIGNAL").upper()   # SIGNAL | LIVE
 
-    # ── Capital & Risk ────────────────────────────────────────────────────
-    CAPITAL:          float = 1000.0
-    RISK_PCT:         float = 1.0     # % capital risk per trade
-    LEVERAGE:         int   = 10
-    TP1_MULT:         float = 1.5     # ATR multiplier TP1
-    TP2_MULT:         float = 3.0     # ATR multiplier TP2
-    SL_MULT:          float = 1.0     # ATR multiplier SL
-    MAX_OPEN_TRADES:  int   = 5       # max simultaneous positions
-    MAX_DAILY_TRADES: int   = 20
+# ── Capital y riesgo ──────────────────────────────────────────────────────────
+CAPITAL          = _float("CAPITAL", 1000.0)
+RISK_PCT         = _float("RISK_PCT", 1.0)
+LEVERAGE         = _int("LEVERAGE", 10)
+MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 5)
+MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES", 20)
 
-    # ── Signal filters ────────────────────────────────────────────────────
-    # Main trigger: trendline breakout (required)
-    REQUIRE_TL_BREAK:   bool = True    # must have TL ruptura
-    # Score thresholds
-    SC_THR_STD:   int = 55
-    SC_THR_FUEL:  int = 68
-    SC_THR_SUP:   int = 80
-    SC_THR_PRE:   int = 48
-    MIN_TIER:     str = "STD"   # STD | FUEL | SUP
-    # HTF alignment minimum (0-4 timeframes)
-    HTF_MIN:      int = 2
+# ── Umbrales de señal — optimizados al perfil SHORT ganador ───────────────────
+MIN_SCORE  = _float("MIN_SCORE",  50.0)   # era 55 → más señales
+FUEL_SCORE = _float("FUEL_SCORE", 62.0)   # era 68 → más FUEL
+SUP_SCORE  = _float("SUP_SCORE",  78.0)   # era 80
+MIN_TIER   = os.getenv("MIN_TIER", "STD").upper()  # STD | FUEL | SUP
 
-    # ── Strategy parameters ───────────────────────────────────────────────
-    ATR_LEN:   int   = 10
-    MOM_LEN:   int   = 20
-    REV_LEN:   int   = 8
-    VOL_LEN:   int   = 14
-    ADX_LEN:   int   = 14
-    ADX_TREND: int   = 25
-    ADX_LAT:   int   = 20
-    CVD_LEN:   int   = 20
-    CVD_ROLL:  int   = 50
-    RSI_LEN:   int   = 14
-    MFI_LEN:   int   = 14
-    MFI_OB:    int   = 80
-    MFI_OS:    int   = 20
-    VDI_LEN:   int   = 3
-    VDI_THR:   float = 1.5
-    SQ_LEN:    int   = 20
-    SQ_BBM:    float = 2.0
-    SQ_KCM:    float = 1.5
-    # Trendline pivot params
-    TL_PIVOT_L: int   = 5    # pivot left bars
-    TL_PIVOT_R: int   = 3    # pivot right bars
-    TL_LOOKBACK:int   = 30   # max bars to search for 2nd pivot
-    TL_BUFFER:  float = 0.15 # ATR buffer for breakout
+# ── Entrada ───────────────────────────────────────────────────────────────────
+REQUIRE_TL_BREAK = _bool("REQUIRE_TL_BREAK", True)
+HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED", 2)
 
-    # ── HTF timeframes ────────────────────────────────────────────────────
-    HTF_15M: str = "15m"
-    HTF_1H:  str = "1h"
-    HTF_4H:  str = "4h"
+# ── Scanner ───────────────────────────────────────────────────────────────────
+SCAN_INTERVAL   = _int("SCAN_INTERVAL", 180)
+TOP_N_SYMBOLS   = _int("TOP_N_SYMBOLS", 0)
+BLACKLIST       = set(_list("BLACKLIST", ""))
+MIN_VOLUME_USDT = _float("MIN_VOLUME_USDT", 5_000_000.0)
 
-    # ── Session filter (UTC) ──────────────────────────────────────────────
-    ONLY_ACTIVE_SESSION: bool = True  # skip signals in OFF session
+# ── Timeframes ────────────────────────────────────────────────────────────────
+TIMEFRAME      = os.getenv("TIMEFRAME",      "3m")
+HTF_TIMEFRAME  = os.getenv("HTF_TIMEFRAME",  "15m")
+HTF2_TIMEFRAME = os.getenv("HTF2_TIMEFRAME", "1h")
+HTF5_TIMEFRAME = os.getenv("HTF5_TIMEFRAME", "4h")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+# ── ATR / SL / TP — ajustados al perfil ganador ───────────────────────────────
+# Los trades ganadores cerraban en 5-15 min → TP1 más cerca, SL más ajustado
+ATR_LEN      = _int("ATR_LEN",      10)
+SL_ATR_MULT  = _float("SL_ATR_MULT",  0.8)   # era 1.0 → SL más ajustado
+TP1_ATR_MULT = _float("TP1_ATR_MULT", 1.2)   # era 1.5 → TP1 más rápido
+TP2_ATR_MULT = _float("TP2_ATR_MULT", 2.5)   # era 3.0 → TP2 realista
 
+# ── ADX ───────────────────────────────────────────────────────────────────────
+ADX_LEN     = _int("ADX_LEN",     14)
+ADX_TREND   = _float("ADX_TREND",   25.0)
+ADX_LATERAL = _float("ADX_LATERAL", 20.0)
 
-settings = Settings()
+# ── Kelly ─────────────────────────────────────────────────────────────────────
+KELLY_WIN_RATE = _float("KELLY_WIN_RATE", 0.60)   # era 0.55, histórico muestra ~0.60+
+KELLY_RR       = _float("KELLY_RR",       1.5)    # era 1.8, ajustado al TP1 más cercano
+KELLY_FRACTION = _float("KELLY_FRACTION", 0.25)
+
+# ── Circuit Breaker ───────────────────────────────────────────────────────────
+CB_ENABLED  = _bool("CB_ENABLED",  True)
+CB_ATR_MULT = _float("CB_ATR_MULT", 3.0)
+CB_BARS     = _int("CB_BARS",      10)
+
+# ── Gestión de posiciones ─────────────────────────────────────────────────────
+POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
+BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT",     1.0)
+
+# ── Puerto ────────────────────────────────────────────────────────────────────
+PORT = _int("PORT", 8080)
