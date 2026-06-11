@@ -63,7 +63,7 @@ class BingXClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._precision_map: dict[str, int]   = {}
         self._min_qty_map:   dict[str, float] = {}
-        log.info("BingXClient v6.3.2 iniciado — firma: sorted+ts_al_final (parseParam oficial)")
+        log.info("BingXClient v6.3.3 iniciado — firma: sorted+ts_al_final (parseParam oficial)")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -89,8 +89,11 @@ class BingXClient:
                     url = "%s%s?%s" % (self.BASE, path, urlencode(base))
                 else:
                     url = "%s%s" % (self.BASE, path)
-                async with session.get(url) as r:
-                    return await r.json(content_type=None)
+                async with session.get(url, headers={"X-BX-APIKEY": C.BINGX_API_KEY}) as r:
+                    data = await r.json(content_type=None)
+                    if signed and data.get("code") == 100001:
+                        log.error("GET %s firma inválida — url=%s", path, url[:120])
+                    return data
             except Exception as e:
                 if attempt == 2:
                     log.error("GET %s error: %s", path, e)
@@ -104,7 +107,7 @@ class BingXClient:
             try:
                 qs  = _build_signed_qs(params)
                 url = "%s%s?%s" % (self.BASE, path, qs)
-                async with session.post(url) as r:
+                async with session.post(url, headers={"X-BX-APIKEY": C.BINGX_API_KEY}) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -119,7 +122,7 @@ class BingXClient:
             try:
                 qs  = _build_signed_qs(params)
                 url = "%s%s?%s" % (self.BASE, path, qs)
-                async with session.delete(url) as r:
+                async with session.delete(url, headers={"X-BX-APIKEY": C.BINGX_API_KEY}) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -249,29 +252,57 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
+        """
+        Retorna availableMargin USDT.
+        Si availableMargin=0 pero hay equity (posiciones abiertas),
+        usa equity como proxy del capital real disponible.
+        """
+        # Intentar v3 primero, luego v2 como fallback
         data = await self._get(
             "/openApi/swap/v3/user/balance",
             {"currency": "USDT"},
             signed=True,
         )
+        if data.get("code", -1) != 0:
+            log.warning("get_balance v3 falló (code=%s) → probando v2", data.get("code"))
+            data = await self._get(
+                "/openApi/swap/v2/user/balance",
+                {"currency": "USDT"},
+                signed=True,
+            )
         raw = data.get("data", {})
+        log.info("get_balance: code=%s data=%s", data.get("code"), str(raw)[:300])
+
+        def _extract(d: dict) -> float:
+            avail  = float(d.get("availableMargin", 0) or 0)
+            equity = float(d.get("equity",          0) or 0)
+            # Si availableMargin=0 pero hay equity → posiciones abiertas
+            # devolver equity para que kelly_position_size pueda calcular
+            if avail > 0:
+                return avail
+            if equity > 0:
+                log.debug("availableMargin=0, usando equity=%.4f", equity)
+                return equity
+            return 0.0
+
         if isinstance(raw, list):
             for a in raw:
                 if isinstance(a, dict) and a.get("asset", "") == "USDT":
-                    return float(a.get("availableMargin", 0) or 0)
+                    return _extract(a)
             for a in raw:
-                v = (a or {}).get("availableMargin")
-                if v is not None:
-                    return float(v or 0)
+                if isinstance(a, dict) and ("availableMargin" in a or "equity" in a):
+                    return _extract(a)
             return 0.0
+
         if isinstance(raw, dict):
             bal = raw.get("balance", raw)
             if isinstance(bal, list):
                 for a in bal:
                     if isinstance(a, dict) and a.get("asset", "") == "USDT":
-                        return float(a.get("availableMargin", 0) or 0)
+                        return _extract(a)
             if isinstance(bal, dict):
-                return float(bal.get("availableMargin", 0) or 0)
+                return _extract(bal)
+
         log.warning("get_balance: formato inesperado %s", str(data)[:200])
         return 0.0
 
@@ -295,14 +326,19 @@ class BingXClient:
     # ── Apalancamiento ────────────────────────────────────────────────────────
 
     async def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> bool:
-        data = await self._post(
-            "/openApi/swap/v2/trade/leverage",
-            {"symbol": symbol, "side": side, "leverage": leverage},
-        )
-        ok = data.get("code", -1) == 0
-        if not ok:
-            log.warning("[%s] set_leverage code=%s — continuando", symbol, data.get("code"))
-        return ok
+        """Establece leverage para ambos lados para evitar el bug de 4x del historial."""
+        ok_long = ok_short = True
+        for s in ["LONG", "SHORT"]:
+            data = await self._post(
+                "/openApi/swap/v2/trade/leverage",
+                {"symbol": symbol, "side": s, "leverage": leverage},
+            )
+            ok = data.get("code", -1) == 0
+            if not ok:
+                log.warning("[%s] set_leverage %s code=%s — continuando", symbol, s, data.get("code"))
+            if s == "LONG":  ok_long  = ok
+            else:            ok_short = ok
+        return ok_long and ok_short
 
     # ── Órdenes ───────────────────────────────────────────────────────────────
 
@@ -329,6 +365,11 @@ class BingXClient:
         order_type: str = "STOP_MARKET",
     ) -> dict:
         qty = self._round_qty(symbol, quantity)
+        if stop_price <= 0:
+            log.warning("[%s] place_stop: stopPrice inválido (%.8f) — skip", symbol, stop_price)
+            return {"code": -1, "msg": "invalid_stop_price"}
+        # BingX requiere quantity > 0 incluso con closePosition=true en algunos pares
+        qty_str = str(qty) if qty > 0 else "0"
         params = {
             "symbol":        symbol,
             "side":          side,
@@ -336,7 +377,7 @@ class BingXClient:
             "type":          order_type,
             "stopPrice":     str(round(stop_price, 8)),
             "closePosition": "true" if close_position else "false",
-            "quantity":      "0" if close_position else str(qty),
+            "quantity":      qty_str,
             "workingType":   "MARK_PRICE",
             "priceProtect":  "true",
         }
