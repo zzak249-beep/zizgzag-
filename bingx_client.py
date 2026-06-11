@@ -395,6 +395,36 @@ class BingXClient:
             {"symbol": symbol},
         )
 
+    async def get_order_book(self, symbol: str, limit: int = 5) -> dict:
+        """
+        Order Book Depth — para calcular Order Book Imbalance.
+        bids[i] = [price, qty], asks[i] = [price, qty]
+        OBI = (bid_vol - ask_vol) / (bid_vol + ask_vol)
+        > 0 → presión compradora, < 0 → presión vendedora
+        """
+        data = await self._get(
+            "/openApi/swap/v2/quote/depth",
+            {"symbol": symbol, "limit": limit},
+        )
+        return data.get("data", {})
+
+    async def get_funding_rate(self, symbol: str) -> float:
+        """
+        Funding rate actual. Positivo → longs pagan (SHORT favorecido).
+        Negativo → shorts pagan (LONG favorecido).
+        """
+        data = await self._get(
+            "/openApi/swap/v2/quote/premiumIndex",
+            {"symbol": symbol},
+        )
+        d = data.get("data", {})
+        if isinstance(d, list) and d:
+            d = d[0]
+        try:
+            return float(d.get("lastFundingRate", 0) or 0)
+        except Exception:
+            return 0.0
+
     async def close_position_market(
         self, symbol: str, quantity: float, position_side: str,
     ) -> dict:
