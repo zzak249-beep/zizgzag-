@@ -210,8 +210,17 @@ class PositionManager:
                     log.info("[%s] TP1 alcanzado @ %.6f", symbol, mark_price)
 
     async def _move_to_breakeven(self, trade: OpenTrade, current_price: float):
-        """Cancela SL original y coloca nuevo SL en entry (breakeven)."""
+        """Cancela SL original y coloca nuevo SL en entry (breakeven).
+        Verifica que la posición sigue abierta antes de actuar."""
         try:
+            # Verificar que la posición aún existe en BingX
+            positions = await self.client.get_open_positions()
+            symbols_open = {p.get("symbol","") for p in positions}
+            if trade.symbol not in symbols_open:
+                log.info("[%s] BE skip — posición ya cerrada en BingX", trade.symbol)
+                await self.remove_trade(trade.symbol, 0.0)
+                return
+
             await self.client.cancel_all_orders(trade.symbol)
             await asyncio.sleep(0.3)
 
