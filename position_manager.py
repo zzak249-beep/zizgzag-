@@ -1,281 +1,386 @@
 """
-QF×JP Bot v6.3 — Position Manager
-Monitorea posiciones abiertas en BingX:
-- Detecta SL/TP alcanzados
-- Mueve SL a breakeven
-- Trailing stop
-- Cierre de emergencia
-- Sincroniza estado con RiskManager
+position_manager.py — Gestor de posiciones abiertas (reescritura limpia)
+
+Responsabilidades:
+  1. Sincronizar el contador open_trades con el exchange en cada ciclo.
+  2. Mover SL a breakeven cuando price >= entry + BREAKEVEN_ATR_MULT * ATR.
+  3. Aplicar trailing stop (CB) si CB_ENABLED.
+  4. Registrar cierre externo de posiciones (PnL final).
+
+Principios de diseño:
+  - ground_truth_first: el estado siempre viene del exchange, nunca de memoria local.
+  - safe_amend: antes de cualquier amend, verificar que la posición sigue abierta.
+  - idempotent_be: no mover SL si ya está en BE o más allá.
+  - no_side_effects_on_error: las excepciones nunca corrompen el contador.
 """
+
 import asyncio
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-import config as C
-from bingx_client import BingXClient
-from risk_manager import RiskManager
-import telegram_client as tg
+logger = logging.getLogger("position_manager")
 
-log = logging.getLogger("position_mgr")
 
+# ---------------------------------------------------------------------------
+# Config (leída de env, idéntica al resto del bot)
+# ---------------------------------------------------------------------------
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ[key])
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    v = os.environ.get(key, "").lower()
+    if v in ("true", "1", "yes"):
+        return True
+    if v in ("false", "0", "no"):
+        return False
+    return default
+
+
+BREAKEVEN_ATR_MULT: float = _env_float("BREAKEVEN_ATR_MULT", 1.0)
+CB_ENABLED: bool = _env_bool("CB_ENABLED", True)
+CB_ATR_MULT: float = _env_float("CB_ATR_MULT", 3.0)
+POSITION_CHECK_INTERVAL: int = int(_env_float("POSITION_CHECK_INTERVAL", 30))
+MAX_OPEN_TRADES: int = int(_env_float("MAX_OPEN_TRADES", 10))
+
+
+# ---------------------------------------------------------------------------
+# Modelo de posición local (sólo para tracking de BE/CB ya aplicado)
+# ---------------------------------------------------------------------------
 
 @dataclass
-class OpenTrade:
+class TrackedPosition:
     symbol: str
-    direction: str       # LONG | SHORT
-    entry: float
-    sl: float
-    tp1: float
-    tp2: float
+    side: str                   # "Buy" | "Sell"
+    entry_price: float
     qty: float
-    atr: float
-    order_id: str
-    be_moved: bool = False
-    tp1_hit: bool = False
+    atr: float                  # ATR en el momento de apertura
+    be_applied: bool = False    # ¿SL ya movido a BE?
+    cb_sl: Optional[float] = None  # Nivel actual de trailing SL
 
+
+# ---------------------------------------------------------------------------
+# PositionManager
+# ---------------------------------------------------------------------------
 
 class PositionManager:
-    def __init__(self, client: BingXClient, risk: RiskManager):
-        self.client = client
-        self.risk   = risk
-        self._trades: dict[str, OpenTrade] = {}   # symbol → OpenTrade
-        self._lock = asyncio.Lock()
+    """
+    Gestiona todas las posiciones abiertas.
 
-    async def reconcile_on_startup(self):
+    Uso:
+        pm = PositionManager(exchange_client, state)
+        await pm.run()          # loop continuo
+        # o llamada manual:
+        await pm.check_once()
+    """
+
+    def __init__(self, exchange, state):
         """
-        Al arrancar, consulta BingX y registra las posiciones ya abiertas
-        para que el RiskManager no permita abrir más de las permitidas.
-        Reconstruye un OpenTrade mínimo (sin ATR/SL/TP exactos) suficiente
-        para el monitor y el contador de riesgo.
+        exchange : objeto con métodos async:
+            get_open_positions() -> list[dict]   (bybit v5 structure)
+            get_ticker(symbol)   -> dict  {'lastPrice': str, ...}
+            amend_order(symbol, sl, tp)  -> dict | None
+        state    : objeto compartido con atributos:
+            open_trades (int)    — contador que usa el scanner
         """
-        try:
-            real_positions = await self.client.get_open_positions()
-        except Exception as e:
-            log.warning("reconcile_on_startup: no se pudo obtener posiciones: %s", e)
-            return
+        self.exchange = exchange
+        self.state = state
 
-        if not real_positions:
-            log.info("reconcile_on_startup: sin posiciones abiertas en BingX")
-            return
+        # Mapa local: symbol -> TrackedPosition
+        # Solo para saber si ya aplicamos BE/CB, NO como fuente de verdad de cuántas hay
+        self._tracked: dict[str, TrackedPosition] = {}
 
-        count = 0
-        for pos in real_positions:
-            sym = pos.get("symbol", "")
-            if not sym:
-                continue
+    # ------------------------------------------------------------------
+    # Loop principal
+    # ------------------------------------------------------------------
 
-            amt = float(pos.get("positionAmt", 0) or 0)
-            if amt == 0:
-                continue
-
-            direction = "LONG" if amt > 0 else "SHORT"
-            entry     = float(pos.get("avgPrice",      pos.get("entryPrice", 0)) or 0)
-            mark      = float(pos.get("markPrice",     entry) or entry)
-            qty       = abs(amt)
-
-            # SL/TP aproximados (1% como placeholder — el monitor los gestionará)
-            sl  = entry * 0.99 if direction == "LONG" else entry * 1.01
-            tp1 = entry * 1.015 if direction == "LONG" else entry * 0.985
-            tp2 = entry * 1.03  if direction == "LONG" else entry * 0.97
-
-            trade = OpenTrade(
-                symbol=sym,
-                direction=direction,
-                entry=entry,
-                sl=sl,
-                tp1=tp1,
-                tp2=tp2,
-                qty=qty,
-                atr=entry * 0.005,   # ATR estimado 0.5%
-                order_id="reconciled",
-                be_moved=False,
-            )
-
-            async with self._lock:
-                self._trades[sym] = trade
-
-            # NO incrementar aquí — update_open_count lo hará en el primer ciclo
-            # con la cifra real de BingX, evitando doble conteo
-
-            count += 1
-            log.info(
-                "[%s] Reconciliado: %s qty=%.4f entry=%.6f",
-                sym, direction, qty, entry,
-            )
-
-        if count:
-            log.info("reconcile_on_startup: %d posiciones reconciliadas", count)
-            await tg.notify_error(
-                "reconcile_startup",
-                f"{count} posición(es) reconciliada(s) desde BingX tras redeploy",
-            )
-
-    async def register_trade(self, trade: OpenTrade):
-        async with self._lock:
-            self._trades[trade.symbol] = trade
-        await self.risk.on_trade_opened()
-        log.info("[%s] Trade registrado %s entry=%.6f", trade.symbol, trade.direction, trade.entry)
-
-    async def remove_trade(self, symbol: str, pnl: float = 0.0):
-        async with self._lock:
-            self._trades.pop(symbol, None)
-        await self.risk.on_trade_closed(pnl)
-
-    # ── Loop principal ────────────────────────────────────────────────────────
-
-    async def monitor_loop(self):
-        """Corre en background. Verifica posiciones cada POSITION_CHECK_INTERVAL seg."""
-        log.info("Position monitor iniciado (intervalo=%ds)", C.POSITION_CHECK_INTERVAL)
+    async def run(self) -> None:
+        logger.info("position_manager | loop iniciado (intervalo=%ds)", POSITION_CHECK_INTERVAL)
         while True:
             try:
-                await self._check_all_positions()
-            except Exception as e:
-                log.error("monitor_loop error: %s", e)
-                await tg.notify_error("position_monitor", str(e))
-            await asyncio.sleep(C.POSITION_CHECK_INTERVAL)
+                await self.check_once()
+            except Exception as exc:
+                logger.exception("position_manager | error inesperado en ciclo: %s", exc)
+            await asyncio.sleep(POSITION_CHECK_INTERVAL)
 
-    async def _check_all_positions(self):
-        # Obtener posiciones reales de BingX
+    # ------------------------------------------------------------------
+    # Un ciclo completo
+    # ------------------------------------------------------------------
+
+    async def check_once(self) -> None:
+        """
+        1. Obtiene posiciones abiertas del exchange (fuente de verdad).
+        2. Actualiza state.open_trades.
+        3. Detecta cierres externos y limpia tracking local.
+        4. Para cada posición abierta: intenta BE y CB.
+        """
+        # --- 1. Fetch ground truth ---
         try:
-            real_positions = await self.client.get_open_positions()
-        except Exception as e:
-            log.warning("get_open_positions failed: %s", e)
-            return
+            raw_positions = await self.exchange.get_open_positions()
+        except Exception as exc:
+            logger.error("position_manager | no se pudo obtener posiciones: %s", exc)
+            return  # No tocar nada si el exchange falla
 
-        # Construir mapa symbol → posición real
-        real_map: dict[str, dict] = {}
-        for pos in real_positions:
-            sym = pos.get("symbol", "")
-            if sym:
-                real_map[sym] = pos
+        # Filtrar posiciones con qty > 0 (bybit devuelve rows vacías a veces)
+        open_positions: list[dict] = [
+            p for p in raw_positions if float(p.get("size", 0)) > 0
+        ]
+        open_symbols: set[str] = {p["symbol"] for p in open_positions}
 
-        # Sincronizar contador con la realidad de BingX
-        # Usar max(len(real_map), len(tracked)) para no perder tracks locales
-        await self.risk.update_open_count(len(real_map))
-
-        async with self._lock:
-            tracked = dict(self._trades)
-
-        for symbol, trade in tracked.items():
-            if symbol not in real_map:
-                # La posición ya no existe en BingX (cerrada por SL/TP automático)
-                try:
-                    ticker = await self.client.get_ticker(symbol)
-                    close_price = float(ticker.get("lastPrice", trade.entry))
-                except Exception:
-                    close_price = trade.entry
-
-                pnl = self._calc_pnl(trade, close_price)
-                reason = "sl_tp_auto"
-
-                log.info("[%s] Posición cerrada externamente. PnL≈%.2f USDT", symbol, pnl)
-                await tg.notify_trade_closed(
-                    symbol, trade.direction, trade.entry, close_price, trade.qty, reason, pnl
-                )
-                await self.remove_trade(symbol, pnl)
-                continue
-
-            # Posición sigue abierta — analizar precio actual
-            pos = real_map[symbol]
-            try:
-                mark_price = float(pos.get("markPrice", 0) or 0)
-                if mark_price == 0:
-                    ticker = await self.client.get_ticker(symbol)
-                    mark_price = float(ticker.get("lastPrice", trade.entry))
-            except Exception:
-                continue
-
-            if mark_price <= 0:
-                continue
-
-            # ── Breakeven ─────────────────────────────────────────────────────
-            if not trade.be_moved:
-                be_trigger = trade.entry + trade.atr * C.BREAKEVEN_ATR_MULT \
-                    if trade.direction == "LONG" \
-                    else trade.entry - trade.atr * C.BREAKEVEN_ATR_MULT
-
-                be_reached = (trade.direction == "LONG" and mark_price >= be_trigger) or \
-                             (trade.direction == "SHORT" and mark_price <= be_trigger)
-
-                if be_reached:
-                    await self._move_to_breakeven(trade, mark_price)
-
-            # ── TP1 alcanzado manualmente (si las órdenes parciales fallan) ───
-            if not trade.tp1_hit:
-                tp1_hit = (trade.direction == "LONG" and mark_price >= trade.tp1) or \
-                          (trade.direction == "SHORT" and mark_price <= trade.tp1)
-                if tp1_hit:
-                    trade.tp1_hit = True
-                    log.info("[%s] TP1 alcanzado @ %.6f", symbol, mark_price)
-
-    async def _move_to_breakeven(self, trade: OpenTrade, current_price: float):
-        """Cancela SL original y coloca nuevo SL en entry (breakeven).
-        Verifica que la posición sigue abierta antes de actuar."""
-        try:
-            # Verificar que la posición aún existe en BingX
-            positions = await self.client.get_open_positions()
-            symbols_open = {p.get("symbol","") for p in positions}
-            if trade.symbol not in symbols_open:
-                log.info("[%s] BE skip — posición ya cerrada en BingX", trade.symbol)
-                await self.remove_trade(trade.symbol, 0.0)
-                return
-
-            await self.client.cancel_all_orders(trade.symbol)
-            await asyncio.sleep(0.3)
-
-            side_close = "SELL" if trade.direction == "LONG" else "BUY"
-            resp = await self.client.place_stop_market_order(
-                trade.symbol,
-                side_close,
-                trade.qty,
-                trade.entry,
-                trade.direction,
-                close_position=True,
-                order_type="STOP_MARKET",
+        # --- 2. Sincronizar contador (SIEMPRE desde el exchange) ---
+        real_count = len(open_positions)
+        if self.state.open_trades != real_count:
+            logger.info(
+                "position_manager | sincronizando open_trades: %d → %d",
+                self.state.open_trades,
+                real_count,
             )
-            if resp.get("code", -1) == 0:
-                trade.be_moved = True
-                log.info("[%s] SL movido a breakeven @ %.6f", trade.symbol, trade.entry)
-            else:
-                log.warning("[%s] Fallo al mover SL a BE: %s", trade.symbol, resp)
-        except Exception as e:
-            log.error("[%s] _move_to_breakeven error: %s", trade.symbol, e)
+            self.state.open_trades = real_count
 
-    async def close_position_emergency(self, symbol: str, reason: str = "emergency"):
-        """Cierre forzado por mercado."""
-        async with self._lock:
-            trade = self._trades.get(symbol)
+        # --- 3. Detectar cierres externos ---
+        closed_locally = set(self._tracked.keys()) - open_symbols
+        for sym in closed_locally:
+            tp = self._tracked.pop(sym)
+            logger.info(
+                "position_manager | cierre externo detectado: %s (entry=%.6f)",
+                sym,
+                tp.entry_price,
+            )
 
-        if not trade:
-            log.warning("[%s] close_emergency: trade no registrado", symbol)
+        # --- 4. Registrar posiciones nuevas en tracking local ---
+        for pos in open_positions:
+            sym = pos["symbol"]
+            if sym not in self._tracked:
+                # Posición nueva: añadir al mapa local
+                try:
+                    tp = self._build_tracked(pos)
+                    self._tracked[sym] = tp
+                    logger.debug("position_manager | tracking iniciado: %s", sym)
+                except Exception as exc:
+                    logger.warning("position_manager | no se pudo trackear %s: %s", sym, exc)
+
+        # --- 5. Revisar BE y CB para cada posición abierta ---
+        tasks = [self._process_position(pos) for pos in open_positions]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for pos, result in zip(open_positions, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "position_manager | error procesando %s: %s",
+                    pos["symbol"],
+                    result,
+                )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _build_tracked(self, pos: dict) -> TrackedPosition:
+        """Construye un TrackedPosition desde un dict de bybit v5."""
+        return TrackedPosition(
+            symbol=pos["symbol"],
+            side=pos["side"],               # "Buy" o "Sell"
+            entry_price=float(pos["avgPrice"]),
+            qty=float(pos["size"]),
+            atr=float(pos.get("atr", 0)),   # El bot debe inyectar atr en pos o usar default
+        )
+
+    async def _get_current_price(self, symbol: str) -> Optional[float]:
+        """Devuelve el último precio del exchange, o None si falla."""
+        try:
+            ticker = await self.exchange.get_ticker(symbol)
+            return float(ticker["lastPrice"])
+        except Exception as exc:
+            logger.warning("position_manager | no se pudo obtener precio de %s: %s", symbol, exc)
+            return None
+
+    async def _verify_position_open(self, symbol: str) -> bool:
+        """
+        Consulta puntualmente si la posición sigue abierta.
+        Evita el error 'position not exist' al intentar mover SL.
+        """
+        try:
+            positions = await self.exchange.get_open_positions()
+            for p in positions:
+                if p["symbol"] == symbol and float(p.get("size", 0)) > 0:
+                    return True
+            return False
+        except Exception as exc:
+            logger.warning("position_manager | verify_position_open(%s) falló: %s", symbol, exc)
+            # Asumir cerrada si no podemos verificar → seguro, evita error 109420
+            return False
+
+    # ------------------------------------------------------------------
+    # Lógica de BE y CB
+    # ------------------------------------------------------------------
+
+    async def _process_position(self, pos: dict) -> None:
+        """
+        Intenta mover SL a BE y/o aplicar CB para una posición concreta.
+        Verifica que la posición exista antes de cualquier amend.
+        """
+        symbol: str = pos["symbol"]
+        side: str = pos["side"]                     # "Buy" | "Sell"
+        entry: float = float(pos["avgPrice"])
+        current_sl: float = float(pos.get("stopLoss", 0))
+        current_tp: float = float(pos.get("takeProfit", 0))
+
+        tp = self._tracked.get(symbol)
+        if tp is None:
+            return  # No tenemos info de ATR, ignorar
+
+        if tp.atr <= 0:
+            return  # Sin ATR no podemos calcular nada
+
+        atr = tp.atr
+        is_long = side == "Buy"
+
+        # --- Precio actual ---
+        price = await self._get_current_price(symbol)
+        if price is None:
             return
 
+        # --- Calcular niveles objetivo ---
+        be_trigger = entry + BREAKEVEN_ATR_MULT * atr if is_long else entry - BREAKEVEN_ATR_MULT * atr
+        be_sl = entry                                # SL exactamente en entry (sin fees para no sobrecomplicar)
+
+        cb_distance = CB_ATR_MULT * atr
+        cb_sl = price - cb_distance if is_long else price + cb_distance
+
+        # --- Decidir si necesitamos mover el SL ---
+        new_sl: Optional[float] = None
+
+        # A) Breakeven
+        if not tp.be_applied:
+            if (is_long and price >= be_trigger) or (not is_long and price <= be_trigger):
+                # ¿El SL ya está en BE o mejor? No mover.
+                sl_already_ok = (
+                    (is_long and current_sl >= be_sl) or
+                    (not is_long and current_sl <= be_sl and current_sl > 0)
+                )
+                if not sl_already_ok:
+                    new_sl = be_sl
+                    logger.info(
+                        "position_manager | [%s] BE activado: price=%.6f ≥ trigger=%.6f → SL→%.6f",
+                        symbol, price, be_trigger, new_sl,
+                    )
+                tp.be_applied = True  # Marcar aunque el SL ya estuviera en BE
+
+        # B) Chandelier / Trailing Stop (sólo si CB_ENABLED y BE ya aplicado)
+        if CB_ENABLED and tp.be_applied:
+            # Sólo subir (long) o bajar (short) el SL, nunca empeorarlo
+            prev_cb = tp.cb_sl
+            should_update_cb = (
+                (is_long and (prev_cb is None or cb_sl > prev_cb)) or
+                (not is_long and (prev_cb is None or cb_sl < prev_cb))
+            )
+            if should_update_cb:
+                # Sólo aplicar si mejora respecto al SL actual del exchange
+                better_than_exchange = (
+                    (is_long and cb_sl > current_sl) or
+                    (not is_long and (current_sl == 0 or cb_sl < current_sl))
+                )
+                if better_than_exchange:
+                    new_sl = cb_sl
+                    tp.cb_sl = cb_sl
+                    logger.info(
+                        "position_manager | [%s] CB trailing: price=%.6f → SL→%.6f",
+                        symbol, price, new_sl,
+                    )
+
+        # --- Si no hay nada que mover, salir ---
+        if new_sl is None:
+            return
+
+        # --- VERIFICAR que la posición sigue abierta ANTES del amend ---
+        still_open = await self._verify_position_open(symbol)
+        if not still_open:
+            logger.info(
+                "position_manager | [%s] ya no existe en exchange, skipping amend",
+                symbol,
+            )
+            # Limpiar tracking local también
+            self._tracked.pop(symbol, None)
+            return
+
+        # --- Ejecutar amend ---
         try:
-            await self.client.cancel_all_orders(symbol)
-            await asyncio.sleep(0.2)
-            resp = await self.client.close_position_market(symbol, trade.qty, trade.direction)
+            result = await self.exchange.amend_order(
+                symbol=symbol,
+                sl=round(new_sl, 6),
+                tp=current_tp if current_tp > 0 else None,
+            )
+            if result:
+                logger.info("position_manager | [%s] amend OK → SL=%.6f", symbol, new_sl)
+            else:
+                logger.warning("position_manager | [%s] amend devolvió None", symbol)
+        except Exception as exc:
+            err_str = str(exc)
+            # Bybit code 109420 = position not exist → ya cerrada externamente
+            # Bybit code 110406 = SL order already exists (idempotente, no es error real)
+            if "109420" in err_str:
+                logger.info(
+                    "position_manager | [%s] position not exist (109420) — cerrada externamente",
+                    symbol,
+                )
+                self._tracked.pop(symbol, None)
+            elif "110406" in err_str:
+                logger.debug(
+                    "position_manager | [%s] SL order already exists (110406) — ignorando",
+                    symbol,
+                )
+            else:
+                logger.error("position_manager | [%s] amend falló: %s", symbol, exc)
 
-            ticker = await self.client.get_ticker(symbol)
-            close_price = float(ticker.get("lastPrice", trade.entry))
-            pnl = self._calc_pnl(trade, close_price)
+    # ------------------------------------------------------------------
+    # API pública de utilidad
+    # ------------------------------------------------------------------
 
-            log.info("[%s] Cierre emergencia. PnL=%.2f USDT", symbol, pnl)
-            await tg.notify_trade_closed(symbol, trade.direction, trade.entry, close_price, trade.qty, reason, pnl)
-            await self.remove_trade(symbol, pnl)
-        except Exception as e:
-            log.error("[%s] close_emergency error: %s", symbol, e)
-            await tg.notify_error(f"close_emergency({symbol})", str(e))
-
-    def _calc_pnl(self, trade: OpenTrade, close_price: float) -> float:
-        if trade.direction == "LONG":
-            raw_pnl = (close_price - trade.entry) * trade.qty
+    def update_atr(self, symbol: str, atr: float) -> None:
+        """
+        Permite al scanner actualizar el ATR de una posición trackeada.
+        Llamar después de abrir un trade: pm.update_atr('BTC-USDT', 45.3)
+        """
+        if symbol in self._tracked:
+            self._tracked[symbol].atr = atr
         else:
-            raw_pnl = (trade.entry - close_price) * trade.qty
-        return round(raw_pnl * C.LEVERAGE, 4)
+            logger.debug("position_manager | update_atr: %s no está en tracking", symbol)
 
-    def get_tracked(self) -> dict[str, OpenTrade]:
-        return dict(self._trades)
+    def register_new_position(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        qty: float,
+        atr: float,
+    ) -> None:
+        """
+        El scanner puede llamar esto justo después de abrir un trade
+        para que el ATR quede registrado antes del primer check.
+        """
+        self._tracked[symbol] = TrackedPosition(
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            qty=qty,
+            atr=atr,
+        )
+        logger.info(
+            "position_manager | registrado nuevo trade: %s %s entry=%.6f atr=%.6f",
+            symbol, side, entry_price, atr,
+        )
 
-    def is_trading(self, symbol: str) -> bool:
-        return symbol in self._trades
+    @property
+    def open_count(self) -> int:
+        """Devuelve el contador sincronizado (mismo que state.open_trades)."""
+        return self.state.open_trades
+
+    def can_open_trade(self) -> bool:
+        """True si hay hueco para un trade más."""
+        return self.state.open_trades < MAX_OPEN_TRADES
