@@ -95,9 +95,8 @@ class PositionManager:
             async with self._lock:
                 self._trades[sym] = trade
 
-            # Incrementar contador de riesgo sin contar como trade nuevo del día
-            async with self.risk._lock:
-                self.risk._open_count += 1
+            # NO incrementar aquí — update_open_count lo hará en el primer ciclo
+            # con la cifra real de BingX, evitando doble conteo
 
             count += 1
             log.info(
@@ -151,7 +150,8 @@ class PositionManager:
             if sym:
                 real_map[sym] = pos
 
-        # Actualizar contador en risk manager
+        # Sincronizar contador con la realidad de BingX
+        # Usar max(len(real_map), len(tracked)) para no perder tracks locales
         await self.risk.update_open_count(len(real_map))
 
         async with self._lock:
