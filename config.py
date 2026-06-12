@@ -54,12 +54,12 @@ MODE = os.getenv("MODE", "SIGNAL").upper()   # SIGNAL | LIVE
 CAPITAL          = _float("CAPITAL",          1000.0)
 RISK_PCT         = _float("RISK_PCT",         1.0)
 LEVERAGE         = _int("LEVERAGE",           10)
-MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES",    5)   # conservador
+MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES",    5)   # MÁXIMO REAL — no subir
 MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES",   20)
 
 # ── Umbrales de señal — optimizados al perfil SHORT ganador ───────────────────
 
-MIN_SCORE  = _float("MIN_SCORE",  55.0)   # restaurado — 50 deja pasar señales débiles
+MIN_SCORE  = _float("MIN_SCORE",  50.0)   # STD mínimo
 FUEL_SCORE = _float("FUEL_SCORE", 62.0)   # Tier FUEL
 SUP_SCORE  = _float("SUP_SCORE",  78.0)   # Tier SUPER
 MIN_TIER   = os.getenv("MIN_TIER", "STD").upper()   # STD | FUEL | SUP
@@ -67,7 +67,7 @@ MIN_TIER   = os.getenv("MIN_TIER", "STD").upper()   # STD | FUEL | SUP
 # ── Entrada ───────────────────────────────────────────────────────────────────
 
 REQUIRE_TL_BREAK = _bool("REQUIRE_TL_BREAK", True)
-HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED",   2)   # restaurado — con 1 entraban señales de baja calidad
+HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED",   1)   # nº timeframes HTF alineados
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
 
@@ -86,9 +86,9 @@ HTF5_TIMEFRAME = os.getenv("HTF5_TIMEFRAME", "4h")
 # ── ATR / SL / TP — ajustados al perfil ganador (cierres en 5-15 min) ─────────
 
 ATR_LEN      = _int("ATR_LEN",       10)
-SL_ATR_MULT  = _float("SL_ATR_MULT",  1.2)   # restaurado — 0.8 era demasiado ajustado
-TP1_ATR_MULT = _float("TP1_ATR_MULT", 1.5)   # restaurado — 1.2 daba R:R demasiado bajo
-TP2_ATR_MULT = _float("TP2_ATR_MULT", 2.5)   # TP2 realista
+SL_ATR_MULT  = _float("SL_ATR_MULT",  0.8)   # SL ajustado
+TP1_ATR_MULT = _float("TP1_ATR_MULT", 1.2)   # TP1 rápido
+TP2_ATR_MULT = _float("TP2_ATR_MULT", 4.0)   # ampliado para R:R > 1.5
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 

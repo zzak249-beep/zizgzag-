@@ -18,11 +18,16 @@ log = logging.getLogger("risk")
 
 class RiskManager:
     def __init__(self):
-        self._lock          = asyncio.Lock()
-        self._open_count    = 0
-        self._daily_trades  = 0
-        self._daily_pnl     = 0.0
-        self._last_reset    = date.today()
+        self._lock             = asyncio.Lock()
+        self._open_count       = 0
+        self._daily_trades     = 0
+        self._daily_pnl        = 0.0
+        self._last_reset       = date.today()
+        # Anti-liquidación y anti-overtrading
+        self._symbol_loss_time: dict[str, float] = {}   # symbol → timestamp última pérdida
+        self._symbol_trade_count: dict[str, int] = {}   # symbol → trades hoy
+        self._LOSS_COOLDOWN    = 7200.0   # 2h cooldown tras pérdida en mismo par
+        self._MAX_TRADES_SYMBOL = 2       # máx 2 trades por par al día
 
     # ── Reset diario ──────────────────────────────────────────────────────────
 
@@ -30,9 +35,10 @@ class RiskManager:
         today = date.today()
         if today != self._last_reset:
             log.info("Reset diario: trades=%d pnl=%.2f", self._daily_trades, self._daily_pnl)
-            self._daily_trades = 0
-            self._daily_pnl    = 0.0
-            self._last_reset   = today
+            self._daily_trades        = 0
+            self._daily_pnl           = 0.0
+            self._last_reset          = today
+            self._symbol_trade_count  = {}   # reset contador diario por símbolo
 
     # ── Consultas ─────────────────────────────────────────────────────────────
 
@@ -54,6 +60,21 @@ class RiskManager:
 
             return True, ""
 
+    def symbol_allowed(self, symbol: str) -> tuple[bool, str]:
+        """Verifica cooldown y límite de trades por símbolo."""
+        import time
+        now = time.time()
+        # Cooldown tras pérdida
+        last_loss = self._symbol_loss_time.get(symbol, 0)
+        if now - last_loss < self._LOSS_COOLDOWN:
+            mins = int((self._LOSS_COOLDOWN - (now - last_loss)) / 60)
+            return False, f"cooldown_loss({symbol},{mins}min)"
+        # Límite diario por símbolo
+        count = self._symbol_trade_count.get(symbol, 0)
+        if count >= self._MAX_TRADES_SYMBOL:
+            return False, f"max_trades_symbol({symbol},{count}/{self._MAX_TRADES_SYMBOL})"
+        return True, ""
+
     def tier_ok(self, tier: str) -> bool:
         """Filtra por tier mínimo configurado."""
         order = {"NONE": 0, "STD": 1, "FUEL": 2, "SUP": 3}
@@ -61,17 +82,23 @@ class RiskManager:
 
     # ── Eventos ───────────────────────────────────────────────────────────────
 
-    async def on_trade_opened(self):
+    async def on_trade_opened(self, symbol: str = ""):
         async with self._lock:
             self._open_count   += 1
             self._daily_trades += 1
-            log.info("Trade abierto — open=%d daily=%d",
-                     self._open_count, self._daily_trades)
+            if symbol:
+                self._symbol_trade_count[symbol] = self._symbol_trade_count.get(symbol, 0) + 1
+            log.info("Trade abierto — open=%d daily=%d symbol=%s",
+                     self._open_count, self._daily_trades, symbol)
 
-    async def on_trade_closed(self, pnl: float = 0.0):
+    async def on_trade_closed(self, pnl: float = 0.0, symbol: str = ""):
+        import time
         async with self._lock:
             self._open_count = max(0, self._open_count - 1)
             self._daily_pnl += pnl
+            if symbol and pnl < 0:
+                self._symbol_loss_time[symbol] = time.time()
+                log.info("Cooldown 2h activado para %s tras pérdida %.4f", symbol, pnl)
             log.info("Trade cerrado — pnl=%.4f daily_pnl=%.4f open=%d",
                      pnl, self._daily_pnl, self._open_count)
 
@@ -114,6 +141,14 @@ class RiskManager:
         risk_usdt  = balance * (C.RISK_PCT / 100) * frac
         sl_dist    = abs(entry - sl)
         qty        = (risk_usdt * C.LEVERAGE) / (sl_dist * entry) if sl_dist * entry > 0 else 0.0
+
+        # CAP ANTI-LIQUIDACIÓN: máx 300 USDT notional por trade
+        # Las liquidaciones de ORCA (-55) y ESPORTS (-85, -104) destruyeron semanas de ganancias
+        notional = qty * entry
+        MAX_NOTIONAL = 300.0   # NUNCA subir sin aumentar SL_ATR_MULT primero
+        if notional > MAX_NOTIONAL:
+            log.info("[sizing] notional clampeado %.0f→%.0f USDT (anti-liquidación)", notional, MAX_NOTIONAL)
+            qty = MAX_NOTIONAL / entry
 
         log.debug(
             "Kelly: balance=%.2f kelly=%.4f frac=%.4f tier_mult=%.2f "
