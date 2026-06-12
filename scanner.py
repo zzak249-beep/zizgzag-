@@ -2,6 +2,13 @@
 QF×JP Bot v6.4 — Scanner
 Escanea todos los pares BingX en paralelo buscando señales QF×JP.
 Incluye: OBI boost, funding rate, circuit-breaker blacklist, batches de 20.
+
+CAMBIOS v6.4.1:
+  - Cap de notional máximo (MAX_NOTIONAL_USDT=19800) antes de open_trade.
+    Evita error 101209 "maximum position value for this leverage is 20000 USDT".
+  - Balance fallback eliminado: si availableMargin < 5 USDT → skip símbolo.
+    Antes caía a C.CAPITAL y el sizing calculaba como si hubiera margen libre,
+    causando error 101204 "Insufficient margin" con muchas posiciones abiertas.
 """
 import asyncio
 import logging
@@ -16,6 +23,10 @@ from position_manager import PositionManager, OpenTrade
 import telegram_client as tg
 
 log = logging.getLogger("scanner")
+
+# Notional máximo por operación (BingX limita según par/leverage)
+# Se usa 19800 para tener margen de seguridad bajo el límite de 20000 USDT
+MAX_NOTIONAL_USDT = 19800.0
 
 # Blacklist por circuit-breaker: symbol → timestamp del último CB
 _cb_blacklist: dict[str, float] = {}
@@ -149,6 +160,15 @@ async def _process_symbol(
         log.info("[%s] Bloqueado por risk: %s", symbol, reason)
         return None
 
+    # ── FIX v6.4.1: balance real sin fallback ─────────────────────────────────
+    #
+    # Antes: si availableMargin=0 (margen agotado por posiciones abiertas),
+    # caía a C.CAPITAL y el sizing calculaba como si hubiera capital libre.
+    # Resultado: 101209 (notional > límite) y 101204 (insufficient margin).
+    #
+    # Ahora: si el margen disponible real es < 5 USDT → skip símbolo.
+    # No tiene sentido intentar abrir si no hay margen libre.
+    # ─────────────────────────────────────────────────────────────────────────
     try:
         balance = await client.get_balance()
     except Exception as e:
@@ -156,8 +176,11 @@ async def _process_symbol(
         return None
 
     if balance < 5.0:
-        log.warning("Balance=%.4f — usando CAPITAL fallback=%.2f", balance, C.CAPITAL)
-        balance = C.CAPITAL
+        log.info(
+            "[%s] Skip — margen disponible insuficiente (%.4f USDT < 5)",
+            symbol, balance,
+        )
+        return None
 
     log.info("Balance activo: %.4f USDT", balance)
 
@@ -167,6 +190,21 @@ async def _process_symbol(
         return None
 
     notional = qty * sig.entry
+
+    # ── FIX v6.4.1: cap de notional máximo ───────────────────────────────────
+    #
+    # BingX limita el valor nocional máximo por posición (normalmente 20000 USDT
+    # dependiendo del par y el apalancamiento). Si el sizing da un notional
+    # superior, recalculamos qty para quedarnos en MAX_NOTIONAL_USDT=19800.
+    # ─────────────────────────────────────────────────────────────────────────
+    if notional > MAX_NOTIONAL_USDT:
+        qty      = client._round_qty(symbol, MAX_NOTIONAL_USDT / sig.entry)
+        notional = qty * sig.entry
+        log.info(
+            "[%s] Notional capeado → qty=%s notional=%.2f USDT (límite BingX)",
+            symbol, qty, notional,
+        )
+
     log.info("[%s] qty=%s notional=%.2f USDT (entry=%s)", symbol, qty, notional, sig.entry)
 
     await tg.notify_signal(sig)
@@ -245,8 +283,8 @@ async def scan_loop(client: BingXClient, risk: RiskManager, pos_mgr: PositionMan
                 log.warning("status notify error: %s", e)
 
         # Procesar en batches de 20 símbolos en paralelo
-        BATCH          = 20
-        signals_found  = 0
+        BATCH         = 20
+        signals_found = 0
 
         for i in range(0, len(symbols), BATCH):
             batch   = symbols[i : i + BATCH]
