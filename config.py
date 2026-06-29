@@ -30,30 +30,39 @@ BASE_URL   = "https://open-api.bingx.com"
 
 # ── Trading
 SYMBOL     = _str("SYMBOL", "BTC-USDT")
-TIMEFRAME  = _str("TIMEFRAME", "5m")        # 1m 3m 5m 15m 30m 1h
-DIRECTION  = _str("DIRECTION", "BOTH")      # LONG | SHORT | BOTH
+TIMEFRAME  = _str("TIMEFRAME", "5m")
+DIRECTION  = _str("DIRECTION", "BOTH")   # LONG | SHORT | BOTH
 LEVERAGE   = _int("LEVERAGE", 10)
 
-# ── Strategy params (matches Pine Script defaults)
+# ── Strategy selector
+# EMA9_VWAP  = solo cruce EMA9 × VWAP
+# PDH_BOS    = solo PDH/PDL Break of Structure + retest
+# BOTH       = PDH_BOS prioritario, EMA9_VWAP como fallback
+STRATEGY   = _str("STRATEGY", "BOTH")
+
+# ── EMA9 × VWAP params
 ATR_LENGTH = _int("ATR_LENGTH", 14)
 ATR_MULT   = _float("ATR_MULT", 2.0)
 EMA_PERIOD = _int("EMA_PERIOD", 9)
-CANDLES    = _int("CANDLES", 300)           # lookback window
+CANDLES    = _int("CANDLES", 300)
+
+# ── PDH BOS Retest params
+PDH_RETEST_ZONE_PCT = _float("PDH_RETEST_ZONE_PCT", 0.15)  # % zona retest
+SL_ATR              = _float("SL_ATR",  1.5)               # SL en ATRs
+TP1_ATR             = _float("TP1_ATR", 3.0)               # TP en ATRs
+EMA8_EXIT           = _bool("EMA8_EXIT", "true")           # exit EMA8 break
 
 # ── Risk
-RISK_PCT          = _float("RISK_PCT", 1.0)          # % equity per trade
-MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)
-MAX_DAILY_LOSS_PCT = _float("MAX_DAILY_LOSS_PCT", 3.0)
+RISK_PCT            = _float("RISK_PCT", 1.0)
+MAX_DAILY_LOSS_PCT  = _float("MAX_DAILY_LOSS_PCT", 3.0)
+FIXED_NOTIONAL_USDT = _float("FIXED_NOTIONAL_USDT", 15.0)
+MIN_NOTIONAL_USDT   = _float("MIN_NOTIONAL_USDT", 10.0)
+MAX_NOTIONAL_USDT   = _float("MAX_NOTIONAL_USDT", 200.0)
 
 # ── Loop timing
-TRAILING_CHECK_SEC = _int("TRAILING_CHECK_SEC", 20)
-SIGNAL_CHECK_SEC   = _int("SIGNAL_CHECK_SEC", 60)
+TRAILING_CHECK_SEC  = _int("TRAILING_CHECK_SEC", 20)
+SIGNAL_CHECK_SEC    = _int("SIGNAL_CHECK_SEC", 60)
 
 # ── Telegram
 TELEGRAM_TOKEN = _str("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT  = _str("TELEGRAM_CHAT_ID")
-
-# ── Notional sizing
-FIXED_NOTIONAL_USDT = _float("FIXED_NOTIONAL_USDT", 15.0)
-MIN_NOTIONAL_USDT   = _float("MIN_NOTIONAL_USDT", 10.0)
-MAX_NOTIONAL_USDT   = _float("MAX_NOTIONAL_USDT", 200.0)
