@@ -34,26 +34,33 @@ class PositionManager:
 
     def calc_qty(self, symbol: str, mark_price: float, atr: float, equity: float) -> float:
         """
-        Risk-based sizing:
-          qty = (equity * risk_pct/100) / (atr * atr_mult)
-        Capped by MAX_NOTIONAL_USDT / mark_price.
-        Rounded to symbol precision.
+        Sizing con floor garantizado de MIN_NOTIONAL_USDT (10 USDT por trade).
+        Usa el mayor entre: risk-based qty y FIXED_NOTIONAL qty.
+        Cap: MAX_NOTIONAL_USDT.
         """
-        risk_usdt = equity * (self.cfg.RISK_PCT / 100.0)
-        sl_usdt   = atr * self.cfg.ATR_MULT
-        if sl_usdt <= 0:
-            log.warning("sl_usdt=0, using min qty")
+        if mark_price <= 0:
             return self._min_qty(symbol)
 
-        qty = risk_usdt / sl_usdt
+        # Risk-based
+        sl_usdt  = atr * self.cfg.ATR_MULT
+        risk_qty = (equity * self.cfg.RISK_PCT / 100.0) / sl_usdt if sl_usdt > 0 else 0.0
 
-        # Notional cap
-        if mark_price > 0:
-            qty = min(qty, self.cfg.MAX_NOTIONAL_USDT / mark_price)
+        # Fixed notional (15 USDT target)
+        fixed_qty = getattr(self.cfg, "FIXED_NOTIONAL_USDT", 15.0) / mark_price
 
-        # Round to symbol precision
+        # Minimum floor (10 USDT guaranteed)
+        min_qty_notional = getattr(self.cfg, "MIN_NOTIONAL_USDT", 10.0) / mark_price
+
+        # Max cap
+        max_qty = getattr(self.cfg, "MAX_NOTIONAL_USDT", 200.0) / mark_price
+
+        qty = max(risk_qty, fixed_qty, min_qty_notional)
+        qty = min(qty, max_qty)
         qty = self._round_qty(symbol, qty)
-        return max(qty, self._min_qty(symbol))
+        qty = max(qty, self._min_qty(symbol))
+
+        log.info(f"calc_qty {symbol}: qty={qty} notional={qty*mark_price:.2f} USDT")
+        return qty
 
     def _sym_info(self, symbol: str) -> dict:
         try:
