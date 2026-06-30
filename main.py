@@ -1,9 +1,10 @@
 """
-daring-spontaneity — Dual Strategy Bot
-========================================
+daring-spontaneity — Triple Strategy Bot
+==========================================
 STRATEGY=EMA9_VWAP  → cruce EMA9 × VWAP + ATR trail
-STRATEGY=PDH_BOS    → PDH/PDL Break of Structure + retest EMA8 exit
-STRATEGY=BOTH       → PDH_BOS prioritario, EMA9_VWAP como fallback
+STRATEGY=PDH_BOS    → PDH/PDL Break of Structure + retest + EMA8 exit
+STRATEGY=FIB        → Fibonacci Golden Pocket (0.5-0.618) + HTF trend
+STRATEGY=BOTH       → PDH_BOS → FIB → EMA9_VWAP (por prioridad)
 """
 
 import logging
@@ -16,6 +17,7 @@ from position_manager import PositionManager
 from risk_manager     import RiskManager
 from strategy         import get_signal          # EMA9×VWAP
 import strategy_pdh_bos as pdh_bos              # PDH BOS Retest
+import strategy_fib     as fib                  # Fibonacci Golden Pocket
 from telegram_client  import TelegramClient
 
 logging.basicConfig(
@@ -30,8 +32,9 @@ SIDES = {
     "SHORT": ["SHORT"],
 }
 
-# Tracks which strategy opened each side: "pdh_bos" | "ema9_vwap"
-_entry_reason: dict[str, str] = {}
+# Tracks strategy + fib TP per side
+_entry_reason: dict[str, str]   = {}
+_fib_tp:       dict[str, float] = {}
 
 
 def main():
@@ -42,8 +45,8 @@ def main():
     risk    = RiskManager(config)
     tg      = TelegramClient(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT)
 
-    active_sides   = SIDES.get(config.DIRECTION, ["LONG", "SHORT"])
-    last_signal_t  = 0.0
+    active_sides  = SIDES.get(config.DIRECTION, ["LONG", "SHORT"])
+    last_signal_t = 0.0
     last_trail_notif: dict[str, float] = {}
 
     tg.startup(config.BOT_NAME, config.SYMBOL, config.TIMEFRAME, config.LEVERAGE)
@@ -54,43 +57,57 @@ def main():
             equity = client.get_equity()
             price  = client.get_mark_price(config.SYMBOL)
 
-            # ── 1. Trail stop + EMA8 exit (every tick) ───────────────────────
+            # ── 1. Manage open positions every tick ───────────────────────────
             for side in active_sides:
                 pos = pos_mgr.get_position(config.SYMBOL, side)
                 if pos is None:
                     continue
 
-                candles = client.get_klines(config.SYMBOL, config.TIMEFRAME, 50)
+                candles  = client.get_klines(config.SYMBOL, config.TIMEFRAME, 60)
                 sig_data = get_signal(candles, config.EMA_PERIOD, config.ATR_LENGTH)
-                atr = sig_data.get("atr") or 0
+                atr      = sig_data.get("atr") or 0
+
+                reason = _entry_reason.get(side, "")
 
                 # ATR trail stop
                 if atr:
                     new_stop, hit = pos_mgr.tick_trail(config.SYMBOL, side, price, atr)
 
                     prev = last_trail_notif.get(side)
-                    if new_stop and (prev is None or abs(new_stop - prev) / prev > 0.003):
-                        tg.trail_update(config.BOT_NAME, config.SYMBOL, side, price, new_stop)
+                    if new_stop and (prev is None or
+                                     abs(new_stop - prev) / (prev or 1) > 0.003):
+                        tg.trail_update(config.BOT_NAME, config.SYMBOL,
+                                        side, price, new_stop)
                         last_trail_notif[side] = new_stop
 
                     if hit:
-                        log.info(f"Trail stop hit — {side}  price={price}  stop={new_stop}")
-                        pnl = pos["unrealizedPnl"]
+                        log.info(f"Trail stop hit — {side}  price={price:.6g}  stop={new_stop:.6g}")
                         _close(side, pos, config.SYMBOL, price, "Trail Stop",
                                pos_mgr, risk, tg)
                         last_trail_notif.pop(side, None)
                         _entry_reason.pop(side, None)
+                        _fib_tp.pop(side, None)
                         continue
 
-                # EMA8 exit — solo si la posición fue abierta por PDH_BOS
-                reason = _entry_reason.get(side, "")
+                # EMA8 exit — posiciones PDH_BOS
                 if config.EMA8_EXIT and reason == "pdh_bos":
                     if pdh_bos.check_ema8_exit(client, config.SYMBOL, side):
-                        log.info(f"EMA8 break exit — {side}")
-                        pnl = pos["unrealizedPnl"]
+                        log.info(f"EMA8 exit — {side}")
                         _close(side, pos, config.SYMBOL, price, "EMA8 Exit",
                                pos_mgr, risk, tg)
                         _entry_reason.pop(side, None)
+                        continue
+
+                # Fibonacci TP exit — posiciones FIB
+                if reason == "fib":
+                    tp = _fib_tp.get(side)
+                    if tp and fib.check_tp_exit(candles, side, tp):
+                        log.info(f"Fib TP reached — {side}  tp={tp:.6g}")
+                        _close(side, pos, config.SYMBOL, price, "Fib TP",
+                               pos_mgr, risk, tg)
+                        _entry_reason.pop(side, None)
+                        _fib_tp.pop(side, None)
+                        continue
 
             # ── 2. Signal check ───────────────────────────────────────────────
             if now - last_signal_t < config.SIGNAL_CHECK_SEC:
@@ -99,18 +116,19 @@ def main():
 
             last_signal_t = now
 
-            allowed, reason = risk.can_trade(equity)
+            allowed, block_reason = risk.can_trade(equity)
             if not allowed:
-                log.warning(f"Trading blocked: {reason}")
-                tg.blocked(config.BOT_NAME, reason)
+                log.warning(f"Trading blocked: {block_reason}")
+                tg.blocked(config.BOT_NAME, block_reason)
                 time.sleep(config.TRAILING_CHECK_SEC)
                 continue
 
             signal = None
             atr    = 0.0
             source = ""
+            fib_tp_price = 0.0
 
-            # ── PDH BOS (mayor prioridad) ─────────────────────────────────────
+            # ── PDH BOS — prioridad 1 ─────────────────────────────────────────
             if config.STRATEGY in ("PDH_BOS", "BOTH"):
                 pdh_sig = pdh_bos.get_signal(client, config.SYMBOL, config)
                 if pdh_sig["signal"]:
@@ -120,20 +138,45 @@ def main():
                     log.info(
                         f"PDH_BOS  signal={signal}  "
                         f"bos={pdh_sig['bos_level']:.6g}  "
-                        f"ema8={pdh_sig['ema8']:.6g}  "
-                        f"atr={atr:.6g}"
+                        f"ema8={pdh_sig['ema8']:.6g}  atr={atr:.4g}"
                     )
                 else:
-                    bos_state = (f"BOS_ACTIVE level={pdh_sig['bos_level']:.6g} (esperando retest)"
-                                if pdh_sig["bos_active"] else "sin BOS")
+                    bos_st = (f"BOS_ACTIVE level={pdh_sig['bos_level']:.6g}"
+                              if pdh_sig.get("bos_active") else "sin BOS")
                     log.info(
-                        f"PDH_BOS  signal=None  {bos_state}  "
+                        f"PDH_BOS  None  {bos_st}  "
                         f"pdh={pdh_sig['pdh']:.6g}  pdl={pdh_sig['pdl']:.6g}  "
-                        f"ema8={pdh_sig['ema8']:.6g}  atr={pdh_sig['atr']:.4g}  "
-                        f"price={price:.6g}"
+                        f"ema8={pdh_sig['ema8']:.6g}  price={price:.6g}"
                     )
 
-            # ── EMA9×VWAP (fallback) ──────────────────────────────────────────
+            # ── Fibonacci — prioridad 2 ───────────────────────────────────────
+            if not signal and config.STRATEGY in ("FIB", "BOTH"):
+                try:
+                    c5m = client.get_klines(config.SYMBOL, "5m",  120)
+                    c1h = client.get_klines(config.SYMBOL, "1h",  60)
+                    fib_sig = fib.get_signal(c5m, c1h, config)
+                    if fib_sig["signal"]:
+                        signal      = fib_sig["signal"]
+                        atr         = fib_sig["atr"]
+                        fib_tp_price = fib_sig["tp_price"]
+                        source      = "fib"
+                        log.info(
+                            f"FIB  signal={signal}  "
+                            f"pocket={fib_sig['fib_618']:.6g}-{fib_sig['fib_50']:.6g}  "
+                            f"rsi={fib_sig['rsi']:.1f}  trend={fib_sig['trend']}  "
+                            f"tp={fib_tp_price:.6g}  atr={atr:.4g}"
+                        )
+                    else:
+                        log.info(
+                            f"FIB  None  "
+                            f"swing={fib_sig['swing_low']:.6g}-{fib_sig['swing_high']:.6g}  "
+                            f"pocket={fib_sig['fib_618']:.6g}-{fib_sig['fib_50']:.6g}  "
+                            f"rsi={fib_sig['rsi']:.1f}  trend={fib_sig['trend']}"
+                        )
+                except Exception as e:
+                    log.warning(f"FIB check error: {e}")
+
+            # ── EMA9×VWAP — fallback ──────────────────────────────────────────
             if not signal and config.STRATEGY in ("EMA9_VWAP", "BOTH"):
                 candles  = client.get_klines(config.SYMBOL, config.TIMEFRAME, config.CANDLES)
                 sig_data = get_signal(candles, config.EMA_PERIOD, config.ATR_LENGTH)
@@ -144,32 +187,35 @@ def main():
                     log.info(
                         f"EMA9_VWAP  signal={signal}  "
                         f"ema9={sig_data['ema9']:.6g}  "
-                        f"vwap={sig_data['vwap']:.6g}  "
-                        f"atr={atr:.6g}"
+                        f"vwap={sig_data['vwap']:.6g}  atr={atr:.4g}"
                     )
                 else:
                     log.info(
-                        f"Signal=None  EMA9={sig_data['ema9']:.6g}  "
-                        f"VWAP={sig_data['vwap']:.6g}  "
-                        f"ATR={sig_data['atr']}  price={price:.6g}"
+                        f"EMA9_VWAP  None  "
+                        f"ema9={sig_data['ema9']:.6g}  "
+                        f"vwap={sig_data['vwap']:.6g}  price={price:.6g}"
                     )
 
             if not signal or not atr:
                 time.sleep(config.TRAILING_CHECK_SEC)
                 continue
 
-            # ── Ejecutar señal ────────────────────────────────────────────────
+            # ── Execute signal ────────────────────────────────────────────────
             if signal == "LONG" and "LONG" in active_sides:
                 opened = _handle_entry("LONG", "SHORT", price, atr, equity,
                                        pos_mgr, risk, tg)
                 if opened:
                     _entry_reason["LONG"] = source
+                    if source == "fib" and fib_tp_price:
+                        _fib_tp["LONG"] = fib_tp_price
 
             elif signal == "SHORT" and "SHORT" in active_sides:
                 opened = _handle_entry("SHORT", "LONG", price, atr, equity,
                                        pos_mgr, risk, tg)
                 if opened:
                     _entry_reason["SHORT"] = source
+                    if source == "fib" and fib_tp_price:
+                        _fib_tp["SHORT"] = fib_tp_price
 
         except KeyboardInterrupt:
             log.info("Stopping.")
@@ -189,26 +235,31 @@ def _handle_entry(enter_side: str, exit_side: str, price: float, atr: float,
                   risk: RiskManager, tg: TelegramClient) -> bool:
     sym = config.SYMBOL
 
-    # Cierra lado contrario si existe (reversal)
     opp = pos_mgr.get_position(sym, exit_side)
     if opp:
-        pnl = opp["unrealizedPnl"]
-        _close(exit_side, opp, sym, price, f"Reversal→{enter_side}", pos_mgr, risk, tg)
+        _close(exit_side, opp, sym, price, f"Reversal→{enter_side}",
+               pos_mgr, risk, tg)
         _entry_reason.pop(exit_side, None)
+        _fib_tp.pop(exit_side, None)
 
     if pos_mgr.has_position(sym, enter_side):
         log.info(f"Already {enter_side} — skip")
         return False
 
     qty = pos_mgr.calc_qty(sym, price, atr, equity)
-    if enter_side == "LONG":
-        pos_mgr.open_long(sym, qty)
-    else:
-        pos_mgr.open_short(sym, qty)
+    if not qty:
+        return False
 
-    stop, _ = pos_mgr.tick_trail(sym, enter_side, price, atr)
-    tg.entry(config.BOT_NAME, sym, enter_side, price, qty, stop, equity)
-    return True
+    if enter_side == "LONG":
+        ok = pos_mgr.open_long(sym, qty)
+    else:
+        ok = pos_mgr.open_short(sym, qty)
+
+    if ok:
+        stop, _ = pos_mgr.tick_trail(sym, enter_side, price, atr)
+        tg.entry(config.BOT_NAME, sym, enter_side, price, qty, stop, equity)
+
+    return ok
 
 
 def _close(side: str, pos: dict, sym: str, price: float, reason: str,
