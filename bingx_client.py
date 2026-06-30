@@ -22,6 +22,9 @@ class BingXClient:
         self.base_url   = base_url.rstrip("/")
         self._session   = requests.Session()
         self._session.headers.update({"X-BX-APIKEY": api_key})
+        self._equity_cache = None
+        self._equity_ts    = 0.0
+        self._price_cache  = {}
 
     # ── Signing ───────────────────────────────────────────────
 
@@ -39,13 +42,16 @@ class BingXClient:
 
     # ── HTTP ──────────────────────────────────────────────────
 
-    def _get(self, path: str, params: dict = None) -> dict:
+    def _get(self, path: str, params: dict = None, _retry: int = 0) -> dict:
         p = dict(params or {})
         p["timestamp"] = self._ts()
         p["signature"] = self._sign(p)
         r = self._session.get(f"{self.base_url}{path}", params=p, timeout=10)
         r.raise_for_status()
         d = r.json()
+        if d.get("code") == 100410 and _retry < 3:
+            time.sleep(2 * (_retry + 1))  # backoff: 2s, 4s, 6s
+            return self._get(path, params, _retry + 1)
         if d.get("code") != 0:
             raise RuntimeError(f"BingX [{d.get('code')}] {d.get('msg')}")
         return d.get("data") or {}
@@ -87,8 +93,14 @@ class BingXClient:
         return sorted(candles, key=lambda x: x["timestamp"])
 
     def get_mark_price(self, symbol: str) -> float:
+        # Cache 5s per symbol — price doesn't need sub-5s freshness for this bot
+        cached = self._price_cache.get(symbol)
+        if cached and time.time() - cached[1] < 5:
+            return cached[0]
         d = self._get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
-        return float(d.get("markPrice", 0))
+        price = float(d.get("markPrice", 0))
+        self._price_cache[symbol] = (price, time.time())
+        return price
 
     def get_symbol_info(self, symbol: str) -> dict:
         data = self._get("/openApi/swap/v2/quote/contracts")
@@ -115,8 +127,14 @@ class BingXClient:
         return {}
 
     def get_equity(self) -> float:
+        # Cache 15s — avoids hammering /balance every 30s loop tick
+        if self._equity_cache is not None and time.time() - self._equity_ts < 15:
+            return self._equity_cache
         b = self.get_balance_data()
-        return float(b.get("equity", b.get("balance", 0)))
+        eq = float(b.get("equity", b.get("balance", 0)))
+        self._equity_cache = eq
+        self._equity_ts    = time.time()
+        return eq
 
     def get_available_margin(self) -> float:
         b = self.get_balance_data()
