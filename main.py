@@ -123,6 +123,15 @@ def main():
                         f"ema8={pdh_sig['ema8']:.6g}  "
                         f"atr={atr:.6g}"
                     )
+                else:
+                    bos_state = (f"BOS_ACTIVE level={pdh_sig['bos_level']:.6g} (esperando retest)"
+                                if pdh_sig["bos_active"] else "sin BOS")
+                    log.info(
+                        f"PDH_BOS  signal=None  {bos_state}  "
+                        f"pdh={pdh_sig['pdh']:.6g}  pdl={pdh_sig['pdl']:.6g}  "
+                        f"ema8={pdh_sig['ema8']:.6g}  atr={pdh_sig['atr']:.4g}  "
+                        f"price={price:.6g}"
+                    )
 
             # ── EMA9×VWAP (fallback) ──────────────────────────────────────────
             if not signal and config.STRATEGY in ("EMA9_VWAP", "BOTH"):
