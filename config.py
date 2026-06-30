@@ -52,6 +52,12 @@ SL_ATR              = _float("SL_ATR",  1.5)               # SL en ATRs
 TP1_ATR             = _float("TP1_ATR", 3.0)               # TP en ATRs
 EMA8_EXIT           = _bool("EMA8_EXIT", "true")           # exit EMA8 break
 
+# ── Unicorn Model params
+UNICORN_PIVOT_LEN   = _int("UNICORN_PIVOT_LEN",   5)     # velas para pivot HTF
+UNICORN_SWEEP_LB    = _int("UNICORN_SWEEP_LB",   30)     # lookback sweep en 5m
+UNICORN_REQUIRE_FVG = _bool("UNICORN_REQUIRE_FVG","true") # requiere FVG (modo Unicorn)
+UNICORN_RR          = _float("UNICORN_RR",        2.0)   # R/R target
+
 # ── Fibonacci Golden Pocket params
 FIB_LOOKBACK      = _int("FIB_LOOKBACK", 50)       # velas para detectar swing
 FIB_ZONE_PCT      = _float("FIB_ZONE_PCT", 0.001)  # tolerancia zona 0.1%
