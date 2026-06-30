@@ -17,7 +17,8 @@ from position_manager import PositionManager
 from risk_manager     import RiskManager
 from strategy         import get_signal          # EMA9×VWAP
 import strategy_pdh_bos as pdh_bos              # PDH BOS Retest
-import strategy_fib     as fib                  # Fibonacci Golden Pocket
+import strategy_fib     as fib
+import strategy_unicorn as unicorn                  # Fibonacci Golden Pocket
 from telegram_client  import TelegramClient
 
 logging.basicConfig(
@@ -32,9 +33,10 @@ SIDES = {
     "SHORT": ["SHORT"],
 }
 
-# Tracks strategy + fib TP per side
+# Tracks strategy + TP per side
 _entry_reason: dict[str, str]   = {}
 _fib_tp:       dict[str, float] = {}
+_uni_tp:       dict[str, float] = {}
 
 
 def main():
@@ -98,7 +100,7 @@ def main():
                         _entry_reason.pop(side, None)
                         continue
 
-                # Fibonacci TP exit — posiciones FIB
+                # Fibonacci TP exit
                 if reason == "fib":
                     tp = _fib_tp.get(side)
                     if tp and fib.check_tp_exit(candles, side, tp):
@@ -107,6 +109,17 @@ def main():
                                pos_mgr, risk, tg)
                         _entry_reason.pop(side, None)
                         _fib_tp.pop(side, None)
+                        continue
+
+                # Unicorn TP exit
+                if reason == "unicorn":
+                    tp = _uni_tp.get(side)
+                    if tp and unicorn.check_tp_exit(candles, side, tp):
+                        log.info(f"Unicorn TP reached — {side}  tp={tp:.6g}")
+                        _close(side, pos, config.SYMBOL, price, "Unicorn TP",
+                               pos_mgr, risk, tg)
+                        _entry_reason.pop(side, None)
+                        _uni_tp.pop(side, None)
                         continue
 
             # ── 2. Signal check ───────────────────────────────────────────────
@@ -127,8 +140,35 @@ def main():
             atr    = 0.0
             source = ""
             fib_tp_price = 0.0
+            uni_tp_price = 0.0
 
-            # ── PDH BOS — prioridad 1 ─────────────────────────────────────────
+            # ── UNICORN — prioridad 1 (Sweep+Breaker+FVG) ────────────────────
+            if config.STRATEGY in ("UNICORN", "BOTH"):
+                try:
+                    c5m = client.get_klines(config.SYMBOL, "5m",  200)
+                    c1h = client.get_klines(config.SYMBOL, "1h",   60)
+                    u_sig = unicorn.get_signal(c5m, c1h, config)
+                    if u_sig["signal"]:
+                        signal      = u_sig["signal"]
+                        atr         = u_sig["atr"]
+                        uni_tp_price = u_sig["tp_price"]
+                        source      = "unicorn"
+                        fvg_tag = "+FVG" if u_sig["has_fvg"] else ""
+                        log.info(
+                            f"UNICORN{fvg_tag}  signal={signal}  "
+                            f"swept={u_sig['swept_level']:.6g}  "
+                            f"breaker={u_sig['breaker_bottom']:.6g}-{u_sig['breaker_top']:.6g}  "
+                            f"tp={uni_tp_price:.6g}  atr={atr:.4g}"
+                        )
+                    else:
+                        log.info(
+                            f"UNICORN  None  "
+                            f"atr={u_sig['atr']:.4g}  price={price:.6g}"
+                        )
+                except Exception as e:
+                    log.warning(f"UNICORN check error: {e}")
+
+            # ── PDH BOS — prioridad 2 ─────────────────────────────────────────
             if config.STRATEGY in ("PDH_BOS", "BOTH"):
                 pdh_sig = pdh_bos.get_signal(client, config.SYMBOL, config)
                 if pdh_sig["signal"]:
@@ -149,7 +189,7 @@ def main():
                         f"ema8={pdh_sig['ema8']:.6g}  price={price:.6g}"
                     )
 
-            # ── Fibonacci — prioridad 2 ───────────────────────────────────────
+            # ── Fibonacci — prioridad 3 ───────────────────────────────────────
             if not signal and config.STRATEGY in ("FIB", "BOTH"):
                 try:
                     c5m = client.get_klines(config.SYMBOL, "5m",  120)
@@ -176,7 +216,7 @@ def main():
                 except Exception as e:
                     log.warning(f"FIB check error: {e}")
 
-            # ── EMA9×VWAP — fallback ──────────────────────────────────────────
+            # ── EMA9×VWAP — fallback (prioridad 4) ─────────────────────────────
             if not signal and config.STRATEGY in ("EMA9_VWAP", "BOTH"):
                 candles  = client.get_klines(config.SYMBOL, config.TIMEFRAME, config.CANDLES)
                 sig_data = get_signal(candles, config.EMA_PERIOD, config.ATR_LENGTH)
@@ -206,16 +246,16 @@ def main():
                                        pos_mgr, risk, tg)
                 if opened:
                     _entry_reason["LONG"] = source
-                    if source == "fib" and fib_tp_price:
-                        _fib_tp["LONG"] = fib_tp_price
+                    if source == "fib"     and fib_tp_price:  _fib_tp["LONG"] = fib_tp_price
+                    if source == "unicorn" and uni_tp_price:  _uni_tp["LONG"] = uni_tp_price
 
             elif signal == "SHORT" and "SHORT" in active_sides:
                 opened = _handle_entry("SHORT", "LONG", price, atr, equity,
                                        pos_mgr, risk, tg)
                 if opened:
                     _entry_reason["SHORT"] = source
-                    if source == "fib" and fib_tp_price:
-                        _fib_tp["SHORT"] = fib_tp_price
+                    if source == "fib"     and fib_tp_price:  _fib_tp["SHORT"] = fib_tp_price
+                    if source == "unicorn" and uni_tp_price:  _uni_tp["SHORT"] = uni_tp_price
 
         except KeyboardInterrupt:
             log.info("Stopping.")
@@ -241,6 +281,7 @@ def _handle_entry(enter_side: str, exit_side: str, price: float, atr: float,
                pos_mgr, risk, tg)
         _entry_reason.pop(exit_side, None)
         _fib_tp.pop(exit_side, None)
+        _uni_tp.pop(exit_side, None)
 
     if pos_mgr.has_position(sym, enter_side):
         log.info(f"Already {enter_side} — skip")
