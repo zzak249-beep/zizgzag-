@@ -57,6 +57,7 @@ def get_signal(client, symbol: str, config) -> dict:
         "signal": None, "entry_price": 0, "sl_price": 0,
         "tp_price": 0, "pdh": 0, "pdl": 0,
         "bos_level": 0, "ema8": 0, "atr": 0,
+        "bos_active": False,
     }
 
     try:
@@ -81,13 +82,7 @@ def get_signal(client, symbol: str, config) -> dict:
         bos_long  = h1_last["close"] > pdh and h1_prev["close"] <= pdh
         bos_short = h1_last["close"] < pdl and h1_prev["close"] >= pdl
 
-        if not bos_long and not bos_short:
-            return result
-
-        bos_level = pdh if bos_long else pdl
-        result["bos_level"] = bos_level
-
-        # ── 3. 5m retest entry ────────────────────────────────────────────────
+        # ── 3. EMA8 / ATR (5m) — always computed for logging/context ───────────
         m5 = client.get_klines(symbol, "5m", limit=60)
         if len(m5) < 15:
             return result
@@ -97,6 +92,13 @@ def get_signal(client, symbol: str, config) -> dict:
         atr = _atr(m5[-20:], 14)
         result["ema8"] = ema8
         result["atr"]  = atr
+
+        if not bos_long and not bos_short:
+            return result
+
+        bos_level = pdh if bos_long else pdl
+        result["bos_level"]  = bos_level
+        result["bos_active"] = True
 
         current_close = m5[-2]["close"]   # last confirmed 5m candle
         current_low   = m5[-2]["low"]
