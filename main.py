@@ -37,6 +37,7 @@ SIDES = {
 _entry_reason: dict[str, str]   = {}
 _fib_tp:       dict[str, float] = {}
 _uni_tp:       dict[str, float] = {}
+_last_close:   dict[str, float] = {}  # cooldown: timestamp of last close per side
 
 
 def main():
@@ -219,7 +220,9 @@ def main():
             # ── EMA9×VWAP — fallback (prioridad 4) ─────────────────────────────
             if not signal and config.STRATEGY in ("EMA9_VWAP", "BOTH"):
                 candles  = client.get_klines(config.SYMBOL, config.TIMEFRAME, config.CANDLES)
-                sig_data = get_signal(candles, config.EMA_PERIOD, config.ATR_LENGTH)
+                c1h      = client.get_klines(config.SYMBOL, "1h", 60)
+                sig_data = get_signal(candles, config.EMA_PERIOD, config.ATR_LENGTH,
+                                      candles_1h=c1h, direction=config.DIRECTION)
                 if sig_data["signal"]:
                     signal = sig_data["signal"]
                     atr    = sig_data["atr"]
@@ -227,13 +230,15 @@ def main():
                     log.info(
                         f"EMA9_VWAP  signal={signal}  "
                         f"ema9={sig_data['ema9']:.6g}  "
-                        f"vwap={sig_data['vwap']:.6g}  atr={atr:.4g}"
+                        f"vwap={sig_data['vwap']:.6g}  "
+                        f"trend_1h={sig_data['trend_1h']}  atr={atr:.4g}"
                     )
                 else:
                     log.info(
                         f"EMA9_VWAP  None  "
-                        f"ema9={sig_data['ema9']:.6g}  "
-                        f"vwap={sig_data['vwap']:.6g}  price={price:.6g}"
+                        f"ema9={sig_data.get('ema9',0):.6g}  "
+                        f"vwap={sig_data.get('vwap',0):.6g}  "
+                        f"trend_1h={sig_data.get('trend_1h','?')}  price={price:.6g}"
                     )
 
             if not signal or not atr:
@@ -273,7 +278,16 @@ def main():
 def _handle_entry(enter_side: str, exit_side: str, price: float, atr: float,
                   equity: float, pos_mgr: PositionManager,
                   risk: RiskManager, tg: TelegramClient) -> bool:
+    import time as _time
     sym = config.SYMBOL
+
+    # Cooldown: no abrir en el mismo sentido si cerró hace menos de N segundos
+    cooldown = getattr(config, "TRADE_COOLDOWN_SEC", 300)
+    last = _last_close.get(enter_side, 0)
+    if _time.time() - last < cooldown:
+        remaining = int(cooldown - (_time.time() - last))
+        log.info(f"Cooldown {enter_side} — {remaining}s restantes")
+        return False
 
     opp = pos_mgr.get_position(sym, exit_side)
     if opp:
@@ -305,6 +319,7 @@ def _handle_entry(enter_side: str, exit_side: str, price: float, atr: float,
 
 def _close(side: str, pos: dict, sym: str, price: float, reason: str,
            pos_mgr: PositionManager, risk: RiskManager, tg: TelegramClient):
+    import time as _time
     pnl = pos["unrealizedPnl"]
     if side == "LONG":
         pos_mgr.close_long(sym, pos["size"], reason)
@@ -312,6 +327,7 @@ def _close(side: str, pos: dict, sym: str, price: float, reason: str,
         pos_mgr.close_short(sym, pos["size"], reason)
     risk.record_trade(pnl)
     tg.exit_trade(config.BOT_NAME, sym, side, price, reason, pnl)
+    _last_close[side] = _time.time()  # start cooldown
 
 
 if __name__ == "__main__":
