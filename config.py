@@ -64,7 +64,9 @@ FIB_ZONE_PCT      = _float("FIB_ZONE_PCT", 0.001)  # tolerancia zona 0.1%
 FIB_RSI_LONG_MIN  = _float("FIB_RSI_LONG_MIN", 35) # RSI mín para LONG
 FIB_RSI_LONG_MAX  = _float("FIB_RSI_LONG_MAX", 60) # RSI máx para LONG
 FIB_RSI_SHORT_MIN = _float("FIB_RSI_SHORT_MIN", 40)
-FIB_RSI_SHORT_MAX = _float("FIB_RSI_SHORT_MAX", 65)
+FIB_RSI_SHORT_MAX     = _float("FIB_RSI_SHORT_MAX", 65)
+FIB_EXTREME_RSI_LONG  = _float("FIB_EXTREME_RSI_LONG",  28) # override tendencia si RSI <= 28
+FIB_EXTREME_RSI_SHORT = _float("FIB_EXTREME_RSI_SHORT", 72) # override tendencia si RSI >= 72
 
 # ── Risk
 RISK_PCT            = _float("RISK_PCT", 1.0)
