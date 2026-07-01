@@ -132,12 +132,15 @@ def get_signal(candles_5m: list[dict],
     rsi_long_max = getattr(config, "FIB_RSI_LONG_MAX", 60)
     vol_ok = current_vol > vol_avg * 0.8
 
-    long_in_pocket = fib_618 - zone <= current_close <= fib_50 + zone
-    long_candle    = current_close > current_open     # vela alcista
-    long_rsi_ok    = rsi_long_min <= rsi <= rsi_long_max
-    long_trend_ok  = trend == "UP"
+    long_in_pocket  = fib_618 - zone <= current_close <= fib_50 + zone
+    long_candle     = current_close > current_open     # vela alcista
+    long_rsi_ok     = rsi_long_min <= rsi <= rsi_long_max
+    long_trend_ok   = trend == "UP"
+    # Override: RSI extremadamente sobrevendido ignora filtro de tendencia
+    extreme_oversold = rsi <= getattr(config, "FIB_EXTREME_RSI_LONG", 28)
+    long_trend_final = long_trend_ok or extreme_oversold
 
-    if long_in_pocket and long_candle and long_rsi_ok and long_trend_ok and vol_ok:
+    if long_in_pocket and long_candle and long_rsi_ok and long_trend_final and vol_ok:
         sl_price = fib_786 - atr * 0.5      # SL bajo el 0.786
         tp_price = sh                         # TP: máximo anterior (0%)
         result.update({
@@ -157,12 +160,14 @@ def get_signal(candles_5m: list[dict],
     rsi_short_min = getattr(config, "FIB_RSI_SHORT_MIN", 40)
     rsi_short_max = getattr(config, "FIB_RSI_SHORT_MAX", 65)
 
-    short_in_pocket = fib_50_inv - zone <= current_close <= fib_618_inv + zone
-    short_candle    = current_close < current_open    # vela bajista
-    short_rsi_ok    = rsi_short_min <= rsi <= rsi_short_max
-    short_trend_ok  = trend == "DOWN"
+    short_in_pocket  = fib_50_inv - zone <= current_close <= fib_618_inv + zone
+    short_candle     = current_close < current_open    # vela bajista
+    short_rsi_ok     = rsi_short_min <= rsi <= rsi_short_max
+    short_trend_ok   = trend == "DOWN"
+    extreme_overbought = rsi >= getattr(config, "FIB_EXTREME_RSI_SHORT", 72)
+    short_trend_final  = short_trend_ok or extreme_overbought
 
-    if short_in_pocket and short_candle and short_rsi_ok and short_trend_ok and vol_ok:
+    if short_in_pocket and short_candle and short_rsi_ok and short_trend_final and vol_ok:
         sl_price = fib_786_inv + atr * 0.5   # SL sobre el 0.786 (invertido)
         tp_price = sl                          # TP: mínimo anterior (0% invertido)
         result.update({
