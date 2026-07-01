@@ -75,6 +75,9 @@ FIXED_NOTIONAL_USDT = _float("FIXED_NOTIONAL_USDT", 15.0)
 MIN_NOTIONAL_USDT   = _float("MIN_NOTIONAL_USDT", 10.0)
 MAX_NOTIONAL_USDT   = _float("MAX_NOTIONAL_USDT", 200.0)
 
+# ── Cooldown (evita trades consecutivos en el mismo sentido)
+TRADE_COOLDOWN_SEC  = _int("TRADE_COOLDOWN_SEC", 300)  # 5 min entre trades
+
 # ── Loop timing
 TRAILING_CHECK_SEC  = _int("TRAILING_CHECK_SEC", 30)
 SIGNAL_CHECK_SEC    = _int("SIGNAL_CHECK_SEC", 90)
