@@ -95,13 +95,16 @@ def _cross_under(a, b) -> bool:
 # Public API
 # ────────────────────────────────────────────────────────────
 
-def get_signal(candles: list, ema_period: int = 9, atr_period: int = 14) -> dict:
+def get_signal(candles: list, ema_period: int = 9, atr_period: int = 14,
+               candles_1h: list = None, direction: str = "BOTH") -> dict:
     """
-    candles: list of dicts {timestamp, open, high, low, close, volume}
-             sorted oldest → newest.
-    Returns {signal, ema9, vwap, atr, close}
+    candles:    5m candles sorted oldest→newest
+    candles_1h: optional 1H candles for HTF trend filter
+    direction:  "LONG" | "SHORT" | "BOTH"
+    Returns {signal, ema9, vwap, atr, close, trend_1h}
     """
-    empty = {"signal": None, "ema9": None, "vwap": None, "atr": None, "close": None}
+    empty = {"signal": None, "ema9": None, "vwap": None,
+             "atr": None, "close": None, "trend_1h": "NONE"}
     if len(candles) < max(ema_period, atr_period) + 5:
         return empty
 
@@ -115,22 +118,43 @@ def get_signal(candles: list, ema_period: int = 9, atr_period: int = 14) -> dict
     vwap_s = _vwap(hi, lo, cl, vo, ts)
     atr_s  = _atr(hi, lo, cl, atr_period)
 
-    # Need last 2 values for crossover
+    # ── ATR chop filter: no entrar si mercado lateral (ATR muy bajo) ──────────
+    atr_now = atr_s[-1]
+    price   = cl[-1]
+    atr_pct = atr_now / price if price > 0 else 0
+    if atr_pct < 0.002:   # ATR < 0.2% del precio = demasiado choppy
+        return {**empty, "ema9": ema9_s[-1], "vwap": vwap_s[-1],
+                "atr": atr_now, "close": price}
+
+    # ── 1H HTF trend filter ───────────────────────────────────────────────────
+    trend_1h = "NONE"
+    if candles_1h and len(candles_1h) >= 50:
+        cl_1h = [c["close"] for c in candles_1h]
+        ema20 = _ema(cl_1h, 20)[-1]
+        ema50 = _ema(cl_1h, 50)[-1]
+        trend_1h = "UP" if ema20 > ema50 else "DOWN"
+
+    # ── Crossover detection ───────────────────────────────────────────────────
     e2 = ema9_s[-2:]
     v2 = vwap_s[-2:]
 
     signal = None
-    if _cross_over(e2, v2):
-        signal = "LONG"
-    elif _cross_under(e2, v2):
-        signal = "SHORT"
+    if _cross_over(e2, v2) and direction in ("LONG", "BOTH"):
+        # LONG solo si tendencia 1H es UP o no hay filtro
+        if trend_1h in ("UP", "NONE"):
+            signal = "LONG"
+    elif _cross_under(e2, v2) and direction in ("SHORT", "BOTH"):
+        # SHORT solo si tendencia 1H es DOWN o no hay filtro
+        if trend_1h in ("DOWN", "NONE"):
+            signal = "SHORT"
 
     return {
-        "signal": signal,
-        "ema9":   ema9_s[-1],
-        "vwap":   vwap_s[-1],
-        "atr":    atr_s[-1],
-        "close":  cl[-1],
+        "signal":   signal,
+        "ema9":     ema9_s[-1],
+        "vwap":     vwap_s[-1],
+        "atr":      atr_now,
+        "close":    price,
+        "trend_1h": trend_1h,
     }
 
 
