@@ -2,6 +2,17 @@
 BingX Perpetual Futures REST client.
 Hedge mode (positionSide required on all orders).
 Signing: HMAC-SHA256 over urlencode(sorted(params)).
+
+FIX: place_stop_market() ahora manda reduceOnly=true. Esta función no
+se llama hoy desde ningún sitio del bot (no hay SL real en el
+exchange, solo trailing stop en software) — el fix es precautorio,
+para que si algún día se activa no se rompa igual que se rompió en
+renewed-love/joyful-art (error 110424).
+
+FIX: get_klines() ahora comprueba que la respuesta sea una lista antes
+de iterarla, igual que el resto del fleet — antes un payload
+inesperado podía romper con un TypeError poco claro en vez de
+devolver una lista vacía.
 """
 
 import hashlib
@@ -88,7 +99,7 @@ class BingXClient:
                 "close":     float(k["close"]),
                 "volume":    float(k["volume"]),
             }
-            for k in raw
+            for k in (raw if isinstance(raw, list) else [])   # FIX: guard de tipo
         ]
         return sorted(candles, key=lambda x: x["timestamp"])
 
@@ -224,7 +235,12 @@ class BingXClient:
         stop_price: float,
         quantity: float,
     ) -> dict:
-        """Protective stop-market order (close position)."""
+        """
+        Protective stop-market order (close position).
+
+        FIX: reduceOnly=true — precautorio, ver docstring del módulo.
+        Esta función no se llama hoy desde ningún sitio del bot.
+        """
         side = "SELL" if position_side == "LONG" else "BUY"
         return self._post(
             "/openApi/swap/v2/trade/order",
@@ -235,5 +251,6 @@ class BingXClient:
                 "type":          "STOP_MARKET",
                 "stopPrice":    f"{stop_price:.6f}",
                 "quantity":      str(quantity),
+                "reduceOnly":    "true",
             },
         )
