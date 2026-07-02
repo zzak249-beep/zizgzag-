@@ -1,6 +1,11 @@
 """
 EMA9 × VWAP strategy — ported from Pine Script v5.
 All maths pure Python (no numpy).
+
+FIX: la rama del filtro ATR-chop devolvía trend_1h="NONE" heredado de
+`empty`, aunque ema9/vwap/atr ya fueran valores reales — indistinguible
+en el log de "no había suficientes velas 1h". Ahora se marca "CHOP"
+explícitamente.
 """
 
 from datetime import datetime, timezone
@@ -124,7 +129,7 @@ def get_signal(candles: list, ema_period: int = 9, atr_period: int = 14,
     atr_pct = atr_now / price if price > 0 else 0
     if atr_pct < 0.002:   # ATR < 0.2% del precio = demasiado choppy
         return {**empty, "ema9": ema9_s[-1], "vwap": vwap_s[-1],
-                "atr": atr_now, "close": price}
+                "atr": atr_now, "close": price, "trend_1h": "CHOP"}   # FIX
 
     # ── 1H HTF trend filter ───────────────────────────────────────────────────
     trend_1h = "NONE"
