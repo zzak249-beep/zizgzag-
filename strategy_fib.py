@@ -6,6 +6,15 @@ Fibonacci Golden Pocket Strategy — KIBITO
 3. LONG:  precio retrocede al 50-61.8% en tendencia alcista + confirmación
 4. SHORT: precio retrocede al 50-61.8% en tendencia bajista + confirmación
 5. Target: nivel 0.236 (extensión del movimiento)
+
+FIX: el override "RSI extremo ignora tendencia" era matemáticamente
+inalcanzable. FIB_EXTREME_RSI_LONG=28 exige rsi<=28 para activarse,
+pero long_rsi_ok exigía rsi>=35 (FIB_RSI_LONG_MIN) de forma
+independiente e incondicional — 28 y 35 no se solapan, así que ambas
+condiciones nunca podían ser ciertas a la vez. Mismo problema en el
+lado SHORT (72 vs 65). El override ahora también salta el rango de
+RSI normal, no solo la tendencia, que es lo que el propio comentario
+del código decía que debía pasar.
 """
 import logging
 
@@ -137,10 +146,13 @@ def get_signal(candles_5m: list[dict],
     long_rsi_ok     = rsi_long_min <= rsi <= rsi_long_max
     long_trend_ok   = trend == "UP"
     # Override: RSI extremadamente sobrevendido ignora filtro de tendencia
+    # Y TAMBIÉN el rango normal de RSI — antes exigía ambos a la vez,
+    # lo cual era imposible por construcción (28 no solapa con 35-60).
     extreme_oversold = rsi <= getattr(config, "FIB_EXTREME_RSI_LONG", 28)
     long_trend_final = long_trend_ok or extreme_oversold
+    long_rsi_final    = long_rsi_ok or extreme_oversold   # FIX
 
-    if long_in_pocket and long_candle and long_rsi_ok and long_trend_final and vol_ok:
+    if long_in_pocket and long_candle and long_rsi_final and long_trend_final and vol_ok:
         sl_price = fib_786 - atr * 0.5      # SL bajo el 0.786
         tp_price = sh                         # TP: máximo anterior (0%)
         result.update({
@@ -166,8 +178,9 @@ def get_signal(candles_5m: list[dict],
     short_trend_ok   = trend == "DOWN"
     extreme_overbought = rsi >= getattr(config, "FIB_EXTREME_RSI_SHORT", 72)
     short_trend_final  = short_trend_ok or extreme_overbought
+    short_rsi_final     = short_rsi_ok or extreme_overbought   # FIX
 
-    if short_in_pocket and short_candle and short_rsi_ok and short_trend_final and vol_ok:
+    if short_in_pocket and short_candle and short_rsi_final and short_trend_final and vol_ok:
         sl_price = fib_786_inv + atr * 0.5   # SL sobre el 0.786 (invertido)
         tp_price = sl                          # TP: mínimo anterior (0% invertido)
         result.update({
