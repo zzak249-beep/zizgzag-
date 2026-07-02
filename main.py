@@ -4,7 +4,28 @@ daring-spontaneity — Triple Strategy Bot
 STRATEGY=EMA9_VWAP  → cruce EMA9 × VWAP + ATR trail
 STRATEGY=PDH_BOS    → PDH/PDL Break of Structure + retest + EMA8 exit
 STRATEGY=FIB        → Fibonacci Golden Pocket (0.5-0.618) + HTF trend
-STRATEGY=BOTH       → PDH_BOS → FIB → EMA9_VWAP (por prioridad)
+STRATEGY=BOTH       → UNICORN → PDH_BOS → FIB → EMA9_VWAP (por prioridad)
+
+FIX: _entry_reason, _fib_tp, _uni_tp, _last_close eran dicts en RAM —
+se perdían en cada redeploy con una posición abierta (misma familia de
+bug que el "entry_time en RAM" ya corregido en renewed-love y
+joyful-art). Ahora persisten vía state.py.
+
+FIX: _close() ahora comprueba el bool que devuelven
+close_long()/close_short() antes de registrar el trade y notificar —
+antes lo hacía incondicionalmente.
+
+DEBUG temporal: trend_1h=NONE aparecía en el 100% de las líneas
+EMA9_VWAP en los logs. Hipótesis con más peso: client.get_klines(SYMBOL,
+"1h", 60) devuelve menos de 50 velas — el umbral que exige get_signal()
+para calcular EMA20/50 en 1h. UNICORN usa la misma llamada pero con un
+umbral mucho más laxo (len(candles_1h)<3), y sí calcula bien — de ahí
+la sospecha. Subido el límite pedido a 100 y añadido un log directo de
+len(c1h) para confirmar antes de tocar bingx_client.py a ciegas.
+
+DEBUG temporal: aviso (no bloqueo) si hay una posición abierta en
+config.SYMBOL sin entry_ts propio en state.py — podría ser de otro bot
+compartiendo la misma cuenta de BingX en el mismo símbolo.
 """
 
 import logging
@@ -12,6 +33,7 @@ import time
 import traceback
 
 import config
+import state
 from bingx_client     import BingXClient
 from position_manager import PositionManager
 from risk_manager     import RiskManager
@@ -32,12 +54,6 @@ SIDES = {
     "LONG":  ["LONG"],
     "SHORT": ["SHORT"],
 }
-
-# Tracks strategy + TP per side
-_entry_reason: dict[str, str]   = {}
-_fib_tp:       dict[str, float] = {}
-_uni_tp:       dict[str, float] = {}
-_last_close:   dict[str, float] = {}  # cooldown: timestamp of last close per side
 
 
 def main():
@@ -66,11 +82,18 @@ def main():
                 if pos is None:
                     continue
 
+                # DEBUG temporal: no bloquea, solo avisa
+                if state.get_entry_ts(config.SYMBOL, side) is None:
+                    log.warning(
+                        f"Posición {side} en {config.SYMBOL} sin entry propio "
+                        f"registrado — ¿abierta por otro bot en la misma cuenta?"
+                    )
+
                 candles  = client.get_klines(config.SYMBOL, config.TIMEFRAME, 60)
                 sig_data = get_signal(candles, config.EMA_PERIOD, config.ATR_LENGTH)
                 atr      = sig_data.get("atr") or 0
 
-                reason = _entry_reason.get(side, "")
+                reason = state.get_reason(config.SYMBOL, side)
 
                 # ATR trail stop
                 if atr:
@@ -88,8 +111,6 @@ def main():
                         _close(side, pos, config.SYMBOL, price, "Trail Stop",
                                pos_mgr, risk, tg)
                         last_trail_notif.pop(side, None)
-                        _entry_reason.pop(side, None)
-                        _fib_tp.pop(side, None)
                         continue
 
                 # EMA8 exit — posiciones PDH_BOS
@@ -98,29 +119,24 @@ def main():
                         log.info(f"EMA8 exit — {side}")
                         _close(side, pos, config.SYMBOL, price, "EMA8 Exit",
                                pos_mgr, risk, tg)
-                        _entry_reason.pop(side, None)
                         continue
 
                 # Fibonacci TP exit
                 if reason == "fib":
-                    tp = _fib_tp.get(side)
+                    tp = state.get_tp(config.SYMBOL, side, "fib")
                     if tp and fib.check_tp_exit(candles, side, tp):
                         log.info(f"Fib TP reached — {side}  tp={tp:.6g}")
                         _close(side, pos, config.SYMBOL, price, "Fib TP",
                                pos_mgr, risk, tg)
-                        _entry_reason.pop(side, None)
-                        _fib_tp.pop(side, None)
                         continue
 
                 # Unicorn TP exit
                 if reason == "unicorn":
-                    tp = _uni_tp.get(side)
+                    tp = state.get_tp(config.SYMBOL, side, "unicorn")
                     if tp and unicorn.check_tp_exit(candles, side, tp):
                         log.info(f"Unicorn TP reached — {side}  tp={tp:.6g}")
                         _close(side, pos, config.SYMBOL, price, "Unicorn TP",
                                pos_mgr, risk, tg)
-                        _entry_reason.pop(side, None)
-                        _uni_tp.pop(side, None)
                         continue
 
             # ── 2. Signal check ───────────────────────────────────────────────
@@ -220,7 +236,8 @@ def main():
             # ── EMA9×VWAP — fallback (prioridad 4) ─────────────────────────────
             if not signal and config.STRATEGY in ("EMA9_VWAP", "BOTH"):
                 candles  = client.get_klines(config.SYMBOL, config.TIMEFRAME, config.CANDLES)
-                c1h      = client.get_klines(config.SYMBOL, "1h", 60)
+                c1h      = client.get_klines(config.SYMBOL, "1h", 100)   # FIX: más margen sobre el mínimo de 50
+                log.info(f"EMA9_VWAP debug: len(c1h)={len(c1h)}")        # DEBUG temporal
                 sig_data = get_signal(candles, config.EMA_PERIOD, config.ATR_LENGTH,
                                       candles_1h=c1h, direction=config.DIRECTION)
                 if sig_data["signal"]:
@@ -250,17 +267,21 @@ def main():
                 opened = _handle_entry("LONG", "SHORT", price, atr, equity,
                                        pos_mgr, risk, tg)
                 if opened:
-                    _entry_reason["LONG"] = source
-                    if source == "fib"     and fib_tp_price:  _fib_tp["LONG"] = fib_tp_price
-                    if source == "unicorn" and uni_tp_price:  _uni_tp["LONG"] = uni_tp_price
+                    state.save_reason(config.SYMBOL, "LONG", source)
+                    if source == "fib"     and fib_tp_price:
+                        state.save_tp(config.SYMBOL, "LONG", "fib", fib_tp_price)
+                    if source == "unicorn" and uni_tp_price:
+                        state.save_tp(config.SYMBOL, "LONG", "unicorn", uni_tp_price)
 
             elif signal == "SHORT" and "SHORT" in active_sides:
                 opened = _handle_entry("SHORT", "LONG", price, atr, equity,
                                        pos_mgr, risk, tg)
                 if opened:
-                    _entry_reason["SHORT"] = source
-                    if source == "fib"     and fib_tp_price:  _fib_tp["SHORT"] = fib_tp_price
-                    if source == "unicorn" and uni_tp_price:  _uni_tp["SHORT"] = uni_tp_price
+                    state.save_reason(config.SYMBOL, "SHORT", source)
+                    if source == "fib"     and fib_tp_price:
+                        state.save_tp(config.SYMBOL, "SHORT", "fib", fib_tp_price)
+                    if source == "unicorn" and uni_tp_price:
+                        state.save_tp(config.SYMBOL, "SHORT", "unicorn", uni_tp_price)
 
         except KeyboardInterrupt:
             log.info("Stopping.")
@@ -278,14 +299,13 @@ def main():
 def _handle_entry(enter_side: str, exit_side: str, price: float, atr: float,
                   equity: float, pos_mgr: PositionManager,
                   risk: RiskManager, tg: TelegramClient) -> bool:
-    import time as _time
     sym = config.SYMBOL
 
     # Cooldown: no abrir en el mismo sentido si cerró hace menos de N segundos
     cooldown = getattr(config, "TRADE_COOLDOWN_SEC", 300)
-    last = _last_close.get(enter_side, 0)
-    if _time.time() - last < cooldown:
-        remaining = int(cooldown - (_time.time() - last))
+    last = state.get_last_close(sym, enter_side) or 0
+    if time.time() - last < cooldown:
+        remaining = int(cooldown - (time.time() - last))
         log.info(f"Cooldown {enter_side} — {remaining}s restantes")
         return False
 
@@ -293,9 +313,6 @@ def _handle_entry(enter_side: str, exit_side: str, price: float, atr: float,
     if opp:
         _close(exit_side, opp, sym, price, f"Reversal→{enter_side}",
                pos_mgr, risk, tg)
-        _entry_reason.pop(exit_side, None)
-        _fib_tp.pop(exit_side, None)
-        _uni_tp.pop(exit_side, None)
 
     if pos_mgr.has_position(sym, enter_side):
         log.info(f"Already {enter_side} — skip")
@@ -319,15 +336,19 @@ def _handle_entry(enter_side: str, exit_side: str, price: float, atr: float,
 
 def _close(side: str, pos: dict, sym: str, price: float, reason: str,
            pos_mgr: PositionManager, risk: RiskManager, tg: TelegramClient):
-    import time as _time
     pnl = pos["unrealizedPnl"]
     if side == "LONG":
-        pos_mgr.close_long(sym, pos["size"], reason)
+        ok = pos_mgr.close_long(sym, pos["size"], reason)
     else:
-        pos_mgr.close_short(sym, pos["size"], reason)
+        ok = pos_mgr.close_short(sym, pos["size"], reason)
+
+    if not ok:   # FIX: antes se registraba el cierre incondicionalmente
+        log.error(f"_close {sym} {side}: la llamada al exchange falló, no se registra el cierre")
+        return
+
     risk.record_trade(pnl)
     tg.exit_trade(config.BOT_NAME, sym, side, price, reason, pnl)
-    _last_close[side] = _time.time()  # start cooldown
+    state.save_last_close(sym, side)  # arranca el cooldown, sobrevive a state.clear()
 
 
 if __name__ == "__main__":
