@@ -1,10 +1,11 @@
 """
-daring-spontaneity — Triple Strategy Bot
+daring-spontaneity — Quad Strategy Bot
 ==========================================
 STRATEGY=EMA9_VWAP  → cruce EMA9 × VWAP + ATR trail
 STRATEGY=PDH_BOS    → PDH/PDL Break of Structure + retest + EMA8 exit
 STRATEGY=FIB        → Fibonacci Golden Pocket (0.5-0.618) + HTF trend
-STRATEGY=BOTH       → UNICORN → PDH_BOS → FIB → EMA9_VWAP (por prioridad)
+STRATEGY=VOL_OB     → order block ponderado por volumen + retest (nueva)
+STRATEGY=BOTH       → UNICORN → PDH_BOS → FIB → EMA9_VWAP → VOL_OB (por prioridad)
 
 FIX: _entry_reason, _fib_tp, _uni_tp, _last_close eran dicts en RAM —
 se perdían en cada redeploy con una posición abierta (misma familia de
@@ -26,6 +27,11 @@ len(c1h) para confirmar antes de tocar bingx_client.py a ciegas.
 DEBUG temporal: aviso (no bloqueo) si hay una posición abierta en
 config.SYMBOL sin entry_ts propio en state.py — podría ser de otro bot
 compartiendo la misma cuenta de BingX en el mismo símbolo.
+
+NUEVO: VOL_OB — quinta estrategia independiente, implementación propia
+(ver strategy_vol_ob.py). Prioridad 5, último fallback — sin
+backtesting propio todavía, entra deliberadamente después de las 4
+estrategias ya validadas.
 """
 
 import logging
@@ -41,6 +47,7 @@ from strategy         import get_signal          # EMA9×VWAP
 import strategy_pdh_bos as pdh_bos              # PDH BOS Retest
 import strategy_fib     as fib
 import strategy_unicorn as unicorn                  # Fibonacci Golden Pocket
+import strategy_vol_ob  as vol_ob               # Volume Order Block (nueva)
 from telegram_client  import TelegramClient
 
 logging.basicConfig(
@@ -139,6 +146,15 @@ def main():
                                pos_mgr, risk, tg)
                         continue
 
+                # Volume Order Block TP exit
+                if reason == "vol_ob":
+                    tp = state.get_tp(config.SYMBOL, side, "vol_ob")
+                    if tp and vol_ob.check_tp_exit(candles, side, tp):
+                        log.info(f"VolOB TP reached — {side}  tp={tp:.6g}")
+                        _close(side, pos, config.SYMBOL, price, "VolOB TP",
+                               pos_mgr, risk, tg)
+                        continue
+
             # ── 2. Signal check ───────────────────────────────────────────────
             if now - last_signal_t < config.SIGNAL_CHECK_SEC:
                 time.sleep(config.TRAILING_CHECK_SEC)
@@ -158,6 +174,7 @@ def main():
             source = ""
             fib_tp_price = 0.0
             uni_tp_price = 0.0
+            vob_tp_price = 0.0
 
             # ── UNICORN — prioridad 1 (Sweep+Breaker+FVG) ────────────────────
             if config.STRATEGY in ("UNICORN", "BOTH"):
@@ -258,6 +275,31 @@ def main():
                         f"trend_1h={sig_data.get('trend_1h','?')}  price={price:.6g}"
                     )
 
+            # ── Volume Order Block — prioridad 5 (nueva, sin backtesting) ──────
+            if not signal and config.STRATEGY in ("VOL_OB", "BOTH"):
+                try:
+                    c5m = client.get_klines(config.SYMBOL, "5m", 200)
+                    vob_sig = vol_ob.get_signal(c5m, config)
+                    if vob_sig["signal"]:
+                        signal       = vob_sig["signal"]
+                        atr          = vob_sig["atr"]
+                        vob_tp_price = vob_sig["tp_price"]
+                        source       = "vol_ob"
+                        log.info(
+                            f"VOL_OB  signal={signal}  "
+                            f"zone={vob_sig['zone_bot']:.6g}-{vob_sig['zone_top']:.6g}  "
+                            f"buy_ratio={vob_sig['buy_ratio']:.2f}  trend={vob_sig['trend']}  "
+                            f"tp={vob_tp_price:.6g}  atr={atr:.4g}"
+                        )
+                    else:
+                        log.info(
+                            f"VOL_OB  None  "
+                            f"zone={vob_sig['zone_bot']:.6g}-{vob_sig['zone_top']:.6g}  "
+                            f"buy_ratio={vob_sig['buy_ratio']:.2f}  trend={vob_sig['trend']}"
+                        )
+                except Exception as e:
+                    log.warning(f"VOL_OB check error: {e}")
+
             if not signal or not atr:
                 time.sleep(config.TRAILING_CHECK_SEC)
                 continue
@@ -272,6 +314,8 @@ def main():
                         state.save_tp(config.SYMBOL, "LONG", "fib", fib_tp_price)
                     if source == "unicorn" and uni_tp_price:
                         state.save_tp(config.SYMBOL, "LONG", "unicorn", uni_tp_price)
+                    if source == "vol_ob"  and vob_tp_price:
+                        state.save_tp(config.SYMBOL, "LONG", "vol_ob", vob_tp_price)
 
             elif signal == "SHORT" and "SHORT" in active_sides:
                 opened = _handle_entry("SHORT", "LONG", price, atr, equity,
@@ -282,6 +326,8 @@ def main():
                         state.save_tp(config.SYMBOL, "SHORT", "fib", fib_tp_price)
                     if source == "unicorn" and uni_tp_price:
                         state.save_tp(config.SYMBOL, "SHORT", "unicorn", uni_tp_price)
+                    if source == "vol_ob"  and vob_tp_price:
+                        state.save_tp(config.SYMBOL, "SHORT", "vol_ob", vob_tp_price)
 
         except KeyboardInterrupt:
             log.info("Stopping.")
