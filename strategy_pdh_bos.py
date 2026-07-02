@@ -8,6 +8,13 @@ PDH BOS Retest Strategy — KIBITO
 4. Exit: EMA8 (5m) break OR ATR trail stop
 
 Designed for BingX Perpetual Futures, hedge mode.
+
+FIX: zone_pct tomaba config.PDH_RETEST_ZONE_PCT (0.15, pensado como
+"0.15%" según el comentario de config.py) y lo usaba directo como
+fracción sin dividir entre 100. Con bos_level≈61320, la zona de
+retest salía en ~9198 USDT en vez de ~92 — el filtro de retest quedaba
+neutralizado (retesting≈True casi siempre). No se había notado porque
+BOS nunca se había activado en los logs vistos hasta ahora.
 """
 
 import logging
@@ -105,7 +112,9 @@ def get_signal(client, symbol: str, config) -> dict:
         current_high  = m5[-2]["high"]
         price_now     = m5[-1]["close"]   # current live price
 
-        zone_pct = getattr(config, "PDH_RETEST_ZONE_PCT", 0.0015)  # 0.15%
+        # FIX: config guarda PDH_RETEST_ZONE_PCT como porcentaje (0.15 = 0.15%),
+        # no como fracción — había que dividir entre 100 antes de multiplicar.
+        zone_pct = getattr(config, "PDH_RETEST_ZONE_PCT", 0.15) / 100.0
         zone      = bos_level * zone_pct + atr * 0.3
 
         if bos_long:
