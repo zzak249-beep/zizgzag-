@@ -203,7 +203,7 @@ def main():
                     log.warning(f"UNICORN check error: {e}")
 
             # ── PDH BOS — prioridad 2 ─────────────────────────────────────────
-            if config.STRATEGY in ("PDH_BOS", "BOTH"):
+            if not signal and config.STRATEGY in ("PDH_BOS", "BOTH"):
                 pdh_sig = pdh_bos.get_signal(client, config.SYMBOL, config)
                 if pdh_sig["signal"]:
                     signal = pdh_sig["signal"]
