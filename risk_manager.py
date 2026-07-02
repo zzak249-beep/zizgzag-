@@ -1,20 +1,30 @@
 """
 RiskManager — daily loss limit.
 Resets PnL counter at UTC midnight.
-"""
 
+FIX: _day_pnl / _day_start_eq / _today ahora persisten vía state.py.
+Antes vivían solo en RAM — un redeploy a mitad de día reseteaba el
+contador a 0, permitiendo saltarse MAX_DAILY_LOSS_PCT de facto si
+había varios redeploys en la misma jornada.
+"""
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
+
+import state
 
 log = logging.getLogger("risk_mgr")
 
 
 class RiskManager:
     def __init__(self, cfg):
-        self.cfg             = cfg
-        self._day_pnl        = 0.0
-        self._day_start_eq   = None
-        self._today          = None
+        self.cfg = cfg
+        saved_pnl, saved_eq, saved_day = state.get_day_state()
+        self._day_pnl      = saved_pnl if saved_pnl is not None else 0.0
+        self._day_start_eq = saved_eq
+        self._today         = date.fromisoformat(saved_day) if saved_day else None
+        if saved_day:
+            log.info(f"RiskManager: día restaurado desde state.py — "
+                     f"day_pnl={self._day_pnl:+.2f}  day_start_eq={self._day_start_eq}")
 
     # ── Public ────────────────────────────────────────────────
 
@@ -31,6 +41,7 @@ class RiskManager:
 
     def record_trade(self, pnl_usdt: float):
         self._day_pnl += pnl_usdt
+        state.save_day_state(self._day_pnl, self._day_start_eq, self._today.isoformat())
         log.info(f"PnL recorded: {pnl_usdt:+.2f}  day_total={self._day_pnl:+.2f}")
 
     @property
@@ -45,4 +56,5 @@ class RiskManager:
             self._today        = today
             self._day_pnl      = 0.0
             self._day_start_eq = equity
+            state.save_day_state(self._day_pnl, self._day_start_eq, self._today.isoformat())
             log.info(f"New day — start equity: {equity:.2f} USDT")
