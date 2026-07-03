@@ -3,11 +3,13 @@ BingX Perpetual Futures REST client.
 Hedge mode (positionSide required on all orders).
 Signing: HMAC-SHA256 over urlencode(sorted(params)).
 
-FIX: place_stop_market() ahora manda reduceOnly=true. Esta función no
-se llama hoy desde ningún sitio del bot (no hay SL real en el
-exchange, solo trailing stop en software) — el fix es precautorio,
-para que si algún día se activa no se rompa igual que se rompió en
-renewed-love/joyful-art (error 110424).
+REVERTIDO (3 jul 2026): el fix anterior mandaba reduceOnly=true en
+place_stop_market(), precautorio porque la función no se llama desde
+ningún sitio de este bot. Estaba mal igualmente — BingX en Hedge
+Mode RECHAZA la orden si ese campo va presente: [109400] "In the
+Hedge mode, the 'ReduceOnly' field can not be filled" — confirmado
+en logs reales de renewed-love. Si algún día se activa esta función,
+mejor así que con el bug precargado.
 
 FIX: get_klines() ahora comprueba que la respuesta sea una lista antes
 de iterarla, igual que el resto del fleet — antes un payload
@@ -238,7 +240,7 @@ class BingXClient:
         """
         Protective stop-market order (close position).
 
-        FIX: reduceOnly=true — precautorio, ver docstring del módulo.
+        REVERTIDO: ya no se manda reduceOnly — ver docstring del módulo.
         Esta función no se llama hoy desde ningún sitio del bot.
         """
         side = "SELL" if position_side == "LONG" else "BUY"
@@ -251,6 +253,5 @@ class BingXClient:
                 "type":          "STOP_MARKET",
                 "stopPrice":    f"{stop_price:.6f}",
                 "quantity":      str(quantity),
-                "reduceOnly":    "true",
             },
         )
