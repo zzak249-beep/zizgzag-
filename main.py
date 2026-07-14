@@ -85,6 +85,32 @@ async def run():
         log.warning("DRY_RUN=True — modo observación: señales sin ejecutar. "
                     "Pasá DRY_RUN=False en Railway recién tras 3-5 días de "
                     "señales razonables en el journal.")
+
+    # Diagnóstico de credenciales — NUNCA loguea la key/secret real, solo su
+    # longitud y si están vacías. Existe para diagnosticar rápido el 100001
+    # "Signature verification failed" cuando el código de firma ya está
+    # confirmado correcto (urlencode(sorted(...)) idéntico en _sign y en la
+    # URL real, .strip() aplicado): si esto aparece vacío o con longitud
+    # sospechosa, el problema es la variable de entorno en Railway, no el
+    # cliente HTTP.
+    key_len = len(config.BINGX_API_KEY)
+    secret_len = len(config.BINGX_API_SECRET)
+    if key_len == 0 or secret_len == 0:
+        log.error(
+            "🚨 BINGX_API_KEY (len=%d) o BINGX_API_SECRET (len=%d) está "
+            "VACÍA — revisar las Variables de ESTE servicio en Railway. "
+            "Todo intento de request firmado va a fallar con 100001.",
+            key_len, secret_len,
+        )
+    else:
+        log.info(
+            "Credenciales BingX presentes | key_len=%d secret_len=%d "
+            "(si igual falla 100001: revisar que no tengan comillas pegadas, "
+            "que sean del ambiente/API correcto -- perpetual/swap, no spot -- "
+            "y que la IP de este servicio esté en el whitelist de la key si "
+            "tiene restricción de IP)",
+            key_len, secret_len,
+        )
     if config.RR < 2.0:
         log.warning("⚠️ RR=%.2f (< 2.0) — env var pisando el default. A 1.5R "
                     "el breakeven sube de 33%% a 40%% de win rate.", config.RR)
