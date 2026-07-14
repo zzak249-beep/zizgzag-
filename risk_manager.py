@@ -1,0 +1,126 @@
+"""
+Risk Manager — sizing por riesgo fijo, circuit breaker diario,
+límite de riesgo concurrente total.
+"""
+import datetime
+import logging
+import time
+
+log = logging.getLogger("risk_manager")
+
+
+class RiskManager:
+    def __init__(self, config):
+        self.config = config
+        self.daily_pnl = 0.0
+        self.daily_start_balance = None
+        self.current_day = datetime.date.today()
+        self.open_risk_pct = 0.0  # suma del % de riesgo de posiciones abiertas
+        self.consecutive_losses = 0
+        self.paused_until = 0.0  # epoch: freno por racha de pérdidas
+
+    def _reset_if_new_day(self, balance):
+        today = datetime.date.today()
+        if today != self.current_day:
+            log.info("Nuevo día de trading — reseteando PnL diario")
+            self.current_day = today
+            self.daily_pnl = 0.0
+            self.daily_start_balance = balance
+
+    def register_realized_pnl(self, pnl_usdt, balance):
+        self._reset_if_new_day(balance)
+        self.daily_pnl += pnl_usdt
+        # Racha de pérdidas: N seguidas -> pausa temporal de entradas nuevas
+        if pnl_usdt < 0:
+            self.consecutive_losses += 1
+            max_losses = getattr(self.config, "MAX_CONSECUTIVE_LOSSES", 0)
+            if max_losses > 0 and self.consecutive_losses >= max_losses:
+                pause_min = getattr(self.config, "LOSS_STREAK_PAUSE_MIN", 120)
+                self.paused_until = time.time() + pause_min * 60
+                log.warning(
+                    "Racha de %d pérdidas consecutivas — pausa de entradas nuevas por %d min",
+                    self.consecutive_losses, pause_min)
+                self.consecutive_losses = 0
+        elif pnl_usdt > 0:
+            self.consecutive_losses = 0
+
+    def daily_loss_breached(self, balance):
+        self._reset_if_new_day(balance)
+        if self.daily_start_balance is None:
+            self.daily_start_balance = balance
+            return False
+        if self.daily_start_balance <= 0:
+            return False
+        loss_pct = -self.daily_pnl / self.daily_start_balance * 100
+        breached = loss_pct >= self.config.DAILY_MAX_LOSS_PCT
+        if breached:
+            log.warning(
+                "Circuit breaker diario activado: pérdida %.2f%% >= límite %.2f%%",
+                loss_pct, self.config.DAILY_MAX_LOSS_PCT,
+            )
+        return breached
+
+    def calc_position_size(self, balance, entry_price, sl_price):
+        """
+        Tamaño de posición (en unidades del activo) según riesgo fijo % del balance.
+        """
+        risk_usdt = balance * (self.config.RISK_PCT_PER_TRADE / 100)
+        risk_per_unit = abs(entry_price - sl_price)
+        if risk_per_unit <= 0:
+            return 0.0
+        qty = risk_usdt / risk_per_unit
+        return qty
+
+    def can_open_new_position(self, balance, open_positions_count, new_risk_pct):
+        if self.daily_loss_breached(balance):
+            return False, "daily_loss_breached"
+        if time.time() < self.paused_until:
+            remaining = int((self.paused_until - time.time()) / 60)
+            return False, f"loss_streak_pause ({remaining} min restantes)"
+        if open_positions_count >= self.config.MAX_ACTIVE_POSITIONS:
+            return False, "max_active_positions_reached"
+        if self.open_risk_pct + new_risk_pct > self.config.MAX_CONCURRENT_RISK_PCT:
+            return False, "max_concurrent_risk_reached"
+        return True, "ok"
+
+    def snapshot(self):
+        """Estado serializable para state_store — contraparte de restore()."""
+        return {
+            "daily_pnl": self.daily_pnl,
+            "daily_start_balance": self.daily_start_balance,
+            "current_day": self.current_day.isoformat(),
+            "open_risk_pct": self.open_risk_pct,
+            "consecutive_losses": self.consecutive_losses,
+            "paused_until": self.paused_until,
+        }
+
+    def restore(self, snap):
+        """Restaura estado tras un redeploy. open_risk_pct se restaura
+        SIEMPRE (las posiciones abiertas sobreviven al redeploy); los
+        contadores diarios solo si el snapshot es de HOY — un snapshot de
+        ayer no debe revivir el circuit breaker de ayer."""
+        if not snap:
+            return
+        self.open_risk_pct = float(snap.get("open_risk_pct", 0.0))
+        self.consecutive_losses = int(snap.get("consecutive_losses", 0))
+        self.paused_until = float(snap.get("paused_until", 0.0))
+        try:
+            day = datetime.date.fromisoformat(snap.get("current_day", ""))
+        except (ValueError, TypeError):
+            return
+        if day != datetime.date.today():
+            log.info("Snapshot de riesgo de otro día (%s) — solo se restaura open_risk_pct=%.2f%%",
+                      day, self.open_risk_pct)
+            return
+        self.current_day = day
+        self.daily_pnl = float(snap.get("daily_pnl", 0.0))
+        dsb = snap.get("daily_start_balance")
+        self.daily_start_balance = float(dsb) if dsb is not None else None
+        log.info("Estado de riesgo restaurado: daily_pnl=%.4f open_risk=%.2f%%",
+                  self.daily_pnl, self.open_risk_pct)
+
+    def register_open_risk(self, risk_pct):
+        self.open_risk_pct += risk_pct
+
+    def release_open_risk(self, risk_pct):
+        self.open_risk_pct = max(0.0, self.open_risk_pct - risk_pct)
