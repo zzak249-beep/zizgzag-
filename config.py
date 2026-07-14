@@ -45,7 +45,15 @@ DRY_RUN = _b("DRY_RUN", True)
 
 # ── BingX ─────────────────────────────────────────────────────────────
 BINGX_API_KEY = _s("BINGX_API_KEY", "")
-BINGX_API_SECRET = _s("BINGX_API_SECRET", "")
+# FIX (Claude, 2026-07-15): en Railway esta variable quedó nombrada
+# BINGX_SECRET_KEY en vez de BINGX_API_SECRET -- os.getenv() no hace
+# fuzzy-match de nombres, así que _s("BINGX_API_SECRET", "") devolvía
+# siempre "" (confirmado: log de arranque mostraba secret_len=0, causa
+# real del 100001 "Signature verification failed" en TODOS los requests
+# firmados, no un bug de firma/HMAC). Fallback a BINGX_SECRET_KEY para no
+# depender de renombrar la variable en Railway, y para que este mismo
+# desajuste de nombre no vuelva a colar en el próximo bot de la flota.
+BINGX_API_SECRET = _s("BINGX_API_SECRET", "") or _s("BINGX_SECRET_KEY", "")
 BINGX_BASE_URL = _s("BINGX_BASE_URL", "https://open-api.bingx.com")
 
 # ── Universo: los ganadores del día ──────────────────────────────────
