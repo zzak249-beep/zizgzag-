@@ -130,8 +130,10 @@ async def run():
     # versión (deploy mixto / editado por un agente), se filtran los kwargs
     # que esa versión no soporte en vez de crashear el arranque.
     import inspect
-    _wanted = {"dry_run": config.DRY_RUN,
-               "max_concurrency": config.API_MAX_CONCURRENCY}
+    # Nota v1.4: el cliente canónico de la flota NO tiene max_concurrency
+    # (maneja el rate limit internamente con min_request_interval). El
+    # parámetro se elimina; el guard de firma queda como seguro barato.
+    _wanted = {"dry_run": config.DRY_RUN}
     try:
         _params = inspect.signature(BingXClient.__init__).parameters
         _kw = {k: v for k, v in _wanted.items() if k in _params}
