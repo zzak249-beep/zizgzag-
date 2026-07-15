@@ -125,10 +125,26 @@ async def run():
         log.info("Sin estado previo en %s — arranque en frío "
                  "(¿Volume montado en /data?)", config.STATE_FILE)
 
+    # Construcción defensiva: si el exchange_client.py del repo es otra
+    # versión (deploy mixto / editado por un agente), se filtran los kwargs
+    # que esa versión no soporte en vez de crashear el arranque.
+    import inspect
+    _wanted = {"dry_run": config.DRY_RUN,
+               "max_concurrency": config.API_MAX_CONCURRENCY}
+    try:
+        _params = inspect.signature(BingXClient.__init__).parameters
+        _kw = {k: v for k, v in _wanted.items() if k in _params}
+        _dropped = set(_wanted) - set(_kw)
+        if _dropped:
+            log.warning("⚠️ exchange_client.py de OTRA versión en el repo "
+                        "(no soporta: %s) — deploy mixto: subí el ZIP "
+                        "completo para restaurar el árbol canónico",
+                        ", ".join(sorted(_dropped)))
+    except (TypeError, ValueError):
+        _kw = {}
     async with BingXClient(
         config.BINGX_API_KEY, config.BINGX_API_SECRET,
-        config.BINGX_BASE_URL, dry_run=config.DRY_RUN,
-        max_concurrency=config.API_MAX_CONCURRENCY,
+        config.BINGX_BASE_URL, **_kw,
     ) as client:
         while True:
             try:
