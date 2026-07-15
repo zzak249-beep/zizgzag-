@@ -160,8 +160,20 @@ async def run():
 async def _cycle(client, journal, risk, store, tracked, done_setups):
     balance = await client.get_balance_usdt()
     if not balance or balance <= 0:
-        log.warning("Balance inválido (%s) — ciclo salteado", balance)
-        return
+        if config.DRY_RUN:
+            # En observación no hace falta plata: se simula el balance para
+            # que el journal calcule sizing y las señales no se pierdan.
+            if not getattr(_cycle, "_warned_balance", False):
+                log.warning(
+                    "Balance real inválido (%s) — DRY_RUN activo: sigo con "
+                    "balance simulado de %.2f USDT (DRY_RUN_BALANCE). Si la "
+                    "cuenta debería tener fondos, revisá keys/transferencia.",
+                    balance, config.DRY_RUN_BALANCE)
+                _cycle._warned_balance = True
+            balance = config.DRY_RUN_BALANCE
+        else:
+            log.warning("Balance inválido (%s) — ciclo salteado", balance)
+            return
 
     # ── 1. Cierres: posiciones trackeadas que ya no están en BingX ──
     open_now = {} if config.DRY_RUN else await _get_open_positions(client)

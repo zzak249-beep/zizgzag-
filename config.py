@@ -40,12 +40,15 @@ def _s(name, default):
     return _clean(os.getenv(name, default))
 
 
-CODE_VERSION = "2026-07-15-pumpfade-v1.4"
+CODE_VERSION = "2026-07-15-pumpfade-v1.5"
 
 # ── Modo ──────────────────────────────────────────────────────────────
 # ARRANCA EN DRY_RUN: este bot shortea los activos más violentos del día.
 # Se pasa a real recién después de ver señales en seco 3-5 días.
 DRY_RUN = _b("DRY_RUN", True)
+DRY_RUN_BALANCE = _f("DRY_RUN_BALANCE", 125.0)  # balance simulado para
+# observar senales aunque la cuenta este vacia o las keys sin fondos --
+# el sizing del journal en seco se calcula con este numero
 
 # ── BingX ─────────────────────────────────────────────────────────────
 BINGX_API_KEY = _s("BINGX_API_KEY", "")
