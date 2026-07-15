@@ -49,28 +49,12 @@ class StateStore:
 
     def save(self, recently_opened, recently_closed, tracked, risk_snapshot, corr_exposure):
         now_ms = int(time.time() * 1000)
-
-        def _prune(entries):
-            # FIX (Claude, 2026-07-15): main.py llama a save() pasando
-            # done_setups como list(set(...)) -- claves de dedupe SIN
-            # timestamp por elemento, no un dict {symbol: timestamp} como
-            # este método esperaba originalmente. Sin este chequeo,
-            # entries.items() explota con "'list' object has no attribute
-            # 'items'" en TODO ciclo que llega a guardar estado (confirmado
-            # en producción, primer ciclo tras arreglar las credenciales).
-            # Si es dict: podar por antigüedad como antes. Si es lista:
-            # guardar tal cual -- main.py ya acota done_setups a mano
-            # (lo limpia cuando supera 500 entradas), así que no necesita
-            # poda por tiempo acá.
-            if isinstance(entries, dict):
-                return {s: t for s, t in entries.items()
-                         if now_ms - t < _PRUNE_MS}
-            return list(entries)
-
         snapshot = {
             "saved_at_ms": now_ms,
-            "recently_opened": _prune(recently_opened),
-            "recently_closed": _prune(recently_closed),
+            "recently_opened": {s: t for s, t in recently_opened.items()
+                                 if now_ms - t < _PRUNE_MS},
+            "recently_closed": {s: t for s, t in recently_closed.items()
+                                 if now_ms - t < _PRUNE_MS},
             "tracked": tracked,
             "risk": risk_snapshot,
             "corr_exposure": corr_exposure,

@@ -69,8 +69,7 @@ def _parse_unblock_wait_s(msg):
 
 class BingXClient:
     def __init__(self, api_key, api_secret, base_url, dry_run=True,
-                 min_request_interval=DEFAULT_MIN_REQUEST_INTERVAL_S,
-                 max_concurrency=4):
+                 min_request_interval=DEFAULT_MIN_REQUEST_INTERVAL_S):
         # .strip() por si alguien instancia el cliente directamente sin pasar
         # por config.py (que ya limpia) — un espacio/salto de línea invisible
         # en la key o el secret produce el mismo síntoma que una firma mal
@@ -90,14 +89,6 @@ class BingXClient:
         self._last_request_at = 0.0
         self._pacing_lock = asyncio.Lock()
         self._min_request_interval = min_request_interval
-        # Tope de requests EN VUELO simultáneas. Independiente de
-        # _wait_for_slot (que espacía la ADMISIÓN de requests): esto acota
-        # cuántas pueden estar esperando respuesta de BingX al mismo tiempo.
-        # main.py y config.py (API_MAX_CONCURRENCY) ya asumían este parámetro
-        # — faltaba implementarlo acá, causa exacta del crash en Railway
-        # (TypeError: __init__() got an unexpected keyword argument
-        # 'max_concurrency').
-        self._request_semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
         # Caché de especificaciones de contrato (precisión de qty/precio por
         # símbolo). Se llena UNA vez con /quote/contracts y se reutiliza —
         # sin esto, el bot mandaba cantidades con 6 decimales a símbolos que
@@ -137,10 +128,6 @@ class BingXClient:
         ).hexdigest()
 
     async def _request(self, method, path, params=None, signed=False):
-        async with self._request_semaphore:
-            return await self._do_request(method, path, params, signed)
-
-    async def _do_request(self, method, path, params=None, signed=False):
         await self._wait_for_slot()
         params = dict(params or {})
         if signed:
@@ -335,6 +322,10 @@ class BingXClient:
                     log.warning("[%s] TP no se pudo colocar (%s) — la posición sigue con SL, no es crítico", symbol, tp_price)
                 else:
                     log.error("🚨 [%s] TP tampoco se pudo colocar (%s) — posición SIN SL NI TP", symbol, tp_price)
+
+        data["sl_placed"] = sl_placed
+        data["tp_placed"] = tp_placed
+        return data
 
         data["sl_placed"] = sl_placed
         data["tp_placed"] = tp_placed

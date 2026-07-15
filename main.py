@@ -11,6 +11,7 @@ Loop:
 6. Estado persistido en /data (sobrevive redeploys... si el Volume está montado)
 """
 import asyncio
+import os
 import logging
 import sys
 import time
@@ -85,32 +86,22 @@ async def run():
         log.warning("DRY_RUN=True — modo observación: señales sin ejecutar. "
                     "Pasá DRY_RUN=False en Railway recién tras 3-5 días de "
                     "señales razonables en el journal.")
-
-    # Diagnóstico de credenciales — NUNCA loguea la key/secret real, solo su
-    # longitud y si están vacías. Existe para diagnosticar rápido el 100001
-    # "Signature verification failed" cuando el código de firma ya está
-    # confirmado correcto (urlencode(sorted(...)) idéntico en _sign y en la
-    # URL real, .strip() aplicado): si esto aparece vacío o con longitud
-    # sospechosa, el problema es la variable de entorno en Railway, no el
-    # cliente HTTP.
-    key_len = len(config.BINGX_API_KEY)
-    secret_len = len(config.BINGX_API_SECRET)
-    if key_len == 0 or secret_len == 0:
-        log.error(
-            "🚨 BINGX_API_KEY (len=%d) o BINGX_API_SECRET (len=%d) está "
-            "VACÍA — revisar las Variables de ESTE servicio en Railway. "
-            "Todo intento de request firmado va a fallar con 100001.",
-            key_len, secret_len,
-        )
-    else:
-        log.info(
-            "Credenciales BingX presentes | key_len=%d secret_len=%d "
-            "(si igual falla 100001: revisar que no tengan comillas pegadas, "
-            "que sean del ambiente/API correcto -- perpetual/swap, no spot -- "
-            "y que la IP de este servicio esté en el whitelist de la key si "
-            "tiene restricción de IP)",
-            key_len, secret_len,
-        )
+    if config.MIN_24H_VOLUME_USDT < 5_000_000:
+        log.warning("⚠️ MIN_24H_VOLUME_USDT=%s (< 5M) — ¿te faltó un cero en "
+                    "Railway? Con el piso bajo, los pares ilíquidos tipo LAB "
+                    "(slippage 3x el riesgo en el stop) vuelven al radar.",
+                    config.MIN_24H_VOLUME_USDT)
+    try:
+        os.makedirs(config.DATA_DIR, exist_ok=True)
+        _probe = os.path.join(config.DATA_DIR, ".write_probe")
+        with open(_probe, "w") as _fh:
+            _fh.write("ok")
+        os.remove(_probe)
+    except OSError as _e:
+        log.warning("⚠️ %s NO es escribible (%s) — el Volume de Railway no "
+                    "está montado: journal y estado se borran en cada "
+                    "redeploy. Settings -> Attach Volume -> mount path %s",
+                    config.DATA_DIR, _e, config.DATA_DIR)
     if config.RR < 2.0:
         log.warning("⚠️ RR=%.2f (< 2.0) — env var pisando el default. A 1.5R "
                     "el breakeven sube de 33%% a 40%% de win rate.", config.RR)

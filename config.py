@@ -40,7 +40,7 @@ def _s(name, default):
     return _clean(os.getenv(name, default))
 
 
-CODE_VERSION = "2026-07-13-pumpfade-v1"
+CODE_VERSION = "2026-07-15-pumpfade-v1.1"
 
 # ── Modo ──────────────────────────────────────────────────────────────
 # ARRANCA EN DRY_RUN: este bot shortea los activos más violentos del día.
