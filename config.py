@@ -13,27 +13,31 @@ Todas las variables se pisan por env var en Railway.
 import os
 
 
+def _clean(v):
+    """Defensa contra env vars pegadas con comillas (KEY="valor")."""
+    return str(v).strip().strip('"').strip("'").strip()
+
+
 def _f(name, default):
     try:
-        return float(str(os.getenv(name, default)).strip().split()[0])
+        return float(_clean(os.getenv(name, default)).split()[0])
     except (ValueError, IndexError):
         return float(default)
 
 
 def _i(name, default):
     try:
-        return int(float(str(os.getenv(name, default)).strip().split()[0]))
+        return int(float(_clean(os.getenv(name, default)).split()[0]))
     except (ValueError, IndexError):
         return int(default)
 
 
 def _b(name, default):
-    v = str(os.getenv(name, default)).strip().lower()
-    return v in ("1", "true", "yes", "on")
+    return _clean(os.getenv(name, default)).lower() in ("1", "true", "yes", "on")
 
 
 def _s(name, default):
-    return str(os.getenv(name, default)).strip()
+    return _clean(os.getenv(name, default))
 
 
 CODE_VERSION = "2026-07-13-pumpfade-v1"
@@ -45,15 +49,7 @@ DRY_RUN = _b("DRY_RUN", True)
 
 # ── BingX ─────────────────────────────────────────────────────────────
 BINGX_API_KEY = _s("BINGX_API_KEY", "")
-# FIX (Claude, 2026-07-15): en Railway esta variable quedó nombrada
-# BINGX_SECRET_KEY en vez de BINGX_API_SECRET -- os.getenv() no hace
-# fuzzy-match de nombres, así que _s("BINGX_API_SECRET", "") devolvía
-# siempre "" (confirmado: log de arranque mostraba secret_len=0, causa
-# real del 100001 "Signature verification failed" en TODOS los requests
-# firmados, no un bug de firma/HMAC). Fallback a BINGX_SECRET_KEY para no
-# depender de renombrar la variable en Railway, y para que este mismo
-# desajuste de nombre no vuelva a colar en el próximo bot de la flota.
-BINGX_API_SECRET = _s("BINGX_API_SECRET", "") or _s("BINGX_SECRET_KEY", "")
+BINGX_API_SECRET = _s("BINGX_API_SECRET", "")
 BINGX_BASE_URL = _s("BINGX_BASE_URL", "https://open-api.bingx.com")
 
 # ── Universo: los ganadores del día ──────────────────────────────────
