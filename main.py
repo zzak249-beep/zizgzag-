@@ -116,7 +116,8 @@ async def run():
     snap = store.load()
     if snap:
         tracked = snap.get("tracked", {}) or {}
-        done_setups = set(snap.get("recently_opened", []) or [])
+        _ro = snap.get("recently_opened") or {}
+        done_setups = set(_ro.keys() if isinstance(_ro, dict) else _ro)
         risk.restore(snap.get("risk_snapshot") or {})
         log.info("Estado restaurado de %s | %d posiciones trackeadas | "
                  "%d setups en dedupe", config.STATE_FILE, len(tracked),
@@ -184,7 +185,7 @@ async def _cycle(client, journal, risk, store, tracked, done_setups):
 
     if risk.daily_loss_breached(balance):
         log.warning("Breaker diario activo — sin entradas nuevas hoy")
-        store.save(list(done_setups), [], tracked, risk.snapshot(), {})
+        store.save({k: int(time.time() * 1000) for k in done_setups}, {}, tracked, risk.snapshot(), {})
         return
 
     # ── 2. Ganadores del día ──
@@ -300,7 +301,7 @@ async def _cycle(client, journal, risk, store, tracked, done_setups):
         done_setups.clear()
         done_setups.update(m["setup_key"] for m in tracked.values())
 
-    store.save(list(done_setups), [], tracked, risk.snapshot(), {})
+    store.save({k: int(time.time() * 1000) for k in done_setups}, {}, tracked, risk.snapshot(), {})
 
 
 if __name__ == "__main__":
