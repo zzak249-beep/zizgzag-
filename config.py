@@ -40,7 +40,7 @@ def _s(name, default):
     return _clean(os.getenv(name, default))
 
 
-CODE_VERSION = "2026-07-15-pumpfade-v1.5"
+CODE_VERSION = "2026-07-16-pumpfade-v1.8"
 
 # ── Modo ──────────────────────────────────────────────────────────────
 # ARRANCA EN DRY_RUN: este bot shortea los activos más violentos del día.
@@ -63,6 +63,10 @@ MIN_24H_VOLUME_USDT = _f("MIN_24H_VOLUME_USDT", 5_000_000)  # lección LAB:
 # pumps reales pasan; lo que filtra es la chicharra ilíquida donde el
 # propio stop mueve el precio.
 TOP_GAINERS_N = _i("TOP_GAINERS_N", 25)
+RADAR_TTL_H = _f("RADAR_TTL_H", 12.0)  # horas que un símbolo sigue en radar
+# después de pumpear, aunque su +24h caiga bajo el mínimo: el desplome
+# post-techo baja la ganancia justo cuando llega el retest — antes de este
+# fix, el bot dejaba de mirar la moneda en el momento exacto de la señal
 REQUIRE_USDT_QUOTE = _b("REQUIRE_USDT_QUOTE", True)
 NON_CRYPTO_PREFIXES = tuple(
     p.strip() for p in _s(
@@ -84,7 +88,11 @@ REJECT_MAX_CLOSE_POS = _f("REJECT_MAX_CLOSE_POS", 0.40)  # el techo debe
 CEILING_MIN_RANGE_ATR = _f("CEILING_MIN_RANGE_ATR", 0.5)
 RETEST_TOUCH_ATR = _f("RETEST_TOUCH_ATR", 0.10)    # tocar el nivel roto
 RETEST_BREAK_ATR = _f("RETEST_BREAK_ATR", 0.05)    # cierre de rechazo
-RECLAIM_ATR = _f("RECLAIM_ATR", 0.75)              # cierre > nivel+0.75ATR
+RECLAIM_ATR = _f("RECLAIM_ATR", 0.75)
+ARM_DIST_ATR = _f("ARM_DIST_ATR", 0.5)   # el contador de retests se ARMA
+# recien cuando el precio se aleja esto del nivel roto. Sin esto, las velas
+# del propio desplome (todavia pegadas al nivel) consumian el retest #1 y el
+# retest de verdad llegaba como #2 = "zona gastada" -> cero senales.              # cierre > nivel+0.75ATR
 # = reclaim: el quiebre era falso, setup muerto
 PUMP_MAX_RETEST = _i("PUMP_MAX_RETEST", 1)         # Raschke: SOLO el primer
 # retest — el #2+ entra contra una zona gastada y acá no hay margen de error
