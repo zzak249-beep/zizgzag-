@@ -15,6 +15,7 @@ import os
 import logging
 import sys
 import time
+from collections import Counter
 
 import config
 from exchange_client import BingXClient
@@ -114,11 +115,20 @@ async def run():
     done_setups = set()   # setup_keys ya operados (dedupe)
 
     snap = store.load()
+    cumulative_states = Counter()
     if snap:
         tracked = snap.get("tracked", {}) or {}
         _ro = snap.get("recently_opened") or {}
         done_setups = set(_ro.keys() if isinstance(_ro, dict) else _ro)
-        risk.restore(snap.get("risk_snapshot") or {})
+        # FIX (Claude, 2026-07-15): state_store.py guarda el riesgo bajo la
+        # clave "risk" (ver save()), pero acá se buscaba "risk_snapshot" --
+        # esa clave NUNCA existió en el archivo, así que risk.restore()
+        # siempre recibía {} y el circuit breaker diario / racha de
+        # pérdidas nunca sobrevivían a un redeploy pese a estar realmente
+        # persistidos en /data/pumpfade_state.json.
+        risk.restore(snap.get("risk") or {})
+        _funnel = (snap.get("corr_exposure") or {}).get("state_funnel") or {}
+        cumulative_states.update(_funnel)
         log.info("Estado restaurado de %s | %d posiciones trackeadas | "
                  "%d setups en dedupe", config.STATE_FILE, len(tracked),
                  len(done_setups))
@@ -151,13 +161,14 @@ async def run():
     ) as client:
         while True:
             try:
-                await _cycle(client, journal, risk, store, tracked, done_setups)
+                await _cycle(client, journal, risk, store, tracked,
+                             done_setups, cumulative_states)
             except Exception:  # noqa: BLE001
                 log.exception("Error en el ciclo — sigo en el próximo")
             await asyncio.sleep(config.SCAN_INTERVAL_S)
 
 
-async def _cycle(client, journal, risk, store, tracked, done_setups):
+async def _cycle(client, journal, risk, store, tracked, done_setups, cumulative_states):
     balance = await client.get_balance_usdt()
     if not balance or balance <= 0:
         if config.DRY_RUN:
@@ -199,13 +210,20 @@ async def _cycle(client, journal, risk, store, tracked, done_setups):
 
     if risk.daily_loss_breached(balance):
         log.warning("Breaker diario activo — sin entradas nuevas hoy")
-        store.save({k: int(time.time() * 1000) for k in done_setups}, {}, tracked, risk.snapshot(), {})
+        store.save({k: int(time.time() * 1000) for k in done_setups}, {}, tracked,
+                   risk.snapshot(), {"state_funnel": dict(cumulative_states)})
         return
 
     # ── 2. Ganadores del día ──
     gainers = await get_top_gainers(client, config)
 
     # ── 3. Evaluar cada uno ──
+    # Embudo del ciclo: cuenta el "state" de CADA símbolo evaluado (no solo
+    # los que llegan a señal), para saber en qué escalón se mueren los
+    # setups sin tener que ir línea por línea -- mismo insight que da el
+    # backtest_pump_fade.py, pero acumulado en vivo, ciclo a ciclo.
+    cycle_states = Counter()
+
     for g in gainers:
         symbol = g["symbol"]
         if symbol in tracked or symbol in open_now:
@@ -217,6 +235,7 @@ async def _cycle(client, journal, risk, store, tracked, done_setups):
             continue
         # velas CERRADAS: descartar la vela en formación (regla [-2] de la flota)
         res = pump_fade_engine.analyze(candles[:-1], config)
+        cycle_states[res["state"]] += 1
 
         if res["state"] in ("bloqueada_chase", "sl_fuera_de_rango"):
             log.info("[%s] %s | +%.0f%% 24h | retest#%s | jump=%s",
@@ -315,7 +334,22 @@ async def _cycle(client, journal, risk, store, tracked, done_setups):
         done_setups.clear()
         done_setups.update(m["setup_key"] for m in tracked.values())
 
-    store.save({k: int(time.time() * 1000) for k in done_setups}, {}, tracked, risk.snapshot(), {})
+    # Embudo del ciclo + acumulado histórico (persistido en /data, sobrevive
+    # redeploys). Lectura rápida sin tener que ir símbolo por símbolo: si
+    # "bloqueada_chase" o "sl_fuera_de_rango" concentran un % alto contra
+    # "esperando_retest"+"senal", ese filtro es el que más está recortando
+    # -- primer candidato a revisar (mismo criterio que backtest_pump_fade.py).
+    if cycle_states:
+        cumulative_states.update(cycle_states)
+        total_hist = sum(cumulative_states.values())
+        log.info("Embudo del ciclo: %s", dict(cycle_states))
+        log.info("Embudo acumulado (n=%d evaluaciones desde el último arranque "
+                 "en frío): %s", total_hist,
+                 {k: f"{v} ({v / total_hist * 100:.0f}%)"
+                  for k, v in cumulative_states.most_common()})
+
+    store.save({k: int(time.time() * 1000) for k in done_setups}, {}, tracked,
+               risk.snapshot(), {"state_funnel": dict(cumulative_states)})
 
 
 if __name__ == "__main__":
