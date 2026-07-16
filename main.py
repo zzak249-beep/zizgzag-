@@ -121,7 +121,18 @@ async def run():
         _ro = snap.get("recently_opened") or {}
         done_setups = set(_ro.keys() if isinstance(_ro, dict) else _ro)
         risk.restore(snap.get("risk_snapshot") or snap.get("risk") or {})
-        watch.update(snap.get("corr_exposure") or {})
+        _raw_watch = snap.get("corr_exposure") or {}
+        _now = int(time.time() * 1000)
+        for _s, _v in (_raw_watch.items() if isinstance(_raw_watch, dict) else []):
+            # sanea entradas de versiones previas / formas inesperadas: sin
+            # esto, un snapshot viejo tumbaba el ciclo con KeyError
+            if isinstance(_v, dict):
+                _v.setdefault("first_ms", _now)
+                _v.setdefault("peak_gain", 0.0)
+                watch[_s] = _v
+        if len(watch) != len(_raw_watch):
+            log.warning("Radar: %d entradas descartadas por formato invalido",
+                        len(_raw_watch) - len(watch))
         log.info("Estado restaurado de %s | %d posiciones trackeadas | "
                  "%d setups en dedupe", config.STATE_FILE, len(tracked),
                  len(done_setups))
@@ -251,14 +262,18 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, watch):
     ttl_ms = int(config.RADAR_TTL_H * 3600 * 1000)
     for g in gainers:
         w = watch.get(g["symbol"]) or {"first_ms": now_ms, "peak_gain": 0.0}
-        w["peak_gain"] = max(w["peak_gain"], g["gain_24h_pct"])
+        w["peak_gain"] = max(w.get("peak_gain", 0.0), g["gain_24h_pct"])
         w["last_gain"] = g["gain_24h_pct"]
         watch[g["symbol"]] = w
     # símbolos que YA no cumplen el +25% pero pumpearon hace < TTL: se
     # siguen evaluando — el desplome post-techo es exactamente el setup
     vivos = {g["symbol"] for g in gainers}
     for sym in list(watch.keys()):
-        if now_ms - watch[sym]["first_ms"] > ttl_ms:
+        _w = watch[sym]
+        if not isinstance(_w, dict):
+            del watch[sym]
+            continue
+        if now_ms - _w.setdefault("first_ms", now_ms) > ttl_ms:
             del watch[sym]
         elif sym not in vivos:
             info = ticker_map.get(sym)

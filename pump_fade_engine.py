@@ -136,14 +136,20 @@ def analyze(candles, config):
     break_lv = broken_level - config.RETEST_BREAK_ATR * atr
     reclaim_lv = broken_level + config.RECLAIM_ATR * atr
 
+    arm_lv = broken_level - config.ARM_DIST_ATR * atr
     episodes = 0
     touching = False
-    signal_idx = None
-    for i in range(choch_idx + 1, n):
+    armed = False       # el precio debe ALEJARSE del nivel antes de que un
+    signal_idx = None   # acercamiento cuente como retest (si no, el propio
+    for i in range(choch_idx + 1, n):   # desplome consume el episodio #1)
         c = candles[i]
         if c["close"] > ceiling_high or c["close"] > reclaim_lv:
             out["state"] = "invalidado"
             return out
+        if not armed:
+            if c["high"] < arm_lv:
+                armed = True
+            continue
         touch_now = c["high"] >= touch_lo
         if touch_now and not touching:
             episodes += 1
@@ -160,7 +166,12 @@ def analyze(candles, config):
 
     if episodes == 0:
         return out
-    if signal_idx is None or episodes > config.PUMP_MAX_RETEST and signal_idx != n - 1:
+    if signal_idx is None:
+        # hubo toque pero todavia ninguna vela de rechazo valida
+        out["state"] = ("retest_gastado" if episodes > config.PUMP_MAX_RETEST
+                        else "esperando_retest")
+        return out
+    if episodes > config.PUMP_MAX_RETEST:
         out["state"] = "retest_gastado"
         return out
     # frescura: la señal es la ÚLTIMA vela cerrada, no una vieja
