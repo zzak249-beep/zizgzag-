@@ -15,7 +15,6 @@ import os
 import logging
 import sys
 import time
-from collections import Counter
 
 import config
 from exchange_client import BingXClient
@@ -113,22 +112,16 @@ async def run():
 
     tracked = {}          # symbol -> meta de posiciones abiertas por ESTE bot
     done_setups = set()   # setup_keys ya operados (dedupe)
+    watch = {}            # symbol -> {first_ms, peak_gain}: radar persistente
+                          # (el +24h cae tras el desplome; el setup sigue vivo)
 
     snap = store.load()
-    cumulative_states = Counter()
     if snap:
         tracked = snap.get("tracked", {}) or {}
         _ro = snap.get("recently_opened") or {}
         done_setups = set(_ro.keys() if isinstance(_ro, dict) else _ro)
-        # FIX (Claude, 2026-07-15): state_store.py guarda el riesgo bajo la
-        # clave "risk" (ver save()), pero acá se buscaba "risk_snapshot" --
-        # esa clave NUNCA existió en el archivo, así que risk.restore()
-        # siempre recibía {} y el circuit breaker diario / racha de
-        # pérdidas nunca sobrevivían a un redeploy pese a estar realmente
-        # persistidos en /data/pumpfade_state.json.
-        risk.restore(snap.get("risk") or {})
-        _funnel = (snap.get("corr_exposure") or {}).get("state_funnel") or {}
-        cumulative_states.update(_funnel)
+        risk.restore(snap.get("risk_snapshot") or snap.get("risk") or {})
+        watch.update(snap.get("corr_exposure") or {})
         log.info("Estado restaurado de %s | %d posiciones trackeadas | "
                  "%d setups en dedupe", config.STATE_FILE, len(tracked),
                  len(done_setups))
@@ -161,14 +154,13 @@ async def run():
     ) as client:
         while True:
             try:
-                await _cycle(client, journal, risk, store, tracked,
-                             done_setups, cumulative_states)
+                await _cycle(client, journal, risk, store, tracked, done_setups, watch)
             except Exception:  # noqa: BLE001
                 log.exception("Error en el ciclo — sigo en el próximo")
             await asyncio.sleep(config.SCAN_INTERVAL_S)
 
 
-async def _cycle(client, journal, risk, store, tracked, done_setups, cumulative_states):
+async def _cycle(client, journal, risk, store, tracked, done_setups, watch):
     balance = await client.get_balance_usdt()
     if not balance or balance <= 0:
         if config.DRY_RUN:
@@ -186,8 +178,48 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, cumulative_
             log.warning("Balance inválido (%s) — ciclo salteado", balance)
             return
 
-    # ── 1. Cierres: posiciones trackeadas que ya no están en BingX ──
-    open_now = {} if config.DRY_RUN else await _get_open_positions(client)
+    # ── 1. Cierres ──
+    # DRY_RUN: cierre SIMULADO contra velas reales (paper trading). Sin esto,
+    # las señales secas ocupaban los slots para siempre: a la 3ra señal el
+    # bot enmudecía y el journal jamás sabría si las señales GANAN.
+    open_now = {}
+    if config.DRY_RUN:
+        for symbol in list(tracked.keys()):
+            meta = tracked[symbol]
+            kl = await client.get_klines(symbol, config.ENTRY_TF, limit=250)
+            exit_price, result = None, None
+            for cndl in kl[:-1]:  # solo velas cerradas
+                if (cndl.get("time") or 0) < meta["opened_at_ms"]:
+                    continue
+                # convención conservadora: si SL y TP caben en la misma
+                # vela, cuenta como SL (igual que el Smart Breakout)
+                if cndl["high"] >= meta["sl"]:
+                    exit_price, result = meta["sl"], "sl"
+                    break
+                if cndl["low"] <= meta["tp"]:
+                    exit_price, result = meta["tp"], "tp"
+                    break
+            if exit_price is None:
+                continue
+            tracked.pop(symbol)
+            pnl = (meta["entry"] - exit_price) * meta.get("qty", 0.0)
+            risk.release_open_risk(meta.get("risk_pct", 0))
+            risk.register_realized_pnl(pnl, balance)
+            journal.record({
+                "event": "position_closed", "symbol": symbol, "side": "SHORT",
+                "simulated": True, "result": result,
+                "pnl_usdt": round(pnl, 4), "exit": exit_price,
+                "setup_key": meta.get("setup_key"),
+                "gain_24h_pct": meta.get("gain_24h_pct"),
+                "retest_count": meta.get("retest_count"),
+                "jump": meta.get("jump"), "sl_widened": meta.get("sl_widened"),
+                "held_min": round((time.time() * 1000 - meta["opened_at_ms"]) / 60000),
+                "ts": int(time.time() * 1000),
+            })
+            log.info("[%s] PAPER cerrada en %s | PnL simulado=%.4f USDT",
+                     symbol, result.upper(), pnl)
+    else:
+        open_now = await _get_open_positions(client)
     for symbol in list(tracked.keys()):
         if config.DRY_RUN:
             break
@@ -210,20 +242,39 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, cumulative_
 
     if risk.daily_loss_breached(balance):
         log.warning("Breaker diario activo — sin entradas nuevas hoy")
-        store.save({k: int(time.time() * 1000) for k in done_setups}, {}, tracked,
-                   risk.snapshot(), {"state_funnel": dict(cumulative_states)})
+        store.save({k: int(time.time() * 1000) for k in done_setups}, {}, tracked, risk.snapshot(), watch)
         return
 
-    # ── 2. Ganadores del día ──
-    gainers = await get_top_gainers(client, config)
+    # ── 2. Ganadores del día + radar persistente ──
+    gainers, ticker_map = await get_top_gainers(client, config)
+    now_ms = int(time.time() * 1000)
+    ttl_ms = int(config.RADAR_TTL_H * 3600 * 1000)
+    for g in gainers:
+        w = watch.get(g["symbol"]) or {"first_ms": now_ms, "peak_gain": 0.0}
+        w["peak_gain"] = max(w["peak_gain"], g["gain_24h_pct"])
+        w["last_gain"] = g["gain_24h_pct"]
+        watch[g["symbol"]] = w
+    # símbolos que YA no cumplen el +25% pero pumpearon hace < TTL: se
+    # siguen evaluando — el desplome post-techo es exactamente el setup
+    vivos = {g["symbol"] for g in gainers}
+    for sym in list(watch.keys()):
+        if now_ms - watch[sym]["first_ms"] > ttl_ms:
+            del watch[sym]
+        elif sym not in vivos:
+            info = ticker_map.get(sym)
+            if info is None or info["volume_24h_usdt"] < config.MIN_24H_VOLUME_USDT:
+                # la liquidez murió después del pump: fuera del radar
+                # (lección LAB — el piso aplica SIEMPRE, también aquí)
+                del watch[sym]
+                continue
+            watch[sym]["last_gain"] = info["gain_24h_pct"]
+            gainers.append({"symbol": sym,
+                            "gain_24h_pct": info["gain_24h_pct"],
+                            "volume_24h_usdt": info["volume_24h_usdt"],
+                            "last_price": info["last_price"],
+                            "from_radar": True})
 
     # ── 3. Evaluar cada uno ──
-    # Embudo del ciclo: cuenta el "state" de CADA símbolo evaluado (no solo
-    # los que llegan a señal), para saber en qué escalón se mueren los
-    # setups sin tener que ir línea por línea -- mismo insight que da el
-    # backtest_pump_fade.py, pero acumulado en vivo, ciclo a ciclo.
-    cycle_states = Counter()
-
     for g in gainers:
         symbol = g["symbol"]
         if symbol in tracked or symbol in open_now:
@@ -235,8 +286,13 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, cumulative_
             continue
         # velas CERRADAS: descartar la vela en formación (regla [-2] de la flota)
         res = pump_fade_engine.analyze(candles[:-1], config)
-        cycle_states[res["state"]] += 1
 
+        w = watch.get(symbol)
+        if w is not None and w.get("state") != res["state"]:
+            log.info("[%s] fase: %s -> %s | +%.0f%% 24h",
+                     symbol, w.get("state", "?"), res["state"],
+                     g["gain_24h_pct"])
+            w["state"] = res["state"]
         if res["state"] in ("bloqueada_chase", "sl_fuera_de_rango"):
             log.info("[%s] %s | +%.0f%% 24h | retest#%s | jump=%s",
                      symbol, res["state"], g["gain_24h_pct"],
@@ -308,7 +364,7 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, cumulative_
 
         done_setups.add(setup_key)
         tracked[symbol] = {
-            "setup_key": setup_key, "risk_pct": risk_pct,
+            "setup_key": setup_key, "risk_pct": risk_pct, "qty": qty,
             "opened_at_ms": int(time.time() * 1000),
             "entry": entry, "sl": sl, "tp": tp,
             "gain_24h_pct": round(g["gain_24h_pct"], 1),
@@ -321,6 +377,7 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, cumulative_
             "engine": "pump_fade", "entry": entry, "sl": sl, "tp": tp,
             "qty": qty, "risk_pct": risk_pct, "setup_key": setup_key,
             "gain_24h_pct": round(g["gain_24h_pct"], 1),
+            "peak_gain_pct": round((watch.get(symbol) or {}).get("peak_gain", 0.0), 1),
             "ceiling_high": res["ceiling_high"],
             "broken_level": res["broken_level"],
             "retest_count": res["retest_count"],
@@ -334,22 +391,7 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, cumulative_
         done_setups.clear()
         done_setups.update(m["setup_key"] for m in tracked.values())
 
-    # Embudo del ciclo + acumulado histórico (persistido en /data, sobrevive
-    # redeploys). Lectura rápida sin tener que ir símbolo por símbolo: si
-    # "bloqueada_chase" o "sl_fuera_de_rango" concentran un % alto contra
-    # "esperando_retest"+"senal", ese filtro es el que más está recortando
-    # -- primer candidato a revisar (mismo criterio que backtest_pump_fade.py).
-    if cycle_states:
-        cumulative_states.update(cycle_states)
-        total_hist = sum(cumulative_states.values())
-        log.info("Embudo del ciclo: %s", dict(cycle_states))
-        log.info("Embudo acumulado (n=%d evaluaciones desde el último arranque "
-                 "en frío): %s", total_hist,
-                 {k: f"{v} ({v / total_hist * 100:.0f}%)"
-                  for k, v in cumulative_states.most_common()})
-
-    store.save({k: int(time.time() * 1000) for k in done_setups}, {}, tracked,
-               risk.snapshot(), {"state_funnel": dict(cumulative_states)})
+    store.save({k: int(time.time() * 1000) for k in done_setups}, {}, tracked, risk.snapshot(), watch)
 
 
 if __name__ == "__main__":
