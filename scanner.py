@@ -55,17 +55,20 @@ async def get_top_gainers(client, config):
             continue
         if vol < config.MIN_24H_VOLUME_USDT:
             continue
-        if not (config.PUMP_MIN_24H_PCT <= gain <= config.PUMP_MAX_24H_PCT):
-            continue
         out.append({"symbol": symbol, "gain_24h_pct": gain,
                     "volume_24h_usdt": vol, "last_price": last})
 
-    out.sort(key=lambda x: x["gain_24h_pct"], reverse=True)
-    top = out[: config.TOP_GAINERS_N]
+    # mapa completo (todos los validos, sin filtro de gain) para que el
+    # radar persistente pueda chequear volumen/gain actual de sus simbolos
+    ticker_map = {t["symbol"]: t for t in out}
+    out2 = [t for t in out
+            if config.PUMP_MIN_24H_PCT <= t["gain_24h_pct"] <= config.PUMP_MAX_24H_PCT]
+    out2.sort(key=lambda x: x["gain_24h_pct"], reverse=True)
+    top = out2[: config.TOP_GAINERS_N]
     if top:
         log.info(
             "Ganadores 24h en radar: %d | top 5: %s",
             len(top),
             ", ".join(f"{t['symbol']} +{t['gain_24h_pct']:.0f}%" for t in top[:5]),
         )
-    return top
+    return top, ticker_map
