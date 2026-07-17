@@ -40,7 +40,7 @@ def _s(name, default):
     return _clean(os.getenv(name, default))
 
 
-CODE_VERSION = "2026-07-16-pumpfade-v1.9"
+CODE_VERSION = "2026-07-16-pumpfade-v2.0"
 
 # ── Modo ──────────────────────────────────────────────────────────────
 # ARRANCA EN DRY_RUN: este bot shortea los activos más violentos del día.
@@ -86,14 +86,27 @@ STRUCT_PIVOT_LEN = _i("STRUCT_PIVOT_LEN", 5)       # swings 5/5 (estándar)
 REJECT_MAX_CLOSE_POS = _f("REJECT_MAX_CLOSE_POS", 0.40)  # el techo debe
 # cerrar en el 40% inferior de su propia vela (rechazo real, no doji)
 CEILING_MIN_RANGE_ATR = _f("CEILING_MIN_RANGE_ATR", 0.5)
+CEILING_VOL_LEN = _i("CEILING_VOL_LEN", 20)         # velas para el volumen
+# promedio de referencia del techo
+CEILING_VOL_MULT = _f("CEILING_VOL_MULT", 1.3)      # el techo debe traer
+# volumen >= esto x el promedio — blow-off real (compra climática siendo
+# absorbida), no una vela angosta cualquiera con mecha
+MIN_CHOCH_DROP_ATR = _f("MIN_CHOCH_DROP_ATR", 1.5)  # el CHoCH debe caer al
+# menos esto en ATRs desde el techo — evita romper un pivote insignificante
+# pegado al propio techo (ruido, no reversión real)
 RETEST_TOUCH_ATR = _f("RETEST_TOUCH_ATR", 0.10)    # tocar el nivel roto
 RETEST_BREAK_ATR = _f("RETEST_BREAK_ATR", 0.05)    # cierre de rechazo
-RECLAIM_ATR = _f("RECLAIM_ATR", 0.75)
+RECLAIM_ATR = _f("RECLAIM_ATR", 0.75)               # cierre > nivel+0.75ATR
+# = reclaim: el quiebre era falso, setup muerto
 ARM_DIST_ATR = _f("ARM_DIST_ATR", 0.5)   # el contador de retests se ARMA
 # recien cuando el precio se aleja esto del nivel roto. Sin esto, las velas
 # del propio desplome (todavia pegadas al nivel) consumian el retest #1 y el
-# retest de verdad llegaba como #2 = "zona gastada" -> cero senales.              # cierre > nivel+0.75ATR
-# = reclaim: el quiebre era falso, setup muerto
+# retest de verdad llegaba como #2 = "zona gastada" -> cero senales.
+QUALITY_GATE_MODE = _s("QUALITY_GATE_MODE", "log")  # "log": se calcula y
+# journalea el quality_score pero no bloquea nada (default — mismo patrón
+# que JUMP_GUARD_MODE en renewed-love: primero medir, después decidir con
+# el journal). "block": descarta señales con score < MIN_QUALITY_SCORE.
+MIN_QUALITY_SCORE = _i("MIN_QUALITY_SCORE", 55)
 PUMP_MAX_RETEST = _i("PUMP_MAX_RETEST", 1)         # Raschke: SOLO el primer
 # retest — el #2+ entra contra una zona gastada y acá no hay margen de error
 

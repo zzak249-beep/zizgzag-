@@ -221,7 +221,7 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, watch):
                 "simulated": True, "result": result,
                 "pnl_usdt": round(pnl, 4), "exit": exit_price,
                 "setup_key": meta.get("setup_key"),
-                "gain_24h_pct": meta.get("gain_24h_pct"),
+                "gain_24h_pct": meta.get("gain_24h_pct"), "quality_score": meta.get("quality_score"),
                 "retest_count": meta.get("retest_count"),
                 "jump": meta.get("jump"), "sl_widened": meta.get("sl_widened"),
                 "held_min": round((time.time() * 1000 - meta["opened_at_ms"]) / 60000),
@@ -243,7 +243,7 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, watch):
         journal.record({
             "event": "position_closed", "symbol": symbol, "side": "SHORT",
             "pnl_usdt": round(pnl, 4), "setup_key": meta.get("setup_key"),
-            "gain_24h_pct": meta.get("gain_24h_pct"),
+            "gain_24h_pct": meta.get("gain_24h_pct"), "quality_score": meta.get("quality_score"),
             "retest_count": meta.get("retest_count"),
             "jump": meta.get("jump"), "sl_widened": meta.get("sl_widened"),
             "held_min": round((time.time() * 1000 - meta["opened_at_ms"]) / 60000),
@@ -313,6 +313,17 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, watch):
                      symbol, res["state"], g["gain_24h_pct"],
                      res.get("retest_count"),
                      (res.get("jump") or {}).get("L_last"))
+            _bk = f"{symbol}|blk|{res.get('setup_key_suffix')}|{res['state']}"
+            if _bk not in done_setups:
+                done_setups.add(_bk)
+                journal.record({
+                    "event": "signal_blocked", "symbol": symbol,
+                    "state": res["state"],
+                    "gain_24h_pct": round(g["gain_24h_pct"], 1),
+                    "retest_count": res.get("retest_count"),
+                    "sl_dist_pct": res.get("sl_dist_pct"),
+                    "jump": res.get("jump"), "ts": int(time.time() * 1000),
+                })
         if res["signal"] != "SHORT":
             continue
 
@@ -349,11 +360,14 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, watch):
 
         log.info("[%s] SEÑAL SHORT pump-fade | +%.0f%% 24h | entry=%.6f "
                  "sl=%.6f (%.2f%%%s) tp=%.6f | techo=%.6f nivel_roto=%.6f | "
-                 "retest#%d | jump_L=%s",
+                 "retest#%d | vol_techox%.1f | choch_drop=%.1fATR | "
+                 "quality=%d/100 | jump_L=%s",
                  symbol, g["gain_24h_pct"], entry, sl, res["sl_dist_pct"],
                  " ensanchado" if res["sl_widened"] else "", tp,
                  res["ceiling_high"], res["broken_level"],
-                 res["retest_count"], (res.get("jump") or {}).get("L_last"))
+                 res["retest_count"], res["ceiling_vol_ratio"],
+                 res["choch_drop_atr"], res["quality_score"],
+                 (res.get("jump") or {}).get("L_last"))
 
         await client.set_leverage(symbol, config.LEVERAGE, side="SHORT")
         order = await client.open_position(symbol, "SHORT", qty,
@@ -383,7 +397,7 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, watch):
             "opened_at_ms": int(time.time() * 1000),
             "entry": entry, "sl": sl, "tp": tp,
             "gain_24h_pct": round(g["gain_24h_pct"], 1),
-            "retest_count": res["retest_count"],
+            "retest_count": res["retest_count"], "quality_score": res["quality_score"],
             "jump": res.get("jump"), "sl_widened": res["sl_widened"],
         }
         risk.register_open_risk(risk_pct)
@@ -396,6 +410,9 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, watch):
             "ceiling_high": res["ceiling_high"],
             "broken_level": res["broken_level"],
             "retest_count": res["retest_count"],
+            "ceiling_vol_ratio": res["ceiling_vol_ratio"],
+            "choch_drop_atr": res["choch_drop_atr"],
+            "quality_score": res["quality_score"],
             "sl_dist_pct": res["sl_dist_pct"], "sl_widened": res["sl_widened"],
             "jump": res.get("jump"), "dry_run": config.DRY_RUN,
             "ts": int(time.time() * 1000),
