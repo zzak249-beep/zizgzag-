@@ -165,7 +165,7 @@ async def run():
     ) as client:
         _log_journal_report()
 
-    while True:
+        while True:
             try:
                 await _cycle(client, journal, risk, store, tracked, done_setups, watch)
             except Exception:  # noqa: BLE001
