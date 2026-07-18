@@ -163,12 +163,47 @@ async def run():
         config.BINGX_API_KEY, config.BINGX_API_SECRET,
         config.BINGX_BASE_URL, **_kw,
     ) as client:
-        while True:
+        _log_journal_report()
+
+    while True:
             try:
                 await _cycle(client, journal, risk, store, tracked, done_setups, watch)
             except Exception:  # noqa: BLE001
                 log.exception("Error en el ciclo — sigo en el próximo")
             await asyncio.sleep(config.SCAN_INTERVAL_S)
+
+
+def _log_journal_report():
+    """Resumen del journal en el log de arranque. Con ANALYZE_ON_START=True
+    vuelca el informe completo de analyze_pumpfade (para leerlo desde el
+    Deploy Log de Railway sin consola ni SSH)."""
+    try:
+        import json as _json
+        with open(config.JOURNAL_FILE) as _f:
+            _entries = _json.load(_f)
+        _op = [e for e in _entries if e.get("event") == "position_opened"]
+        _cl = [e for e in _entries if e.get("event") == "position_closed"
+               and e.get("simulated")]
+        _bk = [e for e in _entries if e.get("event") == "signal_blocked"]
+        _w = sum(1 for e in _cl if e.get("result") == "tp")
+        _l = sum(1 for e in _cl if e.get("result") == "sl")
+        _n = _w + _l
+        log.info("Journal: %d eventos | %d señales | paper %dW/%dL%s | "
+                 "%d bloqueadas", len(_entries), len(_op), _w, _l,
+                 f" (WR {_w / _n * 100:.0f}%)" if _n else "", len(_bk))
+    except FileNotFoundError:
+        log.info("Journal: aún sin archivo (0 eventos)")
+    except Exception as _e:
+        log.warning("Journal: no se pudo resumir (%s)", _e)
+    if config.ANALYZE_ON_START:
+        log.info("ANALYZE_ON_START=True — informe completo:")
+        try:
+            import analyze_pumpfade
+            analyze_pumpfade.main(config.JOURNAL_FILE)
+        except Exception as _e:
+            log.warning("No se pudo generar el informe (%s)", _e)
+        log.info("Fin del informe. Acordate de volver ANALYZE_ON_START a "
+                 "False (o borrarla) para no repetirlo en cada arranque.")
 
 
 async def _cycle(client, journal, risk, store, tracked, done_setups, watch):

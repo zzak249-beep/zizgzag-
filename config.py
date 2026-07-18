@@ -40,13 +40,16 @@ def _s(name, default):
     return _clean(os.getenv(name, default))
 
 
-CODE_VERSION = "2026-07-16-pumpfade-v2.0"
+CODE_VERSION = "2026-07-18-pumpfade-v2.1"
 
 # ── Modo ──────────────────────────────────────────────────────────────
 # ARRANCA EN DRY_RUN: este bot shortea los activos más violentos del día.
 # Se pasa a real recién después de ver señales en seco 3-5 días.
 DRY_RUN = _b("DRY_RUN", True)
-DRY_RUN_BALANCE = _f("DRY_RUN_BALANCE", 125.0)  # balance simulado para
+DRY_RUN_BALANCE = _f("DRY_RUN_BALANCE", 125.0)
+ANALYZE_ON_START = _b("ANALYZE_ON_START", False)  # True -> vuelca el informe
+# completo de analyze_pumpfade en el log de arranque (para leerlo en Railway
+# sin consola). Volver a False despues de leerlo.  # balance simulado para
 # observar senales aunque la cuenta este vacia o las keys sin fondos --
 # el sizing del journal en seco se calcula con este numero
 
