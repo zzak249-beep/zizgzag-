@@ -122,13 +122,14 @@ def test_chase_bloqueado():
         p *= 0.990
     res = eng.analyze(cs, config)
     level = res["broken_level"]
-    while p < level * 0.997:
-        cs.append(mk(p, p * 1.004, t=(t := t + 1)))
-        p *= 1.004
     atr = eng._atr(cs)
-    # vela de rechazo que ADEMÁS es un desplome estadístico (-3%)
-    crash_close = min(level - 0.2 * atr, p * 0.94)
-    cs.append(mk(p, crash_close, h=level + 0.02 * atr, t=(t := t + 1)))
+    # SALTO estadístico como última vela del desplome (sin pivots
+    # confirmados: la escalera no puede re-anclar en caída monótona)...
+    cs.append(mk(p, p * 0.94, t=(t := t + 1)))
+    p *= 0.94
+    # ...y retest INMEDIATO del mismo nivel con vela roja: chase de manual
+    cs.append(mk(level + 0.01 * atr, level - 0.2 * atr,
+                 h=level + 0.02 * atr, t=(t := t + 1)))
     res = eng.analyze(cs, config)
     assert res["signal"] is None and res["state"] == "bloqueada_chase", res
     print(f"desplome vertical: bloqueada por chase "

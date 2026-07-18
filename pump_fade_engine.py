@@ -126,7 +126,7 @@ def analyze(candles, config):
       ceiling_idx, ceiling_high, broken_level, choch_idx, retest_count,
       sl_widened, jump (dict del guard), setup_key_suffix
     """
-    out = {"signal": None, "state": "sin_techo", "retest_count": 0,
+    out = {"signal": None, "state": "sin_techo", "retest_count": 0, "leg": 1,
            "ceiling_high": None, "broken_level": None, "sl_widened": False,
            "jump": None, "setup_key_suffix": None, "ceiling_vol_ratio": None,
            "choch_drop_atr": None, "quality_score": None}
@@ -190,11 +190,37 @@ def analyze(candles, config):
     touching = False
     armed = False       # el precio debe ALEJARSE del nivel antes de que un
     signal_idx = None   # acercamiento cuente como retest (si no, el propio
+    leg = 1             # ESCALERA: peldano vigente (cada CHoCH nuevo = +1)
     for i in range(choch_idx + 1, n):   # desplome consume el episodio #1)
         c = candles[i]
         if c["close"] > ceiling_high or c["close"] > reclaim_lv:
             out["state"] = "invalidado"
             return out
+        # ── ESCALERA: cierre bajo un swing low confirmado MAS BAJO que el
+        # nivel vigente = nuevo peldano; el nivel operable pasa a ser ese
+        # (primer pullback fresco de Raschke POR peldano).
+        nuevo = None
+        for lo_idx in lows:
+            lo_lv = candles[lo_idx]["low"]
+            if (lo_idx > choch_idx
+                    and lo_idx + config.STRUCT_PIVOT_LEN <= i
+                    and lo_lv < broken_level - config.ARM_DIST_ATR * atr
+                    and c["close"] < lo_lv
+                    and (nuevo is None or lo_idx > nuevo[0])):
+                nuevo = (lo_idx, lo_lv)
+        if nuevo is not None:
+            leg += 1
+            broken_level = nuevo[1]
+            reclaim_lv = broken_level + config.RECLAIM_ATR * atr
+            touch_lo = broken_level - config.RETEST_TOUCH_ATR * atr
+            break_lv = broken_level - config.RETEST_BREAK_ATR * atr
+            arm_lv = broken_level - config.ARM_DIST_ATR * atr
+            choch_idx = i
+            episodes = 0
+            touching = False
+            armed = False
+            signal_idx = None
+            continue
         if not armed:
             if c["high"] < arm_lv:
                 armed = True
@@ -212,6 +238,9 @@ def analyze(candles, config):
         else:
             touching = touch_now
     out["retest_count"] = episodes
+    out["leg"] = leg
+    out["broken_level"] = broken_level
+    out["choch_idx"] = choch_idx
 
     if episodes == 0:
         return out

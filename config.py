@@ -40,7 +40,7 @@ def _s(name, default):
     return _clean(os.getenv(name, default))
 
 
-CODE_VERSION = "2026-07-18-pumpfade-v2.2"
+CODE_VERSION = "2026-07-18-pumpfade-v2.3-escalera"
 
 # ── Modo ──────────────────────────────────────────────────────────────
 # ARRANCA EN DRY_RUN: este bot shortea los activos más violentos del día.
@@ -65,8 +65,8 @@ MIN_24H_VOLUME_USDT = _f("MIN_24H_VOLUME_USDT", 5_000_000)  # lección LAB:
 # el piso aplica SIEMPRE — en día de pump el volumen explota, así que los
 # pumps reales pasan; lo que filtra es la chicharra ilíquida donde el
 # propio stop mueve el precio.
-TOP_GAINERS_N = _i("TOP_GAINERS_N", 25)
-RADAR_TTL_H = _f("RADAR_TTL_H", 12.0)  # horas que un símbolo sigue en radar
+TOP_GAINERS_N = _i("TOP_GAINERS_N", 40)
+RADAR_TTL_H = _f("RADAR_TTL_H", 24.0)  # horas que un símbolo sigue en radar
 # después de pumpear, aunque su +24h caiga bajo el mínimo: el desplome
 # post-techo baja la ganancia justo cuando llega el retest — antes de este
 # fix, el bot dejaba de mirar la moneda en el momento exacto de la señal
@@ -82,7 +82,8 @@ NON_CRYPTO_PREFIXES = tuple(
 ENTRY_TF = _s("ENTRY_TF", "5m")
 KLINES_LIMIT = _i("KLINES_LIMIT", 400)      # ~33h de velas 5m
 DAY_BARS = _i("DAY_BARS", 288)              # ventana del "techo del día" (24h)
-CEILING_MAX_AGE_BARS = _i("CEILING_MAX_AGE_BARS", 96)  # techo válido <= 8h
+CEILING_MAX_AGE_BARS = _i("CEILING_MAX_AGE_BARS", 288)  # 24h: los
+# techos nocturnos (caso TENDIES) dejaban de valer justo antes del retest  # techo válido <= 8h
 
 # ── Detección del setup (techo -> CHoCH -> retest) ───────────────────
 STRUCT_PIVOT_LEN = _i("STRUCT_PIVOT_LEN", 5)       # swings 5/5 (estándar)
@@ -138,7 +139,8 @@ MIN_NOTIONAL_MAX_RISK_PCT = _f("MIN_NOTIONAL_MAX_RISK_PCT", 1.5)
 JUMP_GUARD_MODE = _s("JUMP_GUARD_MODE", "block")
 JUMP_THRESH = _f("JUMP_THRESH", 4.0)
 JUMP_WIN = _i("JUMP_WIN", 50)
-JUMP_COOLDOWN_BARS = _i("JUMP_COOLDOWN_BARS", 2)
+JUMP_COOLDOWN_BARS = _i("JUMP_COOLDOWN_BARS", 1)  # solo la vela
+# inmediata al desplome: la unica senal historica murio por chase con 2
 
 # ── Loop / infraestructura ───────────────────────────────────────────
 SCAN_INTERVAL_S = _i("SCAN_INTERVAL_S", 90)
