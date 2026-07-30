@@ -325,6 +325,8 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, watch):
                             "from_radar": True})
 
     # ── 3. Evaluar cada uno ──
+    _state_counts: dict = {}
+    _evaluated = 0
     for g in gainers:
         symbol = g["symbol"]
         if symbol in tracked or symbol in open_now:
@@ -336,12 +338,19 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, watch):
             continue
         # velas CERRADAS: descartar la vela en formación (regla [-2] de la flota)
         res = pump_fade_engine.analyze(candles[:-1], config)
+        _evaluated += 1
+        _state_counts[res["state"]] = _state_counts.get(res["state"], 0) + 1
 
         w = watch.get(symbol)
         if w is not None and w.get("state") != res["state"]:
-            log.info("[%s] fase: %s -> %s | +%.0f%% 24h",
+            log.info("[%s] fase: %s -> %s | +%.0f%% 24h | "
+                     "techo=%s nivel=%s choch_drop=%s quality=%s",
                      symbol, w.get("state", "?"), res["state"],
-                     g["gain_24h_pct"])
+                     g["gain_24h_pct"],
+                     f"{res['ceiling_high']:.6f}" if res.get("ceiling_high") else "—",
+                     f"{res['broken_level']:.6f}" if res.get("broken_level") else "—",
+                     f"{res['choch_drop_atr']:.2f}ATR" if res.get("choch_drop_atr") else "—",
+                     res.get("quality_score"))
             w["state"] = res["state"]
         if res["state"] in ("bloqueada_chase", "sl_fuera_de_rango"):
             log.info("[%s] %s | +%.0f%% 24h | retest#%s | jump=%s",
@@ -452,6 +461,25 @@ async def _cycle(client, journal, risk, store, tracked, done_setups, watch):
             "jump": res.get("jump"), "dry_run": config.DRY_RUN,
             "ts": int(time.time() * 1000),
         })
+
+    # ── Resumen de ciclo — siempre visible en Railway ──────────────────
+    if _evaluated > 0:
+        # Mostrar los estados más relevantes (excluir sin_techo que es el ruido)
+        interesting = {k: v for k, v in _state_counts.items()
+                       if k not in ("sin_techo", "datos_insuficientes")}
+        log.info(
+            "Ciclo: %d evaluados | sin_techo=%d | avanzados: %s | tracked=%d",
+            _evaluated,
+            _state_counts.get("sin_techo", 0),
+            interesting or "ninguno",
+            len(tracked),
+        )
+    elif gainers:
+        log.info("Ciclo: %d en radar, todos en tracked/open — sin nuevos a evaluar | tracked=%d",
+                 len(gainers), len(tracked))
+    else:
+        log.info("Ciclo: sin ganadores en radar | tracked=%d | watch=%d",
+                 len(tracked), len(watch))
 
     # dedupe acotado (los setups viejos ya no pueden repetirse igual)
     if len(done_setups) > 500:
