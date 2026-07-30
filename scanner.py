@@ -67,8 +67,16 @@ async def get_top_gainers(client, config):
     top = out2[: config.TOP_GAINERS_N]
     if top:
         log.info(
-            "Ganadores 24h en radar: %d | top 5: %s",
-            len(top),
+            "Scanner: %d ganadores (+%.0f%%) | vol_ok=%d total | top 5: %s",
+            len(top), config.PUMP_MIN_24H_PCT, len(out),
             ", ".join(f"{t['symbol']} +{t['gain_24h_pct']:.0f}%" for t in top[:5]),
+        )
+    else:
+        log.info(
+            "Scanner: 0 pares con +%.0f%% 24h (vol>=%.0fM) — "
+            "%d pares con vol OK, mercado tranquilo o filtro duro",
+            config.PUMP_MIN_24H_PCT,
+            config.MIN_24H_VOLUME_USDT / 1_000_000,
+            len(out),
         )
     return top, ticker_map
