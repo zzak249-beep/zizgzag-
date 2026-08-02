@@ -72,11 +72,17 @@ async def get_top_gainers(client, config):
             ", ".join(f"{t['symbol']} +{t['gain_24h_pct']:.0f}%" for t in top[:5]),
         )
     else:
+        # Mostrar el gainer más alto aunque no pase el filtro — para saber
+        # si el mercado está en +5.9% o en +1.2% y decidir con datos.
+        best = max(out, key=lambda x: x["gain_24h_pct"], default=None)
+        best_str = (f" | mejor: {best['symbol']} +{best['gain_24h_pct']:.1f}%"
+                    if best else "")
         log.info(
             "Scanner: 0 pares con +%.0f%% 24h (vol>=%.0fM) — "
-            "%d pares con vol OK, mercado tranquilo o filtro duro",
+            "%d pares con vol OK, mercado tranquilo o filtro duro%s",
             config.PUMP_MIN_24H_PCT,
             config.MIN_24H_VOLUME_USDT / 1_000_000,
             len(out),
+            best_str,
         )
     return top, ticker_map
