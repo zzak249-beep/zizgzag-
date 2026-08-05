@@ -51,6 +51,11 @@ QTY_PREC       = int(os.getenv("QTY_PRECISION", "3"))
 TG_TOKEN       = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT        = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# HEDGE o ONEWAY -- consulta tu cuenta: app BingX > Futuros > Preferencias >
+# Modo de posicion. El bot original asumia siempre ONEWAY (positionSide=BOTH).
+# Si tu cuenta esta en HEDGE (como en tu otro bot), las ordenes fallaban.
+POSITION_MODE  = os.getenv("POSITION_MODE", "ONEWAY").upper()
+
 PARAMS = StrategyParams(
     swing_len     = int(os.getenv("SWING_LEN", "10")),
     atr_filter    = _bool("ATR_FILTER", "true"),
@@ -66,6 +71,14 @@ INTERVAL_SECS = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
     "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400,
 }
+
+
+def _position_side(entry_side: str) -> str:
+    """entry_side = 'BUY' o 'SELL', la direccion de la posicion (no de la
+    orden concreta -- para cerrar, entry_side sigue siendo el de apertura)."""
+    if POSITION_MODE == "HEDGE":
+        return "LONG" if entry_side == "BUY" else "SHORT"
+    return "BOTH"
 
 # ─────────────────────────────────────────────
 # TELEGRAM
@@ -109,9 +122,19 @@ class BingXClient:
         return r.json()
 
     def _post(self, path: str, params: Optional[dict] = None) -> dict:
+        # FIX: BingX espera la query firmada en el BODY para POST
+        # (application/x-www-form-urlencoded), no en la URL como GET/DELETE.
+        # Confirmado contra la referencia oficial de BingX para agentes de
+        # IA (github.com/BingX-API/api-ai-skills). Con params= (como estaba)
+        # `requests` la manda como query string de la URL y el body llega
+        # vacío -- no fallaba porque DRY_RUN nunca llega a llamar a esto.
         p  = params or {}
         qs = self._sign(p)
-        r  = self.session.post(f"{BASE_URL}{path}", params=qs, timeout=15)
+        r  = self.session.post(
+            f"{BASE_URL}{path}", data=qs,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15,
+        )
         r.raise_for_status()
         return r.json()
 
@@ -145,11 +168,21 @@ class BingXClient:
 
     # ── account ──────────────────────────────
     def get_balance(self) -> float:
+        # FIX: la respuesta real de BingX trae "balance" como un DICT
+        # único {"asset": "USDT", "balance": "50.0000", ...}, no como
+        # lista. Confirmado contra una respuesta real de BingX en esta
+        # misma conversación. Iterar el dict como si fuera una lista de
+        # dicts fallaba en silencio (0.0 siempre) o reventaba con
+        # AttributeError al primer .get() sobre una clave-string.
         try:
             data = self._get("/openApi/swap/v2/user/balance")
-            for b in data.get("data", {}).get("balance", []):
-                if b.get("asset") == "USDT":
-                    return float(b.get("balance", 0))
+            bal = data.get("data", {}).get("balance", {})
+            if isinstance(bal, dict) and bal.get("asset") == "USDT":
+                return float(bal.get("balance", 0))
+            if isinstance(bal, list):  # por si BingX cambia el formato
+                for b in bal:
+                    if isinstance(b, dict) and b.get("asset") == "USDT":
+                        return float(b.get("balance", 0))
         except Exception as exc:
             log.warning(f"get_balance: {exc}")
         return 0.0
@@ -186,44 +219,55 @@ class BingXClient:
         return self._post("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
             "side":         side,       # BUY | SELL
-            "positionSide": "BOTH",     # one-way mode
+            "positionSide": _position_side(side),
             "type":         "MARKET",
             "quantity":     round(qty, QTY_PREC),
         })
 
-    def stop_market(self, symbol: str, side: str, stop_price: float) -> dict:
-        """STOP_MARKET to close position (SL)."""
-        return self._post("/openApi/swap/v2/trade/order", {
+    def stop_market(self, symbol: str, side: str, stop_price: float, entry_side: str) -> dict:
+        """STOP_MARKET para cerrar posicion (SL). entry_side = direccion
+        ORIGINAL de la posicion (no `side`, que es el lado de esta orden)."""
+        params = {
             "symbol":        symbol,
             "side":          side,
-            "positionSide":  "BOTH",
+            "positionSide":  _position_side(entry_side),
             "type":          "STOP_MARKET",
             "stopPrice":     round(stop_price, PRICE_PREC),
-            "closePosition": "true",
-        })
+        }
+        # closePosition/reduceOnly no son compatibles con HEDGE -- ahi el
+        # cierre lo define la combinacion side+positionSide por si sola.
+        if POSITION_MODE != "HEDGE":
+            params["closePosition"] = "true"
+        return self._post("/openApi/swap/v2/trade/order", params)
 
-    def take_profit_market(self, symbol: str, side: str, tp_price: float) -> dict:
-        """TAKE_PROFIT_MARKET to close position (TP)."""
-        return self._post("/openApi/swap/v2/trade/order", {
+    def take_profit_market(self, symbol: str, side: str, tp_price: float, entry_side: str) -> dict:
+        """TAKE_PROFIT_MARKET para cerrar posicion (TP)."""
+        params = {
             "symbol":        symbol,
             "side":          side,
-            "positionSide":  "BOTH",
+            "positionSide":  _position_side(entry_side),
             "type":          "TAKE_PROFIT_MARKET",
             "stopPrice":     round(tp_price, PRICE_PREC),
-            "closePosition": "true",
-        })
+        }
+        if POSITION_MODE != "HEDGE":
+            params["closePosition"] = "true"
+        return self._post("/openApi/swap/v2/trade/order", params)
 
     def close_position(self, symbol: str, pos: dict) -> dict:
-        amt  = abs(float(pos.get("positionAmt", 0)))
-        side = "SELL" if float(pos.get("positionAmt", 0)) > 0 else "BUY"
-        return self._post("/openApi/swap/v2/trade/order", {
+        amt        = abs(float(pos.get("positionAmt", 0)))
+        is_long    = float(pos.get("positionAmt", 0)) > 0
+        side       = "SELL" if is_long else "BUY"
+        entry_side = "BUY" if is_long else "SELL"
+        params = {
             "symbol":       symbol,
             "side":         side,
-            "positionSide": "BOTH",
+            "positionSide": _position_side(entry_side),
             "type":         "MARKET",
             "quantity":     round(amt, QTY_PREC),
-            "reduceOnly":   "true",
-        })
+        }
+        if POSITION_MODE != "HEDGE":
+            params["reduceOnly"] = "true"
+        return self._post("/openApi/swap/v2/trade/order", params)
 
 
 # ─────────────────────────────────────────────
@@ -294,19 +338,14 @@ def run_cycle() -> None:
 
     # ── DRY RUN ──
     if DRY_RUN:
-        msg = (
-            f"🔵 <b>[DRY] {direction} {SYMBOL}</b>
-"
-            f"Trigger: <code>{trigger}</code>
-"
-            f"Entry: <code>{entry}</code>
-"
-            f"SL: <code>{sl_price}</code>  TP: <code>{tp_price}</code>
-"
-            f"RR: {rr:.1f}x  |  Conf: {sig.conf_score:.0f}
-"
-            f"Zone: {zone}  |  Fib dir: {fdir}  |  ATR: {atr:.5f}"
-        )
+        msg = "\n".join([
+            f"🔵 <b>[DRY] {direction} {SYMBOL}</b>",
+            f"Trigger: <code>{trigger}</code>",
+            f"Entry: <code>{entry}</code>",
+            f"SL: <code>{sl_price}</code>  TP: <code>{tp_price}</code>",
+            f"RR: {rr:.1f}x  |  Conf: {sig.conf_score:.0f}",
+            f"Zone: {zone}  |  Fib dir: {fdir}  |  ATR: {atr:.5f}",
+        ])
         tg(msg)
         log.info("DRY_RUN — no order placed")
         return
@@ -324,32 +363,27 @@ def run_cycle() -> None:
         time.sleep(0.8)
 
         try:
-            client.stop_market(SYMBOL, close_side, sl_price)
+            client.stop_market(SYMBOL, close_side, sl_price, order_side)
             log.info(f"SL placed @ {sl_price}")
         except Exception as exc:
             log.error(f"SL placement failed: {exc}")
 
         try:
-            client.take_profit_market(SYMBOL, close_side, tp_price)
+            client.take_profit_market(SYMBOL, close_side, tp_price, order_side)
             log.info(f"TP placed @ {tp_price}")
         except Exception as exc:
             log.error(f"TP placement failed: {exc}")
 
         state["position"] = direction
         emoji = "🟢" if sig.confirmed_buy else "🔴"
-        msg = (
-            f"{emoji} <b>{direction} {SYMBOL}</b>
-"
-            f"Trigger: <code>{trigger}</code>
-"
-            f"Entry: <code>{entry}</code>
-"
-            f"SL: <code>{sl_price}</code>  TP: <code>{tp_price}</code>
-"
-            f"RR: {rr:.1f}x  |  Conf: {sig.conf_score:.0f}
-"
-            f"Zone: {zone}  |  ATR: {atr:.5f}"
-        )
+        msg = "\n".join([
+            f"{emoji} <b>{direction} {SYMBOL}</b>",
+            f"Trigger: <code>{trigger}</code>",
+            f"Entry: <code>{entry}</code>",
+            f"SL: <code>{sl_price}</code>  TP: <code>{tp_price}</code>",
+            f"RR: {rr:.1f}x  |  Conf: {sig.conf_score:.0f}",
+            f"Zone: {zone}  |  ATR: {atr:.5f}",
+        ])
         tg(msg)
 
     except Exception as exc:
