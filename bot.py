@@ -336,10 +336,55 @@ state  = {
     "symbols_scanned":  0,
     "trades_today":     0,
     "errors":           0,
+    "paper_open":       0,
+    "paper_wins":       0,
+    "paper_losses":     0,
 }
 _trades_today_date: Optional[str] = None
 _symbol_cache: list = []
 _symbol_cache_cycle: int = -999
+_paper_positions: dict = {}  # symbol -> {direction, entry, sl, tp, opened_at, trigger}
+
+
+def _paper_winrate() -> float:
+    total = state["paper_wins"] + state["paper_losses"]
+    return (state["paper_wins"] / total * 100.0) if total else 0.0
+
+
+def _manage_paper_positions() -> None:
+    """Sin esto, DRY_RUN manda la señal por Telegram y la olvida --
+    nunca se sabe si el SL o el TP se habrian tocado. Mismo problema
+    encontrado y arreglado en bingx-ict-scanner (v1.3.0): sin cerrar
+    las posiciones de papel, tampoco hay forma de decir si el bot es
+    rentable, solo cuantas señales dispara."""
+    if not DRY_RUN or not _paper_positions:
+        return
+    for sym in list(_paper_positions.keys()):
+        p = _paper_positions[sym]
+        try:
+            df = client.get_klines(sym, INTERVAL, 2)
+        except Exception as exc:
+            log.debug(f"{sym}: fallo trayendo precio para posicion de papel ({exc})")
+            continue
+        if df.empty:
+            continue
+        price = float(df["close"].iloc[-1])
+        is_long = p["direction"] == "LONG"
+        hit_tp = price >= p["tp"] if is_long else price <= p["tp"]
+        hit_sl = price <= p["sl"] if is_long else price >= p["sl"]
+        if not (hit_tp or hit_sl):
+            continue
+        win = hit_tp and not hit_sl
+        state["paper_wins" if win else "paper_losses"] += 1
+        state["paper_open"] = len(_paper_positions) - 1
+        elapsed_min = (time.time() * 1000 - p["opened_at"]) / 60000
+        icon = "✅" if win else "❌"
+        tg(
+            f"{icon} <b>[Papel] Cierre {'TP' if win else 'SL'}</b> — {sym}\n"
+            f"{p['direction']} desde {p['entry']} | {elapsed_min:.0f} min | "
+            f"Racha: {state['paper_wins']}W/{state['paper_losses']}L ({_paper_winrate():.0f}%)"
+        )
+        del _paper_positions[sym]
 
 
 def _reset_daily_counter_if_new_day() -> None:
@@ -433,10 +478,11 @@ def _dispatch_signal(s: dict, open_symbols: set) -> None:
     Aplica los limites de posiciones concurrentes y trades/dia."""
     sym = s["symbol"]
 
-    if sym in open_symbols:
+    if sym in open_symbols or sym in _paper_positions:
         log.info(f"{sym}: ya hay posicion abierta, se omite")
         return
-    if state["open_positions"] >= MAX_CONCURRENT_POSITIONS:
+    open_count = len(_paper_positions) if DRY_RUN else state["open_positions"]
+    if open_count >= MAX_CONCURRENT_POSITIONS:
         log.info(f"{sym}: limite de posiciones concurrentes alcanzado, se omite")
         return
     if state["trades_today"] >= MAX_TRADES_PER_DAY:
@@ -461,6 +507,12 @@ def _dispatch_signal(s: dict, open_symbols: set) -> None:
         ])
         tg(msg)
         state["trades_today"] += 1  # cuenta igual en DRY_RUN, para probar el limite tal cual se comportara en real
+        _paper_positions[sym] = {
+            "direction": s["direction"], "entry": s["entry"],
+            "sl": s["sl_price"], "tp": s["tp_price"],
+            "trigger": s["trigger"], "opened_at": time.time() * 1000,
+        }
+        state["paper_open"] = len(_paper_positions)
         return
 
     try:
@@ -522,6 +574,8 @@ def run_cycle() -> None:
         positions = client.get_all_positions()
         open_symbols = {p.get("symbol") for p in positions}
         state["open_positions"] = len(open_symbols)
+    else:
+        _manage_paper_positions()
 
     signals: list = []
     if len(symbols) == 1:
@@ -542,10 +596,18 @@ def run_cycle() -> None:
 
     state["last_cycle"] = time.strftime("%H:%M:%S")
     elapsed = time.time() - t0
+    open_now = state['paper_open'] if DRY_RUN else state['open_positions']
     log.info(
         f"Ciclo completo: {len(symbols)} simbolos, {len(signals)} señales, "
-        f"{state['open_positions']} posiciones abiertas, {elapsed:.1f}s"
+        f"{open_now} posiciones abiertas, {elapsed:.1f}s"
     )
+    if DRY_RUN:
+        wl_total = state["paper_wins"] + state["paper_losses"]
+        log.info(
+            f"Papel: {state['paper_open']} abiertas | "
+            f"{state['paper_wins']}W/{state['paper_losses']}L "
+            f"({_paper_winrate():.0f}% de {wl_total} cerradas)"
+        )
 
     for s in signals:
         _dispatch_signal(s, open_symbols)
@@ -570,6 +632,10 @@ class HealthHandler(BaseHTTPRequestHandler):
             "symbols_scanned":  state["symbols_scanned"],
             "open_positions":   state["open_positions"],
             "trades_today":     state["trades_today"],
+            "paper_open":       state["paper_open"],
+            "paper_wins":       state["paper_wins"],
+            "paper_losses":     state["paper_losses"],
+            "paper_winrate":    round(_paper_winrate(), 1),
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
