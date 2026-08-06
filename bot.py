@@ -11,6 +11,7 @@ import hashlib
 import logging
 import threading
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from urllib.parse import urlencode
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -55,6 +56,22 @@ TG_CHAT        = os.getenv("TELEGRAM_CHAT_ID", "")
 # Modo de posicion. El bot original asumia siempre ONEWAY (positionSide=BOTH).
 # Si tu cuenta esta en HEDGE (como en tu otro bot), las ordenes fallaban.
 POSITION_MODE  = os.getenv("POSITION_MODE", "ONEWAY").upper()
+
+# ── Escaneo de todo el exchange ──
+# false (por defecto) = solo SYMBOL, comportamiento original sin cambios.
+# true = ignora SYMBOL, escanea todos los perpetuos USDT-M activos.
+SCAN_ALL_SYMBOLS      = _bool("SCAN_ALL_SYMBOLS", "false")
+QUOTE_ASSET           = os.getenv("QUOTE_ASSET", "USDT")
+SYMBOL_BLACKLIST      = {s.strip().upper() for s in os.getenv("SYMBOL_BLACKLIST", "").split(",") if s.strip()}
+MIN_24H_VOLUME_USDT   = float(os.getenv("MIN_24H_VOLUME_USDT", "0"))
+MAX_WORKERS           = int(os.getenv("MAX_WORKERS", "15"))
+SYMBOL_REFRESH_CYCLES = int(os.getenv("SYMBOL_REFRESH_CYCLES", "20"))
+
+# Frenos obligatorios en cuanto se pasa de 1 simbolo a "todos". Sin esto,
+# cualquier ciclo con varias señales a la vez abriria una posicion por
+# cada una, sin limite.
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
+MAX_TRADES_PER_DAY       = int(os.getenv("MAX_TRADES_PER_DAY", "8"))
 
 PARAMS = StrategyParams(
     swing_len     = int(os.getenv("SWING_LEN", "10")),
@@ -146,6 +163,32 @@ class BingXClient:
         return r.json()
 
     # ── market data ──────────────────────────
+    def get_symbols(self) -> list:
+        """Lista de simbolos USDT-M activos, filtrados por blacklist y
+        volumen minimo. Sin firma (endpoint publico)."""
+        try:
+            data = self._get("/openApi/swap/v2/quote/contracts")
+        except Exception as exc:
+            log.error(f"get_symbols: {exc}")
+            return []
+        rows = data.get("data", [])
+        out = []
+        for c in rows:
+            sym = c.get("symbol", "")
+            if not sym.upper().endswith("-" + QUOTE_ASSET):
+                continue
+            if sym.upper() in SYMBOL_BLACKLIST:
+                continue
+            status = c.get("status", c.get("apiStateOpen"))
+            if status is not None and str(status).upper() in ("0", "FALSE", "OFFLINE", "DELISTED", "PAUSED"):
+                continue
+            if MIN_24H_VOLUME_USDT > 0:
+                vol = float(c.get("quoteVolume24h", c.get("volume24h", 0)) or 0)
+                if vol < MIN_24H_VOLUME_USDT:
+                    continue
+            out.append(sym)
+        return out
+
     def get_klines(self, symbol: str, interval: str, limit: int) -> pd.DataFrame:
         data = self._get("/openApi/swap/v2/quote/klines", {
             "symbol": symbol, "interval": interval, "limit": limit,
@@ -186,6 +229,17 @@ class BingXClient:
         except Exception as exc:
             log.warning(f"get_balance: {exc}")
         return 0.0
+
+    def get_all_positions(self) -> list:
+        """Todas las posiciones abiertas de la cuenta, sin filtrar por
+        simbolo -- para reconciliar el estado real al empezar cada ciclo
+        en vez de fiarse solo de lo que el bot recuerda en memoria."""
+        try:
+            data = self._get("/openApi/swap/v2/user/positions")
+            return [p for p in data.get("data", []) if abs(float(p.get("positionAmt", 0) or 0)) > 0]
+        except Exception as exc:
+            log.warning(f"get_all_positions: {exc}")
+            return []
 
     def get_position(self, symbol: str) -> Optional[dict]:
         try:
@@ -275,12 +329,180 @@ class BingXClient:
 # ─────────────────────────────────────────────
 client = BingXClient(API_KEY, SECRET)
 state  = {
-    "cycles":      0,
-    "last_signal": "—",
-    "last_cycle":  "—",
-    "position":    "none",
-    "errors":      0,
+    "cycles":           0,
+    "last_signal":      "—",
+    "last_cycle":        "—",
+    "open_positions":   0,
+    "symbols_scanned":  0,
+    "trades_today":     0,
+    "errors":           0,
 }
+_trades_today_date: Optional[str] = None
+_symbol_cache: list = []
+_symbol_cache_cycle: int = -999
+
+
+def _reset_daily_counter_if_new_day() -> None:
+    global _trades_today_date
+    today = time.strftime("%Y-%m-%d")
+    if _trades_today_date != today:
+        _trades_today_date = today
+        state["trades_today"] = 0
+
+
+def get_symbol_universe() -> list:
+    """[SYMBOL] en modo single-simbolo. Lista completa (cacheada, refrescada
+    cada SYMBOL_REFRESH_CYCLES ciclos) en modo SCAN_ALL_SYMBOLS."""
+    global _symbol_cache, _symbol_cache_cycle
+    if not SCAN_ALL_SYMBOLS:
+        return [SYMBOL]
+    if _symbol_cache and (state["cycles"] - _symbol_cache_cycle) < SYMBOL_REFRESH_CYCLES:
+        return _symbol_cache
+    syms = client.get_symbols()
+    if syms:
+        _symbol_cache = syms
+        _symbol_cache_cycle = state["cycles"]
+        log.info(f"Universo actualizado: {len(syms)} simbolos")
+    return _symbol_cache or [SYMBOL]
+
+
+# ─────────────────────────────────────────────
+# EVALUACIÓN POR SÍMBOLO (funcion pura, segura para correr en threads --
+# no toca `state`, no llama a Telegram, no coloca ordenes)
+# ─────────────────────────────────────────────
+def evaluate_symbol(sym: str) -> Optional[dict]:
+    try:
+        df = client.get_klines(sym, INTERVAL, MAX_BARS)
+    except Exception as exc:
+        log.debug(f"{sym}: fallo trayendo velas ({exc})")
+        return None
+    if df.empty or len(df) < 80:
+        return None
+    df = df.iloc[:-1].reset_index(drop=True)  # descarta la vela en curso
+
+    try:
+        sig: SignalResult = compute(df, PARAMS)
+    except Exception as exc:
+        log.warning(f"{sym}: fallo evaluando la estrategia ({exc})")
+        return None
+
+    if not SCAN_ALL_SYMBOLS:
+        trend = {1: "▲ Bull", -1: "▼ Bear", 0: "─ Neutral"}[sig.structure_bias]
+        zone  = "PREMIUM" if sig.in_premium else ("DISCOUNT" if sig.in_discount else "MID")
+        fdir  = {1: "Long↑", -1: "Short↓", 0: "—"}[sig.fib_direction]
+        log.info(
+            f"[{sym}] {trend} | Fib:{fdir} | Zone:{zone} | "
+            f"Conf:{sig.conf_score:.0f} | ATR:{sig.atr:.5f} | "
+            f"BOS:{sig.is_bos} CHoCH:{sig.is_choch}"
+        )
+
+    if not sig.confirmed_buy and not sig.confirmed_sell:
+        return None
+
+    direction = "LONG" if sig.confirmed_buy else "SHORT"
+    trigger   = sig.buy_trigger if sig.confirmed_buy else sig.sell_trigger
+    entry     = sig.close
+    atr       = sig.atr
+    if atr <= 0 or entry <= 0:
+        return None
+    rr = ATR_TP_MULT / ATR_SL_MULT
+
+    if sig.confirmed_buy:
+        sl_price = round(entry - atr * ATR_SL_MULT, PRICE_PREC)
+        tp_price = round(entry + atr * ATR_TP_MULT, PRICE_PREC)
+        order_side, close_side = "BUY", "SELL"
+    else:
+        sl_price = round(entry + atr * ATR_SL_MULT, PRICE_PREC)
+        tp_price = round(entry - atr * ATR_TP_MULT, PRICE_PREC)
+        order_side, close_side = "SELL", "BUY"
+
+    qty = round((USDT_PER_TRADE * LEVERAGE) / entry, QTY_PREC)
+
+    return {
+        "symbol": sym, "direction": direction, "trigger": trigger,
+        "entry": entry, "sl_price": sl_price, "tp_price": tp_price,
+        "rr": rr, "qty": qty, "order_side": order_side, "close_side": close_side,
+        "conf_score": sig.conf_score, "atr": atr,
+        "zone": "PREMIUM" if sig.in_premium else ("DISCOUNT" if sig.in_discount else "MID"),
+        "fdir": {1: "Long↑", -1: "Short↓", 0: "—"}[sig.fib_direction],
+    }
+
+
+def _dispatch_signal(s: dict, open_symbols: set) -> None:
+    """Notifica y (si no es DRY_RUN) ejecuta una señal ya evaluada.
+    Aplica los limites de posiciones concurrentes y trades/dia."""
+    sym = s["symbol"]
+
+    if sym in open_symbols:
+        log.info(f"{sym}: ya hay posicion abierta, se omite")
+        return
+    if state["open_positions"] >= MAX_CONCURRENT_POSITIONS:
+        log.info(f"{sym}: limite de posiciones concurrentes alcanzado, se omite")
+        return
+    if state["trades_today"] >= MAX_TRADES_PER_DAY:
+        log.info(f"{sym}: limite de trades/dia alcanzado, se omite")
+        return
+
+    log.info(
+        f"SIGNAL {s['direction']} {sym} [{s['trigger']}] | "
+        f"Entry:{s['entry']} SL:{s['sl_price']} TP:{s['tp_price']} "
+        f"RR:{s['rr']:.1f}x Qty:{s['qty']}"
+    )
+    state["last_signal"] = f"{sym} {s['direction']}@{s['entry']:.4f}"
+
+    if DRY_RUN:
+        msg = "\n".join([
+            f"🔵 <b>[DRY] {s['direction']} {sym}</b>",
+            f"Trigger: <code>{s['trigger']}</code>",
+            f"Entry: <code>{s['entry']}</code>",
+            f"SL: <code>{s['sl_price']}</code>  TP: <code>{s['tp_price']}</code>",
+            f"RR: {s['rr']:.1f}x  |  Conf: {s['conf_score']:.0f}",
+            f"Zone: {s['zone']}  |  Fib dir: {s['fdir']}  |  ATR: {s['atr']:.5f}",
+        ])
+        tg(msg)
+        state["trades_today"] += 1  # cuenta igual en DRY_RUN, para probar el limite tal cual se comportara en real
+        return
+
+    try:
+        if not SCAN_ALL_SYMBOLS:
+            pass  # leverage ya fijado una vez al arrancar para el simbolo unico
+        else:
+            client.set_leverage(sym, LEVERAGE)
+        resp = client.market_order(sym, s["order_side"], s["qty"])
+        log.info(f"Entry order: {resp}")
+        time.sleep(0.8)
+
+        try:
+            client.stop_market(sym, s["close_side"], s["sl_price"], s["order_side"])
+            log.info(f"SL placed @ {s['sl_price']}")
+        except Exception as exc:
+            log.error(f"SL placement failed: {exc}")
+
+        try:
+            client.take_profit_market(sym, s["close_side"], s["tp_price"], s["order_side"])
+            log.info(f"TP placed @ {s['tp_price']}")
+        except Exception as exc:
+            log.error(f"TP placement failed: {exc}")
+
+        state["trades_today"] += 1
+        state["open_positions"] += 1
+        open_symbols.add(sym)
+        emoji = "🟢" if s["direction"] == "LONG" else "🔴"
+        msg = "\n".join([
+            f"{emoji} <b>{s['direction']} {sym}</b>",
+            f"Trigger: <code>{s['trigger']}</code>",
+            f"Entry: <code>{s['entry']}</code>",
+            f"SL: <code>{s['sl_price']}</code>  TP: <code>{s['tp_price']}</code>",
+            f"RR: {s['rr']:.1f}x  |  Conf: {s['conf_score']:.0f}",
+            f"Zone: {s['zone']}  |  ATR: {s['atr']:.5f}",
+        ])
+        tg(msg)
+    except Exception as exc:
+        state["errors"] += 1
+        log.error(f"Order execution failed for {sym}: {exc}", exc_info=True)
+        tg(f"⚠️ <b>FibStruct Order Error</b>\n{sym} | {exc}")
+
+    time.sleep(1.2)  # espacia los envios a Telegram/BingX si hay varias señales seguidas
 
 
 # ─────────────────────────────────────────────
@@ -288,108 +510,45 @@ state  = {
 # ─────────────────────────────────────────────
 def run_cycle() -> None:
     state["cycles"] += 1
+    _reset_daily_counter_if_new_day()
+    t0 = time.time()
 
-    # 1. Fetch candles (drop last — may be incomplete)
-    df = client.get_klines(SYMBOL, INTERVAL, MAX_BARS)
-    if df.empty or len(df) < 80:
-        log.warning(f"Insufficient data: {len(df)} bars")
-        return
-    df = df.iloc[:-1].reset_index(drop=True)
+    symbols = get_symbol_universe()
+    state["symbols_scanned"] = len(symbols)
 
-    # 2. Compute strategy on closed bars
-    sig: SignalResult = compute(df, PARAMS)
+    # Reconcilia contra BingX real en vez de fiarse solo de la memoria del bot.
+    open_symbols: set = set()
+    if not DRY_RUN:
+        positions = client.get_all_positions()
+        open_symbols = {p.get("symbol") for p in positions}
+        state["open_positions"] = len(open_symbols)
 
-    trend = {1: "▲ Bull", -1: "▼ Bear", 0: "─ Neutral"}[sig.structure_bias]
-    zone  = "PREMIUM" if sig.in_premium else ("DISCOUNT" if sig.in_discount else "MID")
-    fdir  = {1: "Long↑", -1: "Short↓", 0: "—"}[sig.fib_direction]
-    state["last_cycle"] = time.strftime("%H:%M:%S")
-
-    log.info(
-        f"[{SYMBOL}] {trend} | Fib:{fdir} | Zone:{zone} | "
-        f"Conf:{sig.conf_score:.0f} | ATR:{sig.atr:.5f} | "
-        f"BOS:{sig.is_bos} CHoCH:{sig.is_choch}"
-    )
-
-    if not sig.confirmed_buy and not sig.confirmed_sell:
-        return
-
-    direction = "LONG" if sig.confirmed_buy else "SHORT"
-    trigger   = sig.buy_trigger if sig.confirmed_buy else sig.sell_trigger
-    entry     = sig.close
-    atr       = sig.atr
-    rr        = ATR_TP_MULT / ATR_SL_MULT
-
-    if sig.confirmed_buy:
-        sl_price = round(entry - atr * ATR_SL_MULT, PRICE_PREC)
-        tp_price = round(entry + atr * ATR_TP_MULT, PRICE_PREC)
-        order_side = "BUY";  close_side = "SELL"
+    signals: list = []
+    if len(symbols) == 1:
+        r = evaluate_symbol(symbols[0])
+        if r:
+            signals.append(r)
     else:
-        sl_price = round(entry + atr * ATR_SL_MULT, PRICE_PREC)
-        tp_price = round(entry - atr * ATR_TP_MULT, PRICE_PREC)
-        order_side = "SELL"; close_side = "BUY"
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(evaluate_symbol, s): s for s in symbols}
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result()
+                except Exception as exc:
+                    log.warning(f"{futures[fut]}: error en el hilo ({exc})")
+                    continue
+                if r:
+                    signals.append(r)
 
-    qty = round((USDT_PER_TRADE * LEVERAGE) / entry, QTY_PREC)
-
+    state["last_cycle"] = time.strftime("%H:%M:%S")
+    elapsed = time.time() - t0
     log.info(
-        f"SIGNAL {direction} [{trigger}] | "
-        f"Entry:{entry} SL:{sl_price} TP:{tp_price} RR:{rr:.1f}x Qty:{qty}"
+        f"Ciclo completo: {len(symbols)} simbolos, {len(signals)} señales, "
+        f"{state['open_positions']} posiciones abiertas, {elapsed:.1f}s"
     )
-    state["last_signal"] = f"{direction}@{entry:.4f}"
 
-    # ── DRY RUN ──
-    if DRY_RUN:
-        msg = "\n".join([
-            f"🔵 <b>[DRY] {direction} {SYMBOL}</b>",
-            f"Trigger: <code>{trigger}</code>",
-            f"Entry: <code>{entry}</code>",
-            f"SL: <code>{sl_price}</code>  TP: <code>{tp_price}</code>",
-            f"RR: {rr:.1f}x  |  Conf: {sig.conf_score:.0f}",
-            f"Zone: {zone}  |  Fib dir: {fdir}  |  ATR: {atr:.5f}",
-        ])
-        tg(msg)
-        log.info("DRY_RUN — no order placed")
-        return
-
-    # ── LIVE ──
-    # Check existing position first
-    pos = client.get_position(SYMBOL)
-    if pos:
-        log.info(f"Position already open ({pos.get('positionAmt')}) — skip")
-        return
-
-    try:
-        resp = client.market_order(SYMBOL, order_side, qty)
-        log.info(f"Entry order: {resp}")
-        time.sleep(0.8)
-
-        try:
-            client.stop_market(SYMBOL, close_side, sl_price, order_side)
-            log.info(f"SL placed @ {sl_price}")
-        except Exception as exc:
-            log.error(f"SL placement failed: {exc}")
-
-        try:
-            client.take_profit_market(SYMBOL, close_side, tp_price, order_side)
-            log.info(f"TP placed @ {tp_price}")
-        except Exception as exc:
-            log.error(f"TP placement failed: {exc}")
-
-        state["position"] = direction
-        emoji = "🟢" if sig.confirmed_buy else "🔴"
-        msg = "\n".join([
-            f"{emoji} <b>{direction} {SYMBOL}</b>",
-            f"Trigger: <code>{trigger}</code>",
-            f"Entry: <code>{entry}</code>",
-            f"SL: <code>{sl_price}</code>  TP: <code>{tp_price}</code>",
-            f"RR: {rr:.1f}x  |  Conf: {sig.conf_score:.0f}",
-            f"Zone: {zone}  |  ATR: {atr:.5f}",
-        ])
-        tg(msg)
-
-    except Exception as exc:
-        state["errors"] += 1
-        log.error(f"Order execution failed: {exc}", exc_info=True)
-        tg(f"⚠️ <b>FibStruct Order Error</b>\n{SYMBOL} | {exc}")
+    for s in signals:
+        _dispatch_signal(s, open_symbols)
 
 
 # ─────────────────────────────────────────────
@@ -398,16 +557,19 @@ def run_cycle() -> None:
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         body = json.dumps({
-            "status":      "ok",
-            "version":     VERSION,
-            "symbol":      SYMBOL,
-            "interval":    INTERVAL,
-            "dry_run":     DRY_RUN,
-            "cycles":      state["cycles"],
-            "errors":      state["errors"],
-            "last_signal": state["last_signal"],
-            "last_cycle":  state["last_cycle"],
-            "position":    state["position"],
+            "status":           "ok",
+            "version":          VERSION,
+            "scan_all_symbols": SCAN_ALL_SYMBOLS,
+            "symbol":           SYMBOL if not SCAN_ALL_SYMBOLS else None,
+            "interval":         INTERVAL,
+            "dry_run":          DRY_RUN,
+            "cycles":           state["cycles"],
+            "errors":           state["errors"],
+            "last_signal":      state["last_signal"],
+            "last_cycle":       state["last_cycle"],
+            "symbols_scanned":  state["symbols_scanned"],
+            "open_positions":   state["open_positions"],
+            "trades_today":     state["trades_today"],
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -430,14 +592,16 @@ def start_health() -> None:
 # ENTRY POINT
 # ─────────────────────────────────────────────
 def main() -> None:
-    log.info(f"CODE_VERSION={VERSION} | {SYMBOL} | {INTERVAL}")
+    scope = "TODOS los USDT-M activos" if SCAN_ALL_SYMBOLS else SYMBOL
+    log.info(f"CODE_VERSION={VERSION} | {scope} | {INTERVAL}")
     log.info("╔══════════════════════════════╗")
     log.info(f"║  FibStruct Bot  v{VERSION}       ║")
     log.info("╚══════════════════════════════╝")
-    log.info(f"Symbol   : {SYMBOL}  |  Interval : {INTERVAL}")
+    log.info(f"Alcance  : {scope}  |  Interval : {INTERVAL}")
     log.info(f"Leverage : {LEVERAGE}x  |  USDT/trade: {USDT_PER_TRADE}")
     log.info(f"SL mult  : {ATR_SL_MULT}  |  TP mult: {ATR_TP_MULT}")
-    log.info(f"DRY_RUN  : {DRY_RUN}")
+    log.info(f"MaxPos   : {MAX_CONCURRENT_POSITIONS}  |  MaxTrades/dia: {MAX_TRADES_PER_DAY}")
+    log.info(f"DRY_RUN  : {DRY_RUN}  |  POSITION_MODE: {POSITION_MODE}")
     log.info(f"Params   : {PARAMS}")
 
     start_health()
@@ -445,16 +609,20 @@ def main() -> None:
     if not DRY_RUN:
         if not API_KEY or not SECRET:
             raise RuntimeError("BINGX_API_KEY / BINGX_SECRET_KEY not set")
-        client.set_leverage(SYMBOL, LEVERAGE)
-        client.cancel_all(SYMBOL)
+        if not SCAN_ALL_SYMBOLS:
+            # En escaneo total, el leverage se fija por simbolo justo antes
+            # de cada orden -- no tiene sentido fijarlo para 500+ pares aqui.
+            client.set_leverage(SYMBOL, LEVERAGE)
+            client.cancel_all(SYMBOL)
         tg(
             f"🚀 <b>FibStruct Bot v{VERSION} — LIVE</b>\n"
-            f"{SYMBOL} | {INTERVAL} | {LEVERAGE}x | SL:{ATR_SL_MULT}× TP:{ATR_TP_MULT}×"
+            f"{scope} | {INTERVAL} | {LEVERAGE}x | SL:{ATR_SL_MULT}× TP:{ATR_TP_MULT}× | "
+            f"Max {MAX_CONCURRENT_POSITIONS} pos · {MAX_TRADES_PER_DAY} trades/día"
         )
     else:
         tg(
             f"🔵 <b>FibStruct Bot v{VERSION} — DRY RUN</b>\n"
-            f"{SYMBOL} | {INTERVAL}"
+            f"{scope} | {INTERVAL}"
         )
 
     interval_secs = INTERVAL_SECS.get(INTERVAL, 900)
