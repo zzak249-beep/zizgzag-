@@ -379,6 +379,7 @@ def _manage_paper_positions() -> None:
         state["paper_open"] = len(_paper_positions) - 1
         elapsed_min = (time.time() * 1000 - p["opened_at"]) / 60000
         icon = "✅" if win else "❌"
+        log.info(f"{sym}: posicion de papel cerrada por {'TP' if win else 'SL'} ({elapsed_min:.0f} min) | Racha: {state['paper_wins']}W/{state['paper_losses']}L")
         tg(
             f"{icon} <b>[Papel] Cierre {'TP' if win else 'SL'}</b> — {sym}\n"
             f"{p['direction']} desde {p['entry']} | {elapsed_min:.0f} min | "
