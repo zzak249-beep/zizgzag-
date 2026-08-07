@@ -21,7 +21,7 @@ import pandas as pd
 
 from strategy import StrategyParams, SignalResult, compute
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BASE_URL = "https://open-api.bingx.com"
 
 logging.basicConfig(
@@ -47,8 +47,20 @@ ATR_SL_MULT    = float(os.getenv("ATR_SL_MULT", "1.5"))
 ATR_TP_MULT    = float(os.getenv("ATR_TP_MULT", "2.5"))
 DRY_RUN        = _bool("DRY_RUN", "true")
 MAX_BARS       = int(os.getenv("MAX_BARS", "300"))
-PRICE_PREC     = int(os.getenv("PRICE_PRECISION", "2"))
-QTY_PREC       = int(os.getenv("QTY_PRECISION", "3"))
+PRICE_PREC     = int(os.getenv("PRICE_PRECISION", "2"))   # fallback si no hay dato del contrato
+QTY_PREC       = int(os.getenv("QTY_PRECISION", "3"))      # fallback si no hay dato del contrato
+
+_symbol_precision: dict = {}  # symbol -> {"price": int, "qty": int}, poblado por get_symbols()
+
+
+def _round_price(symbol: str, value: float) -> float:
+    prec = _symbol_precision.get(symbol, {}).get("price", PRICE_PREC)
+    return round(value, max(prec, 0))
+
+
+def _round_qty(symbol: str, value: float) -> float:
+    prec = _symbol_precision.get(symbol, {}).get("qty", QTY_PREC)
+    return round(value, max(prec, 0))
 TG_TOKEN       = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT        = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -122,6 +134,15 @@ class BingXClient:
         self.secret  = secret
         self.session = requests.Session()
         self.session.headers.update({"X-BX-APIKEY": self.api_key})
+        # FIX: pool por defecto de requests es de 10 conexiones: con
+        # MAX_WORKERS=15 hilos pidiendo a la vez, se quedaba corto --
+        # "Connection pool is full, discarding connection" en cada ciclo
+        # de escaneo. No perdia señales (la petición se sigue haciendo,
+        # solo sin reutilizar conexión), pero cada ciclo tardaba mas de
+        # lo necesario por el handshake TCP/TLS repetido de mas.
+        adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS + 5, pool_maxsize=MAX_WORKERS + 5)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     # ── signing ──────────────────────────────
     def _sign(self, params: dict) -> str:
@@ -165,7 +186,13 @@ class BingXClient:
     # ── market data ──────────────────────────
     def get_symbols(self) -> list:
         """Lista de simbolos USDT-M activos, filtrados por blacklist y
-        volumen minimo. Sin firma (endpoint publico)."""
+        volumen minimo. Sin firma (endpoint publico). De paso cachea la
+        precision real de precio/cantidad de cada simbolo -- BUG REAL
+        encontrado en produccion: PRICE_PRECISION=2 global redondeaba el
+        SL/TP de tokens de precio bajo (ej. entry=0.0004806) a 0.00,
+        y en otros casos igualaba SL y TP al mismo valor redondeado.
+        Con 900 simbolos de magnitudes muy distintas, un solo precision
+        global para todos no funciona -- hace falta por simbolo."""
         try:
             data = self._get("/openApi/swap/v2/quote/contracts")
         except Exception as exc:
@@ -186,6 +213,10 @@ class BingXClient:
                 vol = float(c.get("quoteVolume24h", c.get("volume24h", 0)) or 0)
                 if vol < MIN_24H_VOLUME_USDT:
                     continue
+            _symbol_precision[sym] = {
+                "price": int(c.get("pricePrecision", PRICE_PREC)),
+                "qty": int(c.get("quantityPrecision", QTY_PREC)),
+            }
             out.append(sym)
         return out
 
@@ -275,7 +306,7 @@ class BingXClient:
             "side":         side,       # BUY | SELL
             "positionSide": _position_side(side),
             "type":         "MARKET",
-            "quantity":     round(qty, QTY_PREC),
+            "quantity":     _round_qty(symbol, qty),
         })
 
     def stop_market(self, symbol: str, side: str, stop_price: float, entry_side: str) -> dict:
@@ -286,7 +317,7 @@ class BingXClient:
             "side":          side,
             "positionSide":  _position_side(entry_side),
             "type":          "STOP_MARKET",
-            "stopPrice":     round(stop_price, PRICE_PREC),
+            "stopPrice":     _round_price(symbol, stop_price),
         }
         # closePosition/reduceOnly no son compatibles con HEDGE -- ahi el
         # cierre lo define la combinacion side+positionSide por si sola.
@@ -301,7 +332,7 @@ class BingXClient:
             "side":          side,
             "positionSide":  _position_side(entry_side),
             "type":          "TAKE_PROFIT_MARKET",
-            "stopPrice":     round(tp_price, PRICE_PREC),
+            "stopPrice":     _round_price(symbol, tp_price),
         }
         if POSITION_MODE != "HEDGE":
             params["closePosition"] = "true"
@@ -317,7 +348,7 @@ class BingXClient:
             "side":         side,
             "positionSide": _position_side(entry_side),
             "type":         "MARKET",
-            "quantity":     round(amt, QTY_PREC),
+            "quantity":     _round_qty(symbol, amt),
         }
         if POSITION_MODE != "HEDGE":
             params["reduceOnly"] = "true"
@@ -344,6 +375,42 @@ _trades_today_date: Optional[str] = None
 _symbol_cache: list = []
 _symbol_cache_cycle: int = -999
 _paper_positions: dict = {}  # symbol -> {direction, entry, sl, tp, opened_at, trigger}
+
+# Sin esto, cada reinicio de Railway (cada deploy nuevo, o un simple
+# restart) borraba el racha W/L a cero Y abandonaba en silencio
+# cualquier posicion de papel que estuviera abierta en ese momento --
+# nunca contaba ni como ganada ni como perdida, desaparecia sin mas.
+# Mismo patron de persistencia que ya usa bingx-ict-scanner (StateManager).
+STATE_FILE = os.getenv("STATE_FILE", "/data/paper_state.json")
+
+
+def _save_paper_state() -> None:
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({
+                "paper_positions": _paper_positions,
+                "paper_wins": state["paper_wins"],
+                "paper_losses": state["paper_losses"],
+            }, f)
+    except Exception as exc:
+        log.warning(f"No se pudo guardar el estado de papel en {STATE_FILE}: {exc}")
+
+
+def _load_paper_state() -> None:
+    global _paper_positions
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+        _paper_positions.update(data.get("paper_positions", {}))
+        state["paper_wins"] = data.get("paper_wins", 0)
+        state["paper_losses"] = data.get("paper_losses", 0)
+        state["paper_open"] = len(_paper_positions)
+        log.info(f"Estado de papel restaurado desde {STATE_FILE}: {len(_paper_positions)} abiertas, "
+                 f"{state['paper_wins']}W/{state['paper_losses']}L")
+    except FileNotFoundError:
+        log.info(f"Sin estado de papel previo en {STATE_FILE}, empezando de cero")
+    except Exception as exc:
+        log.warning(f"No se pudo cargar el estado de papel desde {STATE_FILE}: {exc}")
 
 
 def _paper_winrate() -> float:
@@ -378,14 +445,16 @@ def _manage_paper_positions() -> None:
         state["paper_wins" if win else "paper_losses"] += 1
         state["paper_open"] = len(_paper_positions) - 1
         elapsed_min = (time.time() * 1000 - p["opened_at"]) / 60000
+        opened_str = time.strftime("%H:%M", time.localtime(p["opened_at"] / 1000))
         icon = "✅" if win else "❌"
-        log.info(f"{sym}: posicion de papel cerrada por {'TP' if win else 'SL'} ({elapsed_min:.0f} min) | Racha: {state['paper_wins']}W/{state['paper_losses']}L")
+        log.info(f"{sym}: posicion de papel cerrada por {'TP' if win else 'SL'} (abierta {opened_str}, {elapsed_min:.0f} min) | Racha: {state['paper_wins']}W/{state['paper_losses']}L")
         tg(
             f"{icon} <b>[Papel] Cierre {'TP' if win else 'SL'}</b> — {sym}\n"
             f"{p['direction']} desde {p['entry']} | {elapsed_min:.0f} min | "
             f"Racha: {state['paper_wins']}W/{state['paper_losses']}L ({_paper_winrate():.0f}%)"
         )
         del _paper_positions[sym]
+        _save_paper_state()
 
 
 def _reset_daily_counter_if_new_day() -> None:
@@ -454,15 +523,35 @@ def evaluate_symbol(sym: str) -> Optional[dict]:
     rr = ATR_TP_MULT / ATR_SL_MULT
 
     if sig.confirmed_buy:
-        sl_price = round(entry - atr * ATR_SL_MULT, PRICE_PREC)
-        tp_price = round(entry + atr * ATR_TP_MULT, PRICE_PREC)
+        sl_price = _round_price(sym, entry - atr * ATR_SL_MULT)
+        tp_price = _round_price(sym, entry + atr * ATR_TP_MULT)
         order_side, close_side = "BUY", "SELL"
     else:
-        sl_price = round(entry + atr * ATR_SL_MULT, PRICE_PREC)
-        tp_price = round(entry - atr * ATR_TP_MULT, PRICE_PREC)
+        sl_price = _round_price(sym, entry + atr * ATR_SL_MULT)
+        tp_price = _round_price(sym, entry - atr * ATR_TP_MULT)
         order_side, close_side = "SELL", "BUY"
 
-    qty = round((USDT_PER_TRADE * LEVERAGE) / entry, QTY_PREC)
+    # SEGURIDAD: si redondear a la precision del simbolo deja el SL/TP
+    # invalido (igualados, o al lado equivocado de la entrada), se
+    # descarta la señal en vez de mandarla. BUG REAL en produccion:
+    # con PRICE_PRECISION=2 global, un simbolo con entry=0.0004806
+    # (1000CHEEMS-USDT) redondeaba el SL/TP a 0.0 -- sin proteccion
+    # real si esto llega a MODE=LIVE. Con precision por simbolo esto
+    # ya no deberia pasar, pero el chequeo se queda como ultima red.
+    if sl_price == tp_price or sl_price == entry:
+        log.warning(f"{sym}: SL/TP invalidos tras redondear (entry={entry} sl={sl_price} tp={tp_price}), señal descartada")
+        return None
+    if direction == "LONG" and not (sl_price < entry < tp_price):
+        log.warning(f"{sym}: SL/TP en el lado equivocado para LONG (entry={entry} sl={sl_price} tp={tp_price}), señal descartada")
+        return None
+    if direction == "SHORT" and not (tp_price < entry < sl_price):
+        log.warning(f"{sym}: SL/TP en el lado equivocado para SHORT (entry={entry} sl={sl_price} tp={tp_price}), señal descartada")
+        return None
+
+    qty = _round_qty(sym, (USDT_PER_TRADE * LEVERAGE) / entry)
+    if qty <= 0:
+        log.warning(f"{sym}: qty redondeado a 0, señal descartada")
+        return None
 
     return {
         "symbol": sym, "direction": direction, "trigger": trigger,
@@ -514,6 +603,7 @@ def _dispatch_signal(s: dict, open_symbols: set) -> None:
             "trigger": s["trigger"], "opened_at": time.time() * 1000,
         }
         state["paper_open"] = len(_paper_positions)
+        _save_paper_state()
         return
 
     try:
@@ -670,6 +760,9 @@ def main() -> None:
     log.info(f"MaxPos   : {MAX_CONCURRENT_POSITIONS}  |  MaxTrades/dia: {MAX_TRADES_PER_DAY}")
     log.info(f"DRY_RUN  : {DRY_RUN}  |  POSITION_MODE: {POSITION_MODE}")
     log.info(f"Params   : {PARAMS}")
+
+    if DRY_RUN:
+        _load_paper_state()
 
     start_health()
 
