@@ -21,7 +21,7 @@ import pandas as pd
 
 from strategy import StrategyParams, SignalResult, compute
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 BASE_URL = "https://open-api.bingx.com"
 
 logging.basicConfig(
@@ -90,7 +90,7 @@ SYMBOL_REFRESH_CYCLES = int(os.getenv("SYMBOL_REFRESH_CYCLES", "20"))
 # etc. mezclados con las señales normales. Por defecto EXCLUIDOS -- no es
 # una feature especulativa, es una correccion de universo mal calibrado.
 EXCLUDE_TOKENIZED_ASSETS = _bool("EXCLUDE_TOKENIZED_ASSETS", "true")
-_TOKENIZED_PREFIXES = ("NCS", "NCCO")
+_TOKENIZED_PREFIXES = ("NC",)  # cubre NCS/NCCO/NCFX y cualquier otra sub-categoria del mismo proveedor -- confirmado con 3 prefijos distintos vistos en produccion (acciones, materias primas, forex), todos bajo esta misma raiz
 _TOKENIZED_STOCK_BASES = {
     "AAPLX", "NVDAX", "TSLAX", "COINX", "METAX", "HOODX", "CRCLX",
     "GOOGLX", "AMZNX", "MSFTX", "NFLXX", "AMDX",
