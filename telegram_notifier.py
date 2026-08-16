@@ -78,33 +78,6 @@ class TelegramNotifier:
             log.error("Error de red en respaldo diario: %s", e)
             return False
 
-    async def send_direct(self, text: str) -> bool:
-        """Envio directo, SIN cola -- devuelve si de verdad se entrego.
-        send() solo encola y vuelve al momento; un try/except alrededor
-        de eso nunca detectaria un fallo real de Telegram (encolar casi
-        nunca lanza excepcion), asi que marcar 'respaldo enviado' tras
-        un send() normal seria una falsa sensacion de seguridad. Solo
-        para el respaldo diario, donde importa la confirmacion real --
-        el resto de notificaciones (señales, cierres) siguen con send(),
-        donde el rate-limit de la cola importa mas que la certeza."""
-        if not self.enabled or not self._session:
-            return False
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        try:
-            async with self._session.post(
-                url,
-                json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    return True
-                body = await resp.text()
-                log.error("Telegram %d en respaldo diario: %s", resp.status, body[:200])
-                return False
-        except aiohttp.ClientError as e:
-            log.error("Error de red enviando respaldo diario: %s", e)
-            return False
-
     async def _worker(self) -> None:
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         while True:

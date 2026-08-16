@@ -1,19 +1,19 @@
 """
-Orquesta el escaneo de todo el universo de simbolos BingX USDT-M en
-cada ciclo: trae klines en paralelo (limitado por semaforo dentro de
-BingXClient), evalua la estrategia por simbolo y despacha las señales.
+Escanea TODOS los simbolos USDT-M de BingX cada SCAN_INTERVAL_SEC,
+buscando el patron "tres montañas" (pattern.py) en velas de 1h. Misma
+arquitectura de concurrencia controlada (semaforo) que bingx-ict-scanner,
+adaptada a este patron especifico.
 """
 import asyncio
 import logging
 import time
-from typing import Optional
 
 import config as cfg
-import executor
 from bingx_client import BingXClient, BingXError, normalize_symbol
 from state import StateManager
-from strategy import evaluate_symbol, reset_cycle_stats, get_cycle_stats
 from telegram_notifier import TelegramNotifier, format_backup
+from pattern import detect_three_mountains, check_breakdown_confirmed, compute_atr
+from executor import open_signal, check_paper_exit
 
 log = logging.getLogger("scanner")
 
@@ -45,10 +45,11 @@ async def get_symbol_universe(client: BingXClient, force: bool = False) -> list:
         contracts = await client.get_contracts()
     except BingXError as e:
         log.error("No se pudo obtener la lista de contratos: %s", e)
-        return _symbol_cache  # lo que hubiera en cache, aunque este viejo
+        return _symbol_cache
 
     total = len(contracts)
     out = []
+    excluded_tokenized = 0
     for c in contracts:
         sym = c.get("symbol")
         if not sym:
@@ -62,16 +63,21 @@ async def get_symbol_universe(client: BingXClient, force: bool = False) -> list:
             continue
         if norm in cfg.SYMBOL_BLACKLIST:
             continue
-        if cfg.EXCLUDE_MAJORS and norm in cfg.MAJOR_SYMBOLS:
-            continue
+        if cfg.EXCLUDE_TOKENIZED_ASSETS:
+            base = norm.split("-")[0]
+            if base.startswith(cfg._TOKENIZED_PREFIXES):
+                excluded_tokenized += 1
+                continue
         if cfg.MIN_24H_VOLUME_USDT > 0:
             vol = float(c.get("quoteVolume24h", c.get("volume24h", 0)) or 0)
             if vol < cfg.MIN_24H_VOLUME_USDT:
                 continue
-        out.append(sym)  # se usa el symbol tal cual lo devuelve BingX para las llamadas a la API
+        out.append(sym)
 
-    log.info("Universo de simbolos: %d contratos -> %d tras filtros (blacklist=%d whitelist=%d).",
-              total, len(out), len(cfg.SYMBOL_BLACKLIST), len(cfg.SYMBOL_WHITELIST))
+    log.info(
+        "Universo de simbolos: %d contratos -> %d tras filtros (blacklist=%d whitelist=%d tokenizados_excluidos=%d).",
+        total, len(out), len(cfg.SYMBOL_BLACKLIST), len(cfg.SYMBOL_WHITELIST), excluded_tokenized,
+    )
     if total > 0 and len(out) < total * 0.1:
         log.warning("Se filtro mas del 90%% del universo. Revisa MIN_24H_VOLUME_USDT / el campo de estado del contrato.")
 
@@ -80,135 +86,164 @@ async def get_symbol_universe(client: BingXClient, force: bool = False) -> list:
     return out
 
 
-async def _fetch_and_evaluate(client: BingXClient, state: StateManager, symbol: str):
+def _pattern_key(pattern) -> str:
+    return f"{pattern.peak3.open_time}"
+
+
+def _ema_simple(closes: list, length: int) -> float:
+    """EMA manual sobre una lista de cierres -- sin pandas/numpy, mismo
+    criterio de dependencias minimas que el resto de bots del proyecto."""
+    if len(closes) < length:
+        return closes[-1] if closes else 0.0
+    k = 2.0 / (length + 1)
+    ema = sum(closes[:length]) / length
+    for c in closes[length:]:
+        ema = c * k + ema * (1 - k)
+    return ema
+
+
+def _classify_tier(symbol: str) -> str:
+    return "major" if symbol in cfg.MAJOR_SYMBOLS else "altcoin"
+
+
+async def _htf_bias_bearish(client: BingXClient, symbol: str) -> bool:
+    """True si el sesgo de timeframe superior NO contradice un SHORT
+    (precio por debajo de la EMA del HTF). Solo se llama para simbolos
+    donde el patron YA confirmo la ruptura -- una llamada API extra por
+    señal candidata, no por cada simbolo del universo en cada ciclo."""
+    if not cfg.USE_HTF_BIAS:
+        return True
     try:
-        ltf = await client.get_klines(symbol, cfg.TIMEFRAME, cfg.KLINES_LOOKBACK)
-        if len(ltf) < 60:
-            return None
-        htf = await client.get_klines(symbol, cfg.HTF_TIMEFRAME, cfg.HTF_EMA_LEN + 20) if cfg.USE_HTF_BIAS else []
-        daily = await client.get_klines(symbol, "1d", 5)
-        funding_rate = await client.get_funding_rate(symbol) if cfg.USE_FUNDING_FILTER else None
-        current_oi = await client.get_open_interest(symbol) if cfg.USE_OI_FILTER else None
-    except BingXError as e:
-        log.debug("%s: fallo al traer klines (%s)", symbol, e)
-        return None
-    except Exception as e:  # defensivo: un simbolo raro no debe tumbar el ciclo entero
-        log.warning("%s: error inesperado trayendo datos: %s", symbol, e)
-        return None
+        htf_candles = await client.get_klines(symbol, cfg.HTF_TIMEFRAME, cfg.HTF_EMA_LEN + 20)
+    except BingXError:
+        return True  # sin datos HTF -> no bloquea, mismo criterio permisivo que el resto del proyecto
+    if len(htf_candles) < cfg.HTF_EMA_LEN:
+        return True
+    closes = [c.close for c in htf_candles]
+    ema = _ema_simple(closes, cfg.HTF_EMA_LEN)
+    return closes[-1] < ema
 
-    sym_state = state.get_symbol_state(symbol)
+
+async def _evaluate_symbol(client: BingXClient, state: StateManager, notifier: TelegramNotifier, symbol: str) -> None:
     try:
-        new_state, signal = evaluate_symbol(symbol, ltf, htf, daily, sym_state, funding_rate, current_oi)
-    except Exception as e:
-        log.warning("%s: error inesperado evaluando la estrategia: %s", symbol, e)
-        return None
-    state.symbol_states[symbol] = new_state
-    return signal
+        candles = await client.get_klines(symbol, cfg.TIMEFRAME, cfg.CANDLE_LIMIT)
+    except BingXError:
+        return  # simbolo con datos no disponibles -- se omite, no es un fallo del ciclo entero
+
+    if len(candles) < cfg.PIVOT_LEN * 2 + 10:
+        return
+
+    last_close = candles[-1].close
+
+    # ── Si ya hay posicion en este simbolo, solo revisar salida (papel) ──
+    if symbol in state.positions:
+        if cfg.MODE != "LIVE":
+            await check_paper_exit(state, notifier, symbol, last_close)
+        return
+
+    if not state.under_daily_limit() or not state.under_concurrent_limit():
+        return
+
+    if state.circuit_breaker_active():
+        return
+
+    pattern = detect_three_mountains(
+        candles,
+        pivot_len=cfg.PIVOT_LEN,
+        zone_tolerance_pct=cfg.ZONE_TOLERANCE_PCT,
+        peak3_below_zone_pct_min=cfg.PEAK3_BELOW_ZONE_PCT_MIN,
+        require_weak_push=cfg.REQUIRE_WEAK_PUSH,
+        weak_push_max_ratio=cfg.WEAK_PUSH_MAX_RATIO,
+    )
+    if pattern is None:
+        return
+
+    key = _pattern_key(pattern)
+    if key == state.last_pattern_keys.get(symbol):
+        return
+
+    if not check_breakdown_confirmed(candles, pattern):
+        return
+
+    if not await _htf_bias_bearish(client, symbol):
+        state.last_pattern_keys[symbol] = key
+        return
+
+    atr = compute_atr(candles, cfg.ATR_LEN)
+    entry = last_close
+    sl = pattern.peak3.price + atr * cfg.SL_BUFFER_ATR_MULT
+    r_dist = sl - entry
+    if r_dist <= 0:
+        state.last_pattern_keys[symbol] = key
+        return
+
+    tp = entry - r_dist * cfg.RR_RATIO
+    rr = abs(tp - entry) / r_dist
+    if rr < cfg.MIN_RR:
+        state.last_pattern_keys[symbol] = key
+        return
+
+    tier = _classify_tier(symbol)
+    log.info(
+        "%s [%s]: SEÑAL SHORT confirmada. Peak1=%.6g Peak2=%.6g Peak3=%.6g (empuje ratio=%.2f) | Entry=%.6g SL=%.6g TP=%.6g R:R=%.2f",
+        symbol, tier, pattern.peak1.price, pattern.peak2.price, pattern.peak3.price, pattern.vol_ratio,
+        entry, sl, tp, rr,
+    )
+    await open_signal(client, state, notifier, symbol, "SHORT", entry, sl, tp, key, tier)
 
 
-async def _send_daily_backup(state: StateManager, notifier: TelegramNotifier, total_w: int, total_l: int, win_rate: float) -> None:
+async def _send_daily_backup(state: StateManager, notifier: TelegramNotifier) -> None:
     """Envia el respaldo diario y marca como enviado SOLO si de verdad se
-    entrego (send_direct devuelve la confirmacion real, no solo si se
-    encolo). Si falla, no se marca -- se reintenta en el proximo ciclo.
-    Si Telegram esta deshabilitado, no hay nada que reintentar: se marca
-    igual para no repetir el intento (y el log) cada ciclo sin sentido."""
+    entrego (send_direct confirma via HTTP real, no solo si se encolo).
+    Si Telegram esta deshabilitado, se marca igual para no reintentar
+    cada ciclo sin sentido -- misma logica que bingx-ict-scanner."""
     if not notifier.enabled:
         state.mark_backup_sent()
         state.save()
         return
+    total = state.wins + state.losses
+    wr = (state.wins / total * 100.0) if total > 0 else 0.0
     snapshot = state.backup_snapshot_json(include_positions=False)
-    msg = format_backup(snapshot, total_w, total_l, win_rate)
+    msg = format_backup(snapshot, state.wins, state.losses, wr)
     delivered = await notifier.send_direct(msg)
     if delivered:
         state.mark_backup_sent()
         state.save()
-        log.info("Respaldo diario entregado por Telegram (%d caracteres).", len(snapshot))
+        log.info("Respaldo diario confirmado por Telegram (%d caracteres).", len(snapshot))
     else:
-        log.error("Respaldo diario NO se pudo entregar, se reintenta el proximo ciclo.")
+        log.warning("Respaldo diario NO confirmado, se reintenta el proximo ciclo.")
 
 
 async def run_scan_cycle(client: BingXClient, state: StateManager, notifier: TelegramNotifier) -> int:
     t0 = time.time()
-    reset_cycle_stats()
     symbols = await get_symbol_universe(client)
     if not symbols:
-        log.warning("Universo de simbolos vacio, se omite el ciclo.")
+        log.warning("Universo de simbolos vacio -- nada que escanear este ciclo.")
         return 0
 
-    tasks = [_fetch_and_evaluate(client, state, s) for s in symbols]
-    results = await asyncio.gather(*tasks, return_exceptions=False)
-    signals = [r for r in results if r is not None]
+    sem = asyncio.Semaphore(cfg.MAX_CONCURRENT_FETCHES)
 
-    for sig in signals:
-        try:
-            await executor.handle_signal(sig, client, state, notifier)
-        except Exception as e:
-            log.error("%s: error despachando señal: %s", sig.symbol, e)
+    async def _bounded(sym):
+        async with sem:
+            await _evaluate_symbol(client, state, notifier, sym)
 
-    try:
-        await executor.manage_open_positions(client, state, notifier)
-        await executor.manage_paper_positions(client, state, notifier)
-    except Exception as e:
-        log.error("Error gestionando posiciones abiertas: %s", e)
+    await asyncio.gather(*(_bounded(s) for s in symbols), return_exceptions=False)
 
-    state.save()
-
-    elapsed = time.time() - t0
+    breaker_txt = " | CIRCUIT BREAKER ACTIVO" if state.circuit_breaker_active() else ""
+    dt = time.time() - t0
     log.info(
-        "Ciclo completo: %d simbolos, %d señales, %d posiciones abiertas, %.1fs",
-        len(symbols), len(signals), state.open_position_count(), elapsed,
+        "Ciclo completo: %d simbolos, %d posiciones abiertas, %.1fs | %dW/%dL (racha=%d)%s",
+        len(symbols), len(state.positions), dt, state.wins, state.losses, state.consecutive_losses, breaker_txt,
     )
-    if cfg.MODE == "SIGNAL":
-        total_w = sum(v.get("w", 0) for v in state.kz_stats.values())
-        total_l = sum(v.get("l", 0) for v in state.kz_stats.values())
-        wr = (total_w * 100.0 / (total_w + total_l)) if (total_w + total_l) else 0.0
-        log.info("Papel: %d abiertas | %dW/%dL (%.0f%% de %d cerradas)",
-                  state.open_position_count(), total_w, total_l, wr, total_w + total_l)
-        rev = state.path_stats.get("REV", {"w": 0, "l": 0})
-        cont = state.path_stats.get("CONT", {"w": 0, "l": 0})
-        path_total = rev["w"] + rev["l"] + cont["w"] + cont["l"]
-        unclassified = (total_w + total_l) - path_total
-        log.info("Por ruta: REV %dW/%dL | CONT %dW/%dL%s", rev["w"], rev["l"], cont["w"], cont["l"],
-                  f" | sin clasificar: {unclassified} (posiciones abiertas antes de que se guardara 'path')" if unclassified > 0 else "")
-        major = state.tier_stats.get("major", {"w": 0, "l": 0})
-        altcoin = state.tier_stats.get("altcoin", {"w": 0, "l": 0})
-        maj_t, alt_t = major["w"] + major["l"], altcoin["w"] + altcoin["l"]
-        log.info("Por tier: major %dW/%dL%s | altcoin %dW/%dL%s",
-                  major["w"], major["l"], f" ({major['w']*100.0/maj_t:.0f}%)" if maj_t else "",
-                  altcoin["w"], altcoin["l"], f" ({altcoin['w']*100.0/alt_t:.0f}%)" if alt_t else "")
-        n_days = len(state.active_days)
-        avg_per_day = (total_w + total_l) / n_days if n_days else 0.0
-        log.info("Muestra: %d cerradas en %d dias distintos, ~%.0f/dia", total_w + total_l, n_days, avg_per_day)
+    major = state.tier_stats.get("major", {"w": 0, "l": 0})
+    alt = state.tier_stats.get("altcoin", {"w": 0, "l": 0})
+    log.info("Por tier: major %dW/%dL | altcoin %dW/%dL", major["w"], major["l"], alt["w"], alt["l"])
+    n_days = len(state.active_days)
+    total_closed = state.wins + state.losses
+    if n_days > 0:
+        log.info("Muestra: %d cerradas en %d dias distintos, ~%.0f/dia", total_closed, n_days, total_closed / n_days)
 
-        if state.needs_daily_backup():
-            await _send_daily_backup(state, notifier, total_w, total_l, wr)
-    st = get_cycle_stats()
-    log.info(
-        "Embudo: sweeps=%d fvgs=%d confirmaciones=%d | rechazadas por RR=%d direccion=%d "
-        "kz_only=%d htf=%d premium/discount=%d funding=%d oi=%d | señales=%d",
-        st["sweeps"], st["fvgs_formed"], st["confirmations"],
-        st["rejected_rr"], st["rejected_direction"], st["rejected_kz_only"],
-        st["rejected_htf"], st["rejected_premium_discount"],
-        st["rejected_funding"], st["rejected_oi"], st["signals"],
-    )
-    if elapsed > cfg.SCAN_INTERVAL_SEC:
-        log.warning(
-            "El ciclo tardo %.1fs, mas que SCAN_INTERVAL_SEC=%ds. Sube MAX_CONCURRENT_REQUESTS "
-            "o SCAN_INTERVAL_SEC, o reduce el universo con SYMBOL_WHITELIST/MIN_24H_VOLUME_USDT.",
-            elapsed, cfg.SCAN_INTERVAL_SEC,
-        )
-    return len(signals)
+    if state.needs_daily_backup():
+        await _send_daily_backup(state, notifier)
 
-
-async def main_loop(client: BingXClient, state: StateManager, notifier: TelegramNotifier, on_cycle=None) -> None:
-    log.info("Escaneo iniciado. Intervalo=%ds  Simbolos=refrescados cada %dmin", cfg.SCAN_INTERVAL_SEC, cfg.SYMBOL_REFRESH_MIN)
-    while True:
-        cycle_start = time.time()
-        try:
-            await run_scan_cycle(client, state, notifier)
-            if on_cycle:
-                on_cycle()
-        except Exception as e:
-            log.error("Ciclo de escaneo fallo por completo (se reintenta en el siguiente): %s", e, exc_info=True)
-        elapsed = time.time() - cycle_start
-        await asyncio.sleep(max(1.0, cfg.SCAN_INTERVAL_SEC - elapsed))
+    return len(symbols)
