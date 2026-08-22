@@ -1,0 +1,133 @@
+"""
+Configuración del bot. Todo por variables de entorno (Railway).
+
+MODE=SIGNAL es el valor por defecto Y la recomendación. La estrategia
+tiene 35 operaciones medidas: eso no basta para poner dinero. SIGNAL
+manda avisos a Telegram y no toca el exchange.
+"""
+import os
+
+
+def _bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "si", "sí")
+
+
+def _float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# ── Modo ──────────────────────────────────────────────────────────────
+# SIGNAL: solo avisa.  LIVE: envía órdenes reales a BingX.
+MODE = os.getenv("MODE", "SIGNAL").strip().upper()
+
+# Segundo cerrojo para LIVE: hay que ponerlo a mano, aparte del MODE.
+# Dos interruptores para operar de verdad no es paranoia: es que el coste
+# de un despliegue equivocado es dinero, y el de un cerrojo extra es un
+# minuto de tu tiempo.
+LIVE_CONFIRMED = _bool("LIVE_CONFIRMED", False)
+
+# ── BingX ─────────────────────────────────────────────────────────────
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
+BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
+BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com").strip()
+
+# ── Telegram ──────────────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# ── Universo y escaneo ────────────────────────────────────────────────
+TIMEFRAME = os.getenv("TIMEFRAME", "5m").strip()
+SCAN_INTERVAL_SEC = _int("SCAN_INTERVAL_SEC", 60)
+MAX_SYMBOLS = _int("MAX_SYMBOLS", 200)
+SYMBOL_WHITELIST = [s.strip().upper() for s in os.getenv("SYMBOL_WHITELIST", "").split(",") if s.strip()]
+# Excluye los tokenizados sintéticos de BingX (acciones, materias primas,
+# forex). Mismo filtro que el resto de bots del proyecto.
+EXCLUDE_PREFIXES = [p.strip().upper() for p in os.getenv("EXCLUDE_PREFIXES", "NC").split(",") if p.strip()]
+
+# ── EL FILTRO QUE MANDA ───────────────────────────────────────────────
+# Los backtests dicen: donde la reversión funcionó había ~40x el coste
+# de operar (ATR 5-6%); donde no hubo negocio, 6-13x. Este umbral es el
+# hallazgo principal de todo el trabajo, no un parámetro más.
+MIN_ATR_PCT = _float("MIN_ATR_PCT", 4.0)
+COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.14)
+MIN_COST_COVER = _float("MIN_COST_COVER", 30.0)
+
+# ── Escáner de universo completo ──────────────────────────────────────
+# SCAN_ALL=true recorre TODOS los perpetuos y publica un ranking por
+# Telegram cada RANK_INTERVAL_MIN. Sustituye al radar manual de
+# TradingView, que solo admite diez símbolos escritos a mano.
+SCAN_ALL = _bool("SCAN_ALL", True)
+RANK_INTERVAL_MIN = _int("RANK_INTERVAL_MIN", 15)
+RANK_TOP_N = _int("RANK_TOP_N", 12)
+# Mil símbolos son mil llamadas: el semáforo evita que BingX responda 429.
+SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
+RANGE_LEN = _int("RANGE_LEN", 20)
+ER_SHORT = _int("ER_SHORT", 30)
+ER_LONG = _int("ER_LONG", 180)
+ER_TREND = _float("ER_TREND", 0.40)
+
+# ── Estrategia (idéntica a reversion_5m.pine) ─────────────────────────
+MA_LEN = _int("MA_LEN", 20)
+ATR_LEN = _int("ATR_LEN", 14)
+STRETCH_ATR = _float("STRETCH_ATR", 2.5)
+MAX_BARS_STRETCH = _int("MAX_BARS_STRETCH", 6)
+SL_ATR = _float("SL_ATR", 1.0)
+MIN_RR = _float("MIN_RR", 1.0)
+TP_MODE = os.getenv("TP_MODE", "MEAN").strip().upper()  # MEAN | FIXED_R
+RR_FIXED = _float("RR_FIXED", 1.5)
+
+# ── Tiempo máximo por operación ───────────────────────────────────────
+# La reversión intradía vive en la ventana de minutos a una hora. A
+# horizonte de un día varios estudios encuentran lo contrario: momentum
+# tras retornos anormales. Si la vuelta no llega pronto, ya no estás en
+# el fenómeno que querías operar — estás en el que va en tu contra.
+# 12 velas de 5m = 60 minutos. Mismo valor que reversion_5m.pine.
+MAX_TRADE_BARS = _int("MAX_TRADE_BARS", 12)
+USE_TIME_EXIT = _bool("USE_TIME_EXIT", True)
+
+
+def max_trade_seconds() -> int:
+    minutos_por_vela = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
+    return MAX_TRADE_BARS * minutos_por_vela.get(TIMEFRAME, 5) * 60
+
+
+# ── Riesgo ────────────────────────────────────────────────────────────
+RISK_PCT = _float("RISK_PCT", 0.5)
+MAX_CONCURRENT = _int("MAX_CONCURRENT", 2)
+LEVERAGE = _int("LEVERAGE", 3)
+
+# ── Circuit breaker ───────────────────────────────────────────────────
+MAX_CONSECUTIVE_LOSSES = _int("MAX_CONSECUTIVE_LOSSES", 3)
+COOLDOWN_MINUTES = _int("COOLDOWN_MINUTES", 120)
+
+# ── Avisos ────────────────────────────────────────────────────────────
+DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
+DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
+HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
+
+# ── Estado ────────────────────────────────────────────────────────────
+STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+
+
+def is_live() -> bool:
+    """LIVE exige los DOS interruptores y credenciales de verdad."""
+    return MODE == "LIVE" and LIVE_CONFIRMED and bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
+
+
+def describe() -> str:
+    if is_live():
+        return "LIVE — enviando órdenes reales a BingX"
+    if MODE == "LIVE":
+        return "LIVE pedido pero SIN confirmar (falta LIVE_CONFIRMED o claves) — sigue en SIGNAL"
+    return "SIGNAL — solo avisos, no toca el exchange"
