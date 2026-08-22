@@ -83,6 +83,11 @@ MIN_COST_COVER = _float("MIN_COST_COVER", 30.0)
 SCAN_ALL = _bool("SCAN_ALL", True)
 RANK_INTERVAL_MIN = _int("RANK_INTERVAL_MIN", 15)
 RANK_TOP_N = _int("RANK_TOP_N", 12)
+# Avisar SOLO cuando hay algo que decir. Un mensaje idéntico cada 15
+# minutos diciendo "no hay nada" son 96 al día: dejas de mirarlos, y el
+# día que llegue una señal de verdad la vas a pasar por alto igual que
+# las otras 95. El "no hay nada" ya lo cubren el latido y el resumen.
+RANK_ONLY_WHEN_CANDIDATES = _bool("RANK_ONLY_WHEN_CANDIDATES", True)
 # Mil símbolos son mil llamadas: el semáforo evita que BingX responda 429.
 SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
 RANGE_LEN = _int("RANGE_LEN", 20)

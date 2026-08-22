@@ -64,6 +64,7 @@ class Bot:
         self.scanner = scanner.Scanner(self.api)
         self.last_rank = 0.0
         self.volumes: dict[str, float] = {}
+        self.had_candidates = False
         self.last_heartbeat = time.time()
 
     async def start(self) -> None:
@@ -243,6 +244,21 @@ class Bot:
             return
         self.last_rank = time.time()
         rows = await self.scanner.run(self.symbols)
+        con_amplitud = [r for r in rows if r.verdict != "sin amplitud"]
+
+        if config.RANK_ONLY_WHEN_CANDIDATES and not con_amplitud:
+            # Nada que contar. Solo se avisa del cambio de estado: cuando
+            # se pasa de tener candidatos a no tener ninguno.
+            if self.had_candidates:
+                await self.tg.send(
+                    f"😴 Se acabaron los candidatos · {len(rows)} símbolos, "
+                    f"ninguno con amplitud.\nSiguiente aviso cuando aparezca alguno."
+                )
+            self.had_candidates = False
+            log.info("Ranking omitido: sin candidatos (evitando aviso repetido)")
+            return
+
+        self.had_candidates = bool(con_amplitud)
         await self.tg.send(scanner.format_ranking(rows, config.RANK_TOP_N))
 
     def in_cooldown(self) -> bool:
