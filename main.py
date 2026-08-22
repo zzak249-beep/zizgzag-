@@ -29,6 +29,15 @@ logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+# httpx registra en INFO CADA petición. Con ~940 símbolos por ciclo y un
+# ciclo cada pocos minutos, son decenas de miles de líneas al día que
+# entierran lo único que importa leer: los ciclos, las señales y los
+# errores. Se silencia salvo que se pida DEBUG a propósito.
+if config.LOG_LEVEL != "DEBUG":
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 log = logging.getLogger("bot")
 
 
