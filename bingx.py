@@ -80,6 +80,19 @@ class BingX:
             out.append(sym)
         return out
 
+    async def tickers_24h(self) -> dict[str, float]:
+        """Volumen de 24h en USDT por símbolo, en UNA llamada."""
+        data = await self._public("/openApi/swap/v2/quote/ticker")
+        out: dict[str, float] = {}
+        for t in data or []:
+            sym = str(t.get("symbol", ""))
+            vol = t.get("quoteVolume") or t.get("turnover") or 0
+            try:
+                out[sym] = float(vol)
+            except (TypeError, ValueError):
+                out[sym] = 0.0
+        return out
+
     async def klines(self, symbol: str, interval: str, limit: int = 300) -> list[dict]:
         data = await self._public(
             "/openApi/swap/v3/quote/klines",
@@ -153,6 +166,36 @@ class BingX:
             ),
         }
         return await self._private("POST", "/openApi/swap/v2/trade/order", params)
+
+    async def limit_order(
+        self, symbol: str, side: str, quantity: float, price: float, sl: float, tp: float
+    ) -> dict:
+        """
+        Entrada con precio límite. Puede no ejecutarse, y eso es
+        deliberado: en un libro fino, no entrar es mejor que entrar al
+        precio que le quede al libro.
+        """
+        position_side = "LONG" if side == "BUY" else "SHORT"
+        return await self._private(
+            "POST",
+            "/openApi/swap/v2/trade/order",
+            {
+                "symbol": symbol,
+                "side": side,
+                "positionSide": position_side,
+                "type": "LIMIT",
+                "price": price,
+                "quantity": quantity,
+                "timeInForce": "GTC",
+                "stopLoss": '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % sl,
+                "takeProfit": '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % tp,
+            },
+        )
+
+    async def cancel_open_orders(self, symbol: str) -> dict:
+        return await self._private(
+            "POST", "/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol}
+        )
 
     async def close_position(self, symbol: str, side: str, quantity: float) -> dict:
         """

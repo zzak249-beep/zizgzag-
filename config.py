@@ -68,7 +68,12 @@ EXCLUDE_PREFIXES = [p.strip().upper() for p in os.getenv("EXCLUDE_PREFIXES", "NC
 # de operar (ATR 5-6%); donde no hubo negocio, 6-13x. Este umbral es el
 # hallazgo principal de todo el trabajo, no un parámetro más.
 MIN_ATR_PCT = _float("MIN_ATR_PCT", 4.0)
-COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.14)
+# 0.25% y no 0.14%: la comisión es lo de menos. En pares finos, una orden
+# a mercado paga entre 0.1% y 0.5% de más POR OPERACIÓN, y en perpetuos
+# las cascadas de liquidación amplifican eso justo cuando esta estrategia
+# entra — tras un movimiento violento. El 0.14% de antes era la comisión
+# sola, que es la parte que no duele.
+COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
 MIN_COST_COVER = _float("MIN_COST_COVER", 30.0)
 
 # ── Escáner de universo completo ──────────────────────────────────────
@@ -84,6 +89,18 @@ RANGE_LEN = _int("RANGE_LEN", 20)
 ER_SHORT = _int("ER_SHORT", 30)
 ER_LONG = _int("ER_LONG", 180)
 ER_TREND = _float("ER_TREND", 0.40)
+
+# ── Liquidez ──────────────────────────────────────────────────────────
+# Filtrar por amplitud sin filtrar por liquidez es cazar justo las
+# monedas donde el libro es un colador. Volumen de 24h en USDT.
+MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 2_000_000.0)
+
+# ── Ejecución ─────────────────────────────────────────────────────────
+# LIMIT por defecto: la recomendación unánime para pares finos es no
+# cruzar el spread con órdenes a mercado. Se paga con fills perdidos,
+# que es mejor que pagar con precio.
+ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
+LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
 
 # ── Estrategia (idéntica a reversion_5m.pine) ─────────────────────────
 MA_LEN = _int("MA_LEN", 20)

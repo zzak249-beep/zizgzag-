@@ -63,6 +63,7 @@ class Bot:
         self.live = config.is_live()
         self.scanner = scanner.Scanner(self.api)
         self.last_rank = 0.0
+        self.volumes: dict[str, float] = {}
         self.last_heartbeat = time.time()
 
     async def start(self) -> None:
@@ -76,6 +77,7 @@ class Bot:
         await self.refresh_symbols()
         while True:
             try:
+                await self.reconcile()
                 await self.maybe_daily_summary()
                 await self.maybe_heartbeat()
                 await self.check_time_exits()
@@ -93,6 +95,19 @@ class Bot:
             return
         if config.SYMBOL_WHITELIST:
             syms = [s for s in syms if s.split("-")[0].upper() in config.SYMBOL_WHITELIST]
+
+        # Filtro de liquidez: filtrar por amplitud sin mirar el volumen es
+        # cazar justo las monedas donde el libro es un colador.
+        try:
+            self.volumes = await self.api.tickers_24h()
+            antes = len(syms)
+            syms = [s for s in syms if self.volumes.get(s, 0.0) >= config.MIN_QUOTE_VOLUME_24H]
+            log.info(
+                "Liquidez: %d de %d símbolos superan %.0f USDT de volumen 24h",
+                len(syms), antes, config.MIN_QUOTE_VOLUME_24H,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("No se pudo filtrar por liquidez (%s): se sigue sin ese filtro", exc)
         self.symbols = syms if config.SCAN_ALL else syms[: config.MAX_SYMBOLS]
         log.info("Universo: %d símbolos", len(self.symbols))
 
@@ -142,6 +157,52 @@ class Bot:
             return
         self.last_heartbeat = time.time()
         await self.tg.send(f"💓 Vivo · {self.stats_text()}")
+
+    async def reconcile(self) -> None:
+        """
+        BUG QUE ESTO ARREGLA: el bot abría posiciones y las guardaba en
+        el estado, pero NADIE registraba los cierres. Cuando saltaba el
+        SL o el TP en el exchange, el bot no se enteraba: la posición
+        seguía "abierta" para siempre, bloqueando el hueco de
+        MAX_CONCURRENT y dejando el circuit breaker sin contar ni una
+        pérdida. En SIGNAL no se nota; en LIVE el bot se habría quedado
+        mudo y bloqueado tras las primeras operaciones.
+
+        El resultado (ganada/perdida) se estima comparando el último
+        precio con la entrada. Es una APROXIMACIÓN — el fill real puede
+        diferir — y sirve para el circuit breaker, no para contabilidad.
+        """
+        if not self.live:
+            return
+        abiertas = self.state.data.get("open", {})
+        if not abiertas:
+            return
+        try:
+            posiciones = await self.api.open_positions()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("No se pudieron leer las posiciones: %s", exc)
+            return
+
+        vivos = {str(p.get("symbol", "")) for p in posiciones if float(p.get("positionAmt", 0) or 0) != 0}
+        for symbol, pos in list(abiertas.items()):
+            if symbol in vivos:
+                continue
+            # Ya no está en el exchange: se cerró por SL o por TP.
+            try:
+                velas = await self.api.klines(symbol, config.TIMEFRAME, limit=2)
+                ultimo = velas[-1]["close"] if velas else pos["entry"]
+            except Exception:  # noqa: BLE001
+                ultimo = pos["entry"]
+            if pos["side"] == "BUY":
+                gano = ultimo > pos["entry"]
+            else:
+                gano = ultimo < pos["entry"]
+            log.info("%s cerrada fuera del bot (%s)", symbol, "ganada" if gano else "perdida")
+            await self.tg.send(
+                f"{'✅' if gano else '🛑'} <b>{symbol}</b> cerrada · "
+                f"{'objetivo' if gano else 'stop'}\n{self.stats_text()}"
+            )
+            self.register_close(symbol, gano)
 
     async def check_time_exits(self) -> None:
         """
@@ -249,7 +310,14 @@ class Bot:
                 await self.tg.send(f"⚠️ Señal en {sig.symbol} sin ejecutar: tamaño 0")
                 return
             await self.api.set_leverage(sig.symbol, "LONG" if sig.side == "BUY" else "SHORT", config.LEVERAGE)
-            await self.api.market_order(sig.symbol, sig.side, qty, sig.sl, sig.tp)
+            if config.ENTRY_TYPE == "LIMIT":
+                # Se pide un pelín MEJOR que el precio actual: en un libro
+                # fino no entrar es mejor que entrar a cualquier precio.
+                ajuste = 1 + config.LIMIT_OFFSET_PCT / 100.0
+                precio = sig.entry * (ajuste if sig.side == "SELL" else 2 - ajuste)
+                await self.api.limit_order(sig.symbol, sig.side, qty, precio, sig.sl, sig.tp)
+            else:
+                await self.api.market_order(sig.symbol, sig.side, qty, sig.sl, sig.tp)
         except BingXError as exc:
             await self.tg.send(f"❌ BingX rechazó la orden en {sig.symbol}: {exc}")
             return
