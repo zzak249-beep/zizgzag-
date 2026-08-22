@@ -42,8 +42,17 @@ BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
 BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com").strip()
 
 # ── Telegram ──────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# Se aceptan los dos nombres: los bots antiguos del proyecto usan
+# TELEGRAM_BOT_TOKEN y este empezó con TELEGRAM_TOKEN. Reutilizar el
+# servicio de Railway con las variables de otro bot es lo normal, y que
+# el bot se quede mudo por el nombre de una variable es un fallo tonto
+# que solo se descubre leyendo los logs con lupa.
+TELEGRAM_TOKEN = (
+    os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or ""
+).strip()
+TELEGRAM_CHAT_ID = (
+    os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or ""
+).strip()
 
 # ── Universo y escaneo ────────────────────────────────────────────────
 TIMEFRAME = os.getenv("TIMEFRAME", "5m").strip()
