@@ -125,6 +125,11 @@ RR_FIXED = _float("RR_FIXED", 1.5)
 # 12 velas de 5m = 60 minutos. Mismo valor que reversion_5m.pine.
 MAX_TRADE_BARS = _int("MAX_TRADE_BARS", 12)
 USE_TIME_EXIT = _bool("USE_TIME_EXIT", True)
+# Corrección a partir de datos reales: en el histórico medido, varias de
+# las MEJORES ganadoras duraron 75, 100 y 105 minutos. Cortarlas a los 60
+# habría matado justo las que pagaban. El reloj solo se aplica a lo que
+# NO va a favor: se corta lo muerto y se deja correr lo que funciona.
+TIME_EXIT_ONLY_LOSING = _bool("TIME_EXIT_ONLY_LOSING", True)
 
 
 def max_trade_seconds() -> int:
