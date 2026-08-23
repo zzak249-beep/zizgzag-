@@ -70,6 +70,58 @@ ranking va cada 15 y no cada minuto.
 
 ---
 
+## Si no da señales: sube de timeframe, no bajes el listón
+
+La volatilidad escala con la **raíz cuadrada del tiempo**: el ATR de 15m
+es ≈1.73× el de 5m, y el de 30m ≈2.45×. Pero el coste de operar **no
+escala** — la comisión y el spread son los mismos entres en la vela que
+entres.
+
+Consecuencia práctica: subir de timeframe da más candidatos **sin
+rebajar el filtro**. No es aflojar nada; es que el mismo movimiento pesa
+más frente al mismo coste.
+
+Cuando el escaneo no encuentra a nadie, el aviso incluye cuántos
+pasarían el MISMO listón en 15m y en 30m. Si ahí hay números, cambia
+`TIMEFRAME` y vuelve a medir en TradingView antes de operarlo: la
+estrategia se validó en 5m y el comportamiento en 30m hay que
+comprobarlo, no suponerlo.
+
+Lo que NO conviene: bajar `MIN_COST_COVER`. Ese umbral no es un gusto
+personal, sale de los datos — donde la estrategia funcionó había 40× el
+coste y donde no hubo negocio, 6-13×.
+
+---
+
+## Sección cruzada (opera todos los días)
+
+Segundo sistema, independiente del anterior y con una diferencia clave:
+su criterio es **relativo**, no absoluto. Siempre existe un "peor 1%",
+así que siempre hay candidatos — justo lo que le falta a la reversión,
+cuyo filtro de amplitud deja días enteros sin nada.
+
+**La idea, con respaldo:** un estudio sobre más de 3.600 monedas
+encuentra que las cripto con el retorno más bajo del último día superan
+sistemáticamente a las de retorno más alto. Cada día a la hora fijada,
+el bot ordena el universo por retorno de 24 h y apunta: largo en las N
+peores, corto en las N mejores.
+
+**Arranca en modo REGISTRO y no manda órdenes.** Guarda el ranking, y
+al día siguiente evalúa qué habría pasado **descontando el coste de ida
+y vuelta**. Te llega el resultado del día y el acumulado.
+
+Con 20 días tendrás una respuesta propia a la única pregunta que
+importa: ¿queda diferencial después de costes?
+
+**El conflicto que hay que vigilar:** los autores atribuyen el efecto a
+la iliquidez, y señalan que las monedas más grandes muestran momentum
+diario en vez de reversión — el efecto contrario. O sea que el edge vive
+donde más caro es operar. Por eso `XSECTION_MIN_VOL` es más bajo que el
+filtro de la otra estrategia: si se filtra igual, se corta justo donde
+el efecto es más fuerte. El coste dirá si compensa.
+
+---
+
 ## Termómetro del mercado
 
 El resumen diario incluye la temperatura del universo: ATR mediano,

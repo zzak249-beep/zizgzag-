@@ -21,6 +21,7 @@ import httpx
 
 import config
 import scanner
+import xsection
 import strategy
 from bingx import BingX, BingXError
 from notify import State, Telegram
@@ -79,6 +80,7 @@ class Bot:
         await self.refresh_symbols()
         while True:
             try:
+                await self.maybe_xsection()
                 await self.reconcile()
                 await self.maybe_daily_summary()
                 await self.maybe_heartbeat()
@@ -159,6 +161,60 @@ class Bot:
             return
         self.last_heartbeat = time.time()
         await self.tg.send(f"💓 Vivo · {self.stats_text()}")
+
+    async def _closes_24h(self) -> dict[str, tuple[float, float]]:
+        """Precio de hace 24 h y actual, por símbolo."""
+        out: dict[str, tuple[float, float]] = {}
+        velas_dia = int(24 * 60 / {"5m": 5, "15m": 15, "30m": 30, "1h": 60}.get(config.TIMEFRAME, 5))
+        for sym in self.symbols:
+            if self.volumes.get(sym, 0.0) < config.XSECTION_MIN_VOL:
+                continue
+            try:
+                velas = await self.api.klines(sym, config.TIMEFRAME, limit=velas_dia + 5)
+            except Exception:  # noqa: BLE001
+                continue
+            if len(velas) < velas_dia + 1:
+                continue
+            out[sym] = (velas[-velas_dia - 1]["close"], velas[-1]["close"])
+        return out
+
+    async def maybe_xsection(self) -> None:
+        """Una vez al día: evalúa lo de ayer y registra lo de hoy."""
+        if not config.XSECTION_ENABLED:
+            return
+        ahora = dt.datetime.now(dt.timezone.utc)
+        hoy = ahora.strftime("%Y-%m-%d")
+        if ahora.hour != config.XSECTION_HOUR_UTC:
+            return
+        if self.state.data.get("xs_last_day") == hoy:
+            return
+
+        closes = await self._closes_24h()
+        if len(closes) < config.XSECTION_N * 3:
+            log.warning("Sección cruzada: solo %d símbolos con datos, se salta", len(closes))
+            return
+
+        # 1. Evaluar el ranking de ayer con los precios de hoy.
+        anterior = self.state.data.get("xs_pending")
+        texto, resumen = xsection.evaluate_previous(anterior, closes)
+        if texto and resumen:
+            hist = self.state.data.setdefault("xs_history", [])
+            hist.append(resumen)
+            await self.tg.send(texto + "\n\n" + xsection.format_history(hist))
+
+        # 2. Registrar el de hoy.
+        ranking = xsection.build_ranking(self.last_rows, self.volumes, closes)
+        largos, cortos = xsection.pick_sides(ranking, config.XSECTION_N)
+        if not largos:
+            return
+        self.state.data["xs_pending"] = {
+            "fecha": hoy,
+            "largos": [{"symbol": r.symbol, "price": r.price, "ret24": r.ret24} for r in largos],
+            "cortos": [{"symbol": r.symbol, "price": r.price, "ret24": r.ret24} for r in cortos],
+        }
+        self.state.data["xs_last_day"] = hoy
+        self.state.save()
+        await self.tg.send(xsection.format_signal(largos, cortos))
 
     async def reconcile(self) -> None:
         """

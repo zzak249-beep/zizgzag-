@@ -146,6 +146,21 @@ LEVERAGE = _int("LEVERAGE", 3)
 MAX_CONSECUTIVE_LOSSES = _int("MAX_CONSECUTIVE_LOSSES", 3)
 COOLDOWN_MINUTES = _int("COOLDOWN_MINUTES", 120)
 
+# ── Sección cruzada (retorno de 24 h) ─────────────────────────────────
+# Sistema RELATIVO: siempre hay un "peor 1%", así que opera todos los
+# días — a diferencia de la reversión, cuyo filtro es absoluto y deja
+# días enteros sin candidatos.
+# Arranca en modo REGISTRO: apunta el ranking y lo evalúa al día
+# siguiente con el coste descontado. No manda órdenes.
+XSECTION_ENABLED = _bool("XSECTION_ENABLED", True)
+XSECTION_HOUR_UTC = _int("XSECTION_HOUR_UTC", 0)
+XSECTION_N = _int("XSECTION_N", 5)
+# El paper atribuye el efecto a la iliquidez, y las monedas más líquidas
+# muestran lo contrario (momentum). Este mínimo es más bajo que el de la
+# otra estrategia a propósito: si se filtra igual, se corta justo donde
+# el efecto es más fuerte. El coste dirá si compensa.
+XSECTION_MIN_VOL = _float("XSECTION_MIN_VOL", 500_000.0)
+
 # ── Avisos ────────────────────────────────────────────────────────────
 DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
 DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
