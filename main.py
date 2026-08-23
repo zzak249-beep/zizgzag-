@@ -65,6 +65,7 @@ class Bot:
         self.last_rank = 0.0
         self.volumes: dict[str, float] = {}
         self.had_candidates = False
+        self.last_rows: list = []
         self.last_heartbeat = time.time()
 
     async def start(self) -> None:
@@ -244,6 +245,7 @@ class Bot:
             return
         self.last_rank = time.time()
         rows = await self.scanner.run(self.symbols)
+        self.last_rows = rows
         con_amplitud = [r for r in rows if r.verdict != "sin amplitud"]
 
         if config.RANK_ONLY_WHEN_CANDIDATES and not con_amplitud:
@@ -322,18 +324,45 @@ class Bot:
                 await self.tg.send(f"⚠️ Señal en {sig.symbol} sin ejecutar: saldo 0")
                 return
             qty = strategy.position_size(equity, sig.entry, sig.sl)
-            if qty <= 0:
-                await self.tg.send(f"⚠️ Señal en {sig.symbol} sin ejecutar: tamaño 0")
+            qty = self.api.round_qty(sig.symbol, qty)
+            minimo = self.api.min_qty(sig.symbol)
+            if qty <= 0 or (minimo > 0 and qty < minimo):
+                await self.tg.send(
+                    f"⚠️ Señal en {sig.symbol} sin ejecutar: tamaño {qty} "
+                    f"por debajo del mínimo del contrato ({minimo}).\n"
+                    f"Con {config.RISK_PCT}% de riesgo y este stop no da para el lote mínimo."
+                )
+                return
+
+            # Segunda comprobación, contra el EXCHANGE y no contra el
+            # estado propio: si una posición se abrió fuera del bot o el
+            # estado se perdió, abrir otra sería doblar el riesgo sin
+            # enterarse.
+            try:
+                vivas = await self.api.open_positions()
+                if any(
+                    str(p.get("symbol")) == sig.symbol
+                    and float(p.get("positionAmt", 0) or 0) != 0
+                    for p in vivas
+                ):
+                    log.warning("%s ya tiene posición en el exchange: no se abre otra", sig.symbol)
+                    return
+            except Exception as exc:  # noqa: BLE001
+                log.warning("No se pudo comprobar posiciones de %s: %s", sig.symbol, exc)
                 return
             await self.api.set_leverage(sig.symbol, "LONG" if sig.side == "BUY" else "SHORT", config.LEVERAGE)
             if config.ENTRY_TYPE == "LIMIT":
                 # Se pide un pelín MEJOR que el precio actual: en un libro
                 # fino no entrar es mejor que entrar a cualquier precio.
                 ajuste = 1 + config.LIMIT_OFFSET_PCT / 100.0
-                precio = sig.entry * (ajuste if sig.side == "SELL" else 2 - ajuste)
-                await self.api.limit_order(sig.symbol, sig.side, qty, precio, sig.sl, sig.tp)
+                precio = self.api.round_price(sig.symbol, sig.entry * (ajuste if sig.side == "SELL" else 2 - ajuste))
+                sl_r = self.api.round_price(sig.symbol, sig.sl)
+                tp_r = self.api.round_price(sig.symbol, sig.tp)
+                await self.api.limit_order(sig.symbol, sig.side, qty, precio, sl_r, tp_r)
             else:
-                await self.api.market_order(sig.symbol, sig.side, qty, sig.sl, sig.tp)
+                sl_r = self.api.round_price(sig.symbol, sig.sl)
+                tp_r = self.api.round_price(sig.symbol, sig.tp)
+                await self.api.market_order(sig.symbol, sig.side, qty, sl_r, tp_r)
         except BingXError as exc:
             await self.tg.send(f"❌ BingX rechazó la orden en {sig.symbol}: {exc}")
             return

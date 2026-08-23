@@ -34,6 +34,7 @@ class BingX:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._c = client
         self._base = config.BINGX_BASE_URL.rstrip("/")
+        self._precision: dict[str, dict] = {}
 
     # ── firma ─────────────────────────────────────────────────────────
     def _sign(self, params: dict[str, Any]) -> str:
@@ -68,6 +69,7 @@ class BingX:
 
     # ── público ───────────────────────────────────────────────────────
     async def symbols(self) -> list[str]:
+        """Además de la lista, guarda la PRECISIÓN de cada símbolo."""
         data = await self._public("/openApi/swap/v2/quote/contracts")
         out: list[str] = []
         for item in data or []:
@@ -78,7 +80,27 @@ class BingX:
             if any(base.startswith(pref) for pref in config.EXCLUDE_PREFIXES):
                 continue
             out.append(sym)
+            # BingX RECHAZA las órdenes con más decimales de los que
+            # admite el contrato. Sin esto, en LIVE la primera orden se
+            # rechaza y el bot parece roto sin estarlo: manda una
+            # cantidad como 13847.293847 donde solo se aceptan enteros.
+            self._precision[sym] = {
+                "qty": int(item.get("quantityPrecision", 4) or 0),
+                "price": int(item.get("pricePrecision", 6) or 0),
+                "min_qty": float(item.get("tradeMinQuantity", 0) or 0),
+            }
         return out
+
+    def round_qty(self, symbol: str, qty: float) -> float:
+        p = self._precision.get(symbol, {})
+        return round(qty, int(p.get("qty", 4)))
+
+    def round_price(self, symbol: str, price: float) -> float:
+        p = self._precision.get(symbol, {})
+        return round(price, int(p.get("price", 6)))
+
+    def min_qty(self, symbol: str) -> float:
+        return float(self._precision.get(symbol, {}).get("min_qty", 0.0))
 
     async def tickers_24h(self) -> dict[str, float]:
         """Volumen de 24h en USDT por símbolo, en UNA llamada."""

@@ -70,6 +70,25 @@ ranking va cada 15 y no cada minuto.
 
 ---
 
+## Termómetro del mercado
+
+El resumen diario incluye la temperatura del universo: ATR mediano,
+percentil 90 y cuántos símbolos están a media distancia del umbral.
+
+Responde a una pregunta distinta de "¿hay candidatos hoy?": **¿se está
+calentando el mercado?** Con la mediana subiendo, van a aparecer
+candidatos pronto aunque hoy no haya ninguno. Con la mediana plana,
+puedes pasarte semanas sin una sola señal — y eso también es una
+respuesta, no un fallo.
+
+Contexto que conviene tener presente: la frecuencia de oportunidades de
+esta estrategia depende del RÉGIMEN del mercado. Cuando la dominancia de
+Bitcoin es alta y las alts están estancadas, hay poco que filtrar. En
+fases de rotación hacia alts, los movimientos del 10-20% diario son
+frecuentes y el radar se llena.
+
+---
+
 ## Despliegue en Railway
 
 **1. Sube el repositorio a GitHub** con estos archivos en la raíz.
@@ -107,6 +126,22 @@ dinero, el de un cerrojo extra es un minuto.
 
 Recomendado para el primer LIVE: `RISK_PCT=0.25`, `MAX_CONCURRENT=1`,
 `SYMBOL_WHITELIST` con dos o tres símbolos que ya hayas medido.
+
+---
+
+## Detalles de ejecución que evitan rechazos
+
+- Las cantidades y los precios se **redondean a la precisión del
+  contrato** que publica BingX. Sin esto, la primera orden en LIVE se
+  rechaza por enviar 13847.293847 donde solo se aceptan enteros, y el
+  bot parece roto sin estarlo.
+- Si el tamaño calculado queda por debajo del **lote mínimo** del
+  contrato, la señal se descarta con un aviso explicando por qué: con
+  un riesgo del 0.25% y un stop ancho, en algunos símbolos simplemente
+  no da para el mínimo.
+- Antes de abrir se comprueba si ya hay posición **en el exchange**, no
+  solo en el estado propio. Si una posición se abrió fuera del bot o el
+  estado se perdió, abrir otra sería doblar el riesgo sin enterarse.
 
 ---
 
