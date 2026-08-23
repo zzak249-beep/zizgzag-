@@ -221,6 +221,18 @@ class Bot:
             edad = ahora - float(pos.get("opened_at", ahora))
             if edad < limite:
                 continue
+            if config.TIME_EXIT_ONLY_LOSING:
+                try:
+                    velas = await self.api.klines(symbol, config.TIMEFRAME, limit=2)
+                    ultimo = velas[-1]["close"] if velas else None
+                except Exception:  # noqa: BLE001
+                    ultimo = None
+                if ultimo is not None:
+                    entrada = float(pos.get("entry", ultimo))
+                    a_favor = ultimo > entrada if pos["side"] == "BUY" else ultimo < entrada
+                    if a_favor:
+                        log.info("%s pasa del límite pero va a favor: se deja correr", symbol)
+                        continue
             log.info("%s lleva %.0f min abierta: cierre por tiempo", symbol, edad / 60)
             if self.live:
                 try:
