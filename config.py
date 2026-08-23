@@ -100,6 +100,16 @@ ER_TREND = _float("ER_TREND", 0.40)
 # monedas donde el libro es un colador. Volumen de 24h en USDT.
 MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 2_000_000.0)
 
+# ── Filtro de eficiencia: descarta los verticales ─────────────────────
+# El hallazgo que faltaba por implementar. Medido: la reversión gana en
+# pumps que van y VUELVEN (JIMOTHY +0.22R, CATE PF 1.6) y pierde en los
+# que solo van (INDEXUS -0.56R con 21 operaciones, y su ruptura -0.32R
+# con 159: ahí no gana nadie). La diferencia se ve en el ratio de
+# eficiencia: un movimiento en línea recta da ER alto; uno que sube y
+# baja, ER bajo. Sin este filtro, el agregado de todo lo medido sale
+# NEGATIVO porque el vertical se come lo que ganan los demás.
+MAX_ER_LONG = _float("MAX_ER_LONG", 0.35)
+
 # ── Ejecución ─────────────────────────────────────────────────────────
 # LIMIT por defecto: la recomendación unánime para pares finos es no
 # cruzar el spread con órdenes a mercado. Se paga con fills perdidos,

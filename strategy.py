@@ -93,6 +93,16 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
     if atr_pct < config.MIN_ATR_PCT or cover < config.MIN_COST_COVER:
         return None, f"sin amplitud ({atr_pct:.2f}%, {cover:.0f}x)"
 
+    # Ratio de eficiencia de fondo: recorrido neto / suma de movimientos.
+    # Alto = línea recta = no es terreno de reversión.
+    er_len = min(180, len(closes) - 1)
+    if er_len > 20:
+        neto = abs(closes[-1] - closes[-1 - er_len])
+        total = sum(abs(closes[i] - closes[i - 1]) for i in range(len(closes) - er_len, len(closes)))
+        er_long = neto / total if total > 0 else 0.0
+        if er_long > config.MAX_ER_LONG:
+            return None, f"vertical (ER {er_long:.2f} > {config.MAX_ER_LONG})"
+
     stretch = (close - ma) / a
 
     # El estiramiento tiene que ser RÁPIDO: hace N velas aún no lo estaba.
