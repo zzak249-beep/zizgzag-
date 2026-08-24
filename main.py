@@ -483,7 +483,26 @@ class Bot:
         if symbol in self.state.data.get("open", {}) or symbol in self.state.data.get("pending", {}):
             return
 
-        estado = strategy.watch_status(velas)
+        # DEFENSIVO: si el repositorio tiene una versión de strategy.py
+        # más antigua que main.py, esto reventaba el ciclo entero con
+        # AttributeError. Un bot con dinero real NO puede caerse por un
+        # desajuste de versiones entre dos archivos: se desactiva el
+        # aviso, se avisa una vez, y lo demás sigue operando.
+        fn = getattr(strategy, "watch_status", None)
+        if fn is None:
+            if not self.state.data.get("warned_watch_missing"):
+                self.state.data["warned_watch_missing"] = True
+                self.state.save()
+                log.error("strategy.py desactualizado: falta watch_status()")
+                await self.tg.send(
+                    "⚠️ <b>Archivos descoordinados</b>\n"
+                    "El <code>strategy.py</code> del repositorio es más antiguo que "
+                    "<code>main.py</code> (falta <code>watch_status</code>).\n"
+                    "Los avisos de vigilancia quedan desactivados; el resto sigue "
+                    "funcionando. Sube el strategy.py actualizado."
+                )
+            return
+        estado = fn(velas)
         if not estado:
             return
         cerca, stretch, atr_pct, lado = estado

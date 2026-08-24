@@ -63,7 +63,8 @@ class State:
             "losses": 0,
             "consecutive_losses": 0,
             "cooldown_until": 0,
-            "open": {},          # symbol -> datos de la posición
+            "open": {},          # symbol -> posición confirmada por el exchange
+            "pending": {},       # symbol -> orden limitada enviada, aún sin ejecutar
             "last_signal": {},   # symbol -> timestamp de la última señal
         }
         self._load()
