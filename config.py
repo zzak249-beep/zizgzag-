@@ -87,7 +87,13 @@ RANK_TOP_N = _int("RANK_TOP_N", 12)
 # minutos diciendo "no hay nada" son 96 al día: dejas de mirarlos, y el
 # día que llegue una señal de verdad la vas a pasar por alto igual que
 # las otras 95. El "no hay nada" ya lo cubren el latido y el resumen.
-RANK_ONLY_WHEN_CANDIDATES = _bool("RANK_ONLY_WHEN_CANDIDATES", True)
+# "solo_candidatos": avisa únicamente cuando alguno pasa TODOS los filtros.
+# "top_siempre":     manda el top por amplitud aunque ninguno sea operable,
+#                    marcando cuál pasa y cuál no. Cada mensaje es distinto
+#                    (símbolos y cifras cambian), así que no cae en la
+#                    fatiga de alertas del mensaje idéntico repetido.
+RANK_MODE = os.getenv("RANK_MODE", "top_siempre").strip().lower()
+RANK_ONLY_WHEN_CANDIDATES = RANK_MODE == "solo_candidatos"
 # Mil símbolos son mil llamadas: el semáforo evita que BingX responda 429.
 SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
 RANGE_LEN = _int("RANGE_LEN", 20)
@@ -116,6 +122,13 @@ MAX_ER_LONG = _float("MAX_ER_LONG", 0.35)
 # que es mejor que pagar con precio.
 ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
 LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
+# Minutos que se le dan a una orden limitada para ejecutarse. Pasado ese
+# plazo se cancela. Una orden colgada no es "una entrada que aún puede
+# salir bien": es una entrada calculada para un contexto que ya no
+# existe, esperando a ejecutarse en otro. Esta estrategia entra en
+# agotamientos que duran minutos; una orden de hace dos horas no tiene
+# nada que ver con la señal que la creó.
+LIMIT_TTL_MIN = _int("LIMIT_TTL_MIN", 10)
 
 # ── Estrategia (idéntica a reversion_5m.pine) ─────────────────────────
 MA_LEN = _int("MA_LEN", 20)
@@ -171,10 +184,24 @@ XSECTION_N = _int("XSECTION_N", 5)
 # el efecto es más fuerte. El coste dirá si compensa.
 XSECTION_MIN_VOL = _float("XSECTION_MIN_VOL", 500_000.0)
 
+# ── Avisos de vigilancia ──────────────────────────────────────────────
+# Aviso ANTES de que dispare: cuando un símbolo pasa todos los filtros y
+# está cerca del umbral de estiramiento, pero aún le falta la vela de
+# agotamiento. Da tiempo a abrir el gráfico y pasarlo por el script
+# antes de que la señal exista — que es justo lo que no pasó con AIINU,
+# donde el aviso llegó cuando el precio ya había vuelto a su media.
+WATCH_ALERTS = _bool("WATCH_ALERTS", True)
+WATCH_STRETCH_PCT = _float("WATCH_STRETCH_PCT", 75.0)
+# Sin esto, un símbolo que ronda el umbral avisaría cada minuto.
+WATCH_COOLDOWN_MIN = _int("WATCH_COOLDOWN_MIN", 45)
+
 # ── Avisos ────────────────────────────────────────────────────────────
 DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
 DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
 HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
+# Días sin operar en LIVE que disparan aviso. El fallo más traicionero
+# es el silencioso: todo "funciona" y hace semanas que no se opera.
+IDLE_ALERT_DAYS = _int("IDLE_ALERT_DAYS", 5)
 
 # ── Estado ────────────────────────────────────────────────────────────
 STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")
