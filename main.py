@@ -77,24 +77,13 @@ class Bot:
             f"Filtro de amplitud: ATR ≥ {config.MIN_ATR_PCT}% y ≥ {config.MIN_COST_COVER:.0f}× el coste\n"
             f"Riesgo por operación: {config.RISK_PCT}%"
         )
-        # Si un despliegue anterior dejó órdenes pendientes, se resuelven
-        # antes de nada: al reiniciar, lo primero es saber qué hay vivo.
-        huerfanas = list(self.state.data.get("pending", {}).keys())
-        if huerfanas:
-            await self.tg.send(
-                f"⚠️ Al arrancar quedaban {len(huerfanas)} órdenes pendientes de antes: "
-                f"{', '.join(huerfanas)}.\nSe resolverán en el primer ciclo."
-            )
-
         await self.refresh_symbols()
         while True:
             try:
-                await self.resolve_pending()
                 await self.maybe_xsection()
                 await self.reconcile()
                 await self.maybe_daily_summary()
                 await self.maybe_heartbeat()
-                await self.maybe_idle_warning()
                 await self.check_time_exits()
                 await self.maybe_rank()
                 await self.scan_once()
@@ -164,35 +153,6 @@ class Bot:
         if not entregado:
             log.error("El resumen diario NO se entregó: revisa las credenciales de Telegram")
 
-    async def maybe_idle_warning(self) -> None:
-        """
-        Aviso de INACTIVIDAD ECONÓMICA.
-
-        El fallo más traicionero de un bot en producción es el silencioso:
-        la infraestructura sigue viva, los logs no dan errores y el
-        exchange responde, pero hace semanas que no se opera. Vigilar la
-        salud del proceso no detecta eso — hay que vigilar el resultado.
-        """
-        if not self.live or config.IDLE_ALERT_DAYS <= 0:
-            return
-        ultima = float(self.state.data.get("last_trade_ts", 0) or 0)
-        if ultima <= 0:
-            ultima = float(self.state.data.get("started_ts", time.time()))
-            self.state.data.setdefault("started_ts", ultima)
-        dias = (time.time() - ultima) / 86400.0
-        if dias < config.IDLE_ALERT_DAYS:
-            return
-        if self.state.data.get("idle_warned_at", 0) and time.time() - float(self.state.data["idle_warned_at"]) < 86400:
-            return
-        self.state.data["idle_warned_at"] = time.time()
-        self.state.save()
-        await self.tg.send(
-            f"🔇 <b>{dias:.0f} días sin una sola operación</b> estando en LIVE.\n"
-            f"Puede ser el mercado (filtros exigentes) o puede ser un fallo silencioso.\n"
-            f"Comprueba: ¿el ranking sigue llegando? ¿el saldo es correcto?\n"
-            f"{self.stats_text()}"
-        )
-
     async def maybe_heartbeat(self) -> None:
         """Señal de vida periódica: si deja de llegar, el bot está caído."""
         if config.HEARTBEAT_HOURS <= 0:
@@ -255,56 +215,6 @@ class Bot:
         self.state.data["xs_last_day"] = hoy
         self.state.save()
         await self.tg.send(xsection.format_signal(largos, cortos))
-
-    async def resolve_pending(self) -> None:
-        """
-        Cierra el ciclo de vida de las órdenes limitadas: o se ejecutaron
-        (pasan a posición) o caducan (se cancelan y se olvidan).
-
-        Sin esto, una orden que no entra se queda flotando en el exchange
-        y puede ejecutarse horas después, cuando la señal que la justificó
-        ya no existe. Es la forma más silenciosa de acabar con una
-        posición que nadie decidió abrir.
-        """
-        if not self.live:
-            return
-        pendientes = self.state.data.get("pending", {})
-        if not pendientes:
-            return
-        try:
-            posiciones = await self.api.open_positions()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("No se pudieron leer posiciones para las pendientes: %s", exc)
-            return
-
-        vivas = {
-            str(p.get("symbol", "")): float(p.get("positionAmt", 0) or 0)
-            for p in posiciones
-            if float(p.get("positionAmt", 0) or 0) != 0
-        }
-        ahora = time.time()
-        for symbol, pend in list(pendientes.items()):
-            if symbol in vivas:
-                # Se ejecutó: ahora sí es una posición.
-                pend["opened_at"] = ahora
-                self.state.data.setdefault("open", {})[symbol] = pend
-                self.state.data["pending"].pop(symbol, None)
-                self.state.save()
-                await self.tg.send(f"✅ <b>{symbol}</b> ejecutada · la orden limitada entró")
-                continue
-
-            edad_min = (ahora - float(pend.get("opened_at", ahora))) / 60.0
-            if edad_min >= config.LIMIT_TTL_MIN:
-                try:
-                    await self.api.cancel_open_orders(symbol)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("No se pudo cancelar la orden de %s: %s", symbol, exc)
-                self.state.data["pending"].pop(symbol, None)
-                self.state.save()
-                await self.tg.send(
-                    f"🚫 <b>{symbol}</b> cancelada · no se ejecutó en {config.LIMIT_TTL_MIN} min.\n"
-                    f"No entrar es una decisión, no un fallo: el precio ya no es el de la señal."
-                )
 
     async def reconcile(self) -> None:
         """
@@ -406,13 +316,6 @@ class Bot:
         self.last_rows = rows
         con_amplitud = [r for r in rows if r.verdict != "sin amplitud"]
 
-        if not config.RANK_ONLY_WHEN_CANDIDATES and not con_amplitud:
-            # Modo "top_siempre": aunque nadie sea operable, se manda la
-            # lista de vigilancia con las mejores situadas.
-            self.had_candidates = False
-            await self.tg.send(scanner.format_watchlist(rows, config.RANK_TOP_N))
-            return
-
         if config.RANK_ONLY_WHEN_CANDIDATES and not con_amplitud:
             # Nada que contar. Solo se avisa del cambio de estado: cuando
             # se pasa de tener candidatos a no tener ninguno.
@@ -428,6 +331,13 @@ class Bot:
         self.had_candidates = bool(con_amplitud)
         await self.tg.send(scanner.format_ranking(rows, config.RANK_TOP_N))
 
+        # Las favoritas: no es lo mismo que el ranking. El ranking ordena
+        # por amplitud aunque falte la vela de agotamiento; esto es
+        # exactamente lo que strategy.evaluate() aceptaría abrir AHORA.
+        favoritas = scanner.format_favorites(rows, config.RANK_TOP_N)
+        if favoritas:
+            await self.tg.send(favoritas)
+
     def in_cooldown(self) -> bool:
         return time.time() < float(self.state.data.get("cooldown_until", 0))
 
@@ -437,7 +347,7 @@ class Bot:
             log.info("En enfriamiento, %d min restantes", restante)
             return
 
-        abiertas = len(self.state.data.get("open", {})) + len(self.state.data.get("pending", {}))
+        abiertas = len(self.state.data.get("open", {}))
         if abiertas >= config.MAX_CONCURRENT:
             log.info("Límite de posiciones alcanzado (%d)", abiertas)
             return
@@ -450,18 +360,13 @@ class Bot:
                 log.debug("%s: sin velas (%s)", sym, exc)
                 continue
 
-            # Aviso de vigilancia: va ANTES de evaluar la señal, porque el
-            # objetivo es avisar mientras el precio se estira — no cuando
-            # ya se ha girado y la operación ha pasado.
-            await self.maybe_watch(sym, velas)
-
             sig, motivo = strategy.evaluate(sym, velas)
             if not motivo.startswith("sin amplitud"):
                 con_amplitud += 1
             if sig is None:
                 log.debug("%s: %s", sym, motivo)
                 continue
-            if sym in self.state.data.get("open", {}) or sym in self.state.data.get("pending", {}):
+            if sym in self.state.data.get("open", {}):
                 continue
 
             await self.handle_signal(sig)
@@ -474,37 +379,6 @@ class Bot:
             "Ciclo completo · %d símbolos, %d con amplitud suficiente",
             len(self.symbols),
             con_amplitud,
-        )
-
-    async def maybe_watch(self, symbol: str, velas: list[dict]) -> None:
-        """Avisa de los símbolos que están A PUNTO, con enfriamiento."""
-        if not config.WATCH_ALERTS:
-            return
-        if symbol in self.state.data.get("open", {}) or symbol in self.state.data.get("pending", {}):
-            return
-
-        estado = strategy.watch_status(velas)
-        if not estado:
-            return
-        cerca, stretch, atr_pct, lado = estado
-        if not cerca:
-            return
-
-        ultimo = float(self.state.data.setdefault("watch", {}).get(symbol, 0))
-        if time.time() - ultimo < config.WATCH_COOLDOWN_MIN * 60:
-            return
-        self.state.data["watch"][symbol] = time.time()
-        self.state.save()
-
-        base = symbol.split("-")[0]
-        falta = config.STRETCH_ATR - abs(stretch)
-        await self.tg.send(
-            f"👀 <b>{base}</b> se está estirando\n"
-            f"Estiramiento <b>{stretch:+.2f}</b> de {config.STRETCH_ATR:.1f} ATR "
-            f"(faltan {falta:.2f})\n"
-            f"ATR {atr_pct:.2f}%  ·  dirección probable: <b>{lado}</b>\n"
-            f"<i>Aún no hay señal. Buen momento para abrirlo en TradingView "
-            f"y pasarle el script.</i>"
         )
 
     async def handle_signal(self, sig: strategy.Signal) -> None:
@@ -552,9 +426,6 @@ class Bot:
                 log.warning("No se pudo comprobar posiciones de %s: %s", sig.symbol, exc)
                 return
             await self.api.set_leverage(sig.symbol, "LONG" if sig.side == "BUY" else "SHORT", config.LEVERAGE)
-            # Identificador propio para poder comprobar después si la
-            # orden existe cuando la respuesta se pierda por el camino.
-            client_id = f"rev{sig.symbol.split('-')[0][:6]}{int(time.time())}"
             if config.ENTRY_TYPE == "LIMIT":
                 # Se pide un pelín MEJOR que el precio actual: en un libro
                 # fino no entrar es mejor que entrar a cualquier precio.
@@ -562,42 +433,19 @@ class Bot:
                 precio = self.api.round_price(sig.symbol, sig.entry * (ajuste if sig.side == "SELL" else 2 - ajuste))
                 sl_r = self.api.round_price(sig.symbol, sig.sl)
                 tp_r = self.api.round_price(sig.symbol, sig.tp)
-                await self.api.limit_order(sig.symbol, sig.side, qty, precio, sl_r, tp_r, client_id)
+                await self.api.limit_order(sig.symbol, sig.side, qty, precio, sl_r, tp_r)
             else:
                 sl_r = self.api.round_price(sig.symbol, sig.sl)
                 tp_r = self.api.round_price(sig.symbol, sig.tp)
-                await self.api.market_order(sig.symbol, sig.side, qty, sl_r, tp_r, client_id)
+                await self.api.market_order(sig.symbol, sig.side, qty, sl_r, tp_r)
         except BingXError as exc:
             await self.tg.send(f"❌ BingX rechazó la orden en {sig.symbol}: {exc}")
             return
         except Exception as exc:  # noqa: BLE001
-            # LA RESPUESTA SE PERDIÓ, PERO LA ORDEN PUEDE EXISTIR.
-            # Es el fallo clásico de los bots en producción: la petición
-            # llega al exchange y la respuesta no vuelve. Darla por
-            # fallida sin comprobar lleva a abrir una segunda encima.
-            existe = await self.api.order_exists(sig.symbol, client_id)
-            if existe:
-                await self.tg.send(
-                    f"⚠️ <b>{sig.symbol}</b>: fallo de red al enviar, pero la orden SÍ existe "
-                    f"en el exchange.\nSe registra como abierta.\n<code>{exc}</code>"
-                )
-                log.warning("%s: respuesta perdida pero la orden existe", sig.symbol)
-            else:
-                await self.tg.send(
-                    f"❌ Error al ejecutar {sig.symbol} y la orden NO existe "
-                    f"en el exchange: {exc}"
-                )
-                return
+            await self.tg.send(f"❌ Error al ejecutar {sig.symbol}: {exc}")
+            return
 
-        # BUG QUE ESTO ARREGLA: con ENTRY_TYPE=LIMIT la orden PUEDE NO
-        # EJECUTARSE, y el bot la daba por abierta igualmente. Consecuencias
-        # en real: el hueco de MAX_CONCURRENT bloqueado por una posición que
-        # no existe, y reconcile() contando después un cierre inventado —
-        # con su ganancia o pérdida ficticia alimentando el circuit breaker.
-        # Ahora una orden limitada entra como PENDIENTE y solo pasa a
-        # posición cuando el exchange confirma que hay algo abierto.
-        es_limite = config.ENTRY_TYPE == "LIMIT"
-        registro = {
+        self.state.data.setdefault("open", {})[sig.symbol] = {
             "side": sig.side,
             "entry": sig.entry,
             "sl": sig.sl,
@@ -605,15 +453,8 @@ class Bot:
             "qty": qty,
             "opened_at": time.time(),
         }
-        if es_limite:
-            self.state.data.setdefault("pending", {})[sig.symbol] = registro
-        else:
-            self.state.data.setdefault("open", {})[sig.symbol] = registro
         self.state.save()
-        await self.tg.send(
-            fmt_signal(sig, live=True)
-            + (f"\n⏳ Orden limitada enviada · caduca en {config.LIMIT_TTL_MIN} min" if es_limite else "")
-        )
+        await self.tg.send(fmt_signal(sig, live=True))
 
     def register_close(self, symbol: str, won: bool) -> None:
         """
