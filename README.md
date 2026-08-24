@@ -122,6 +122,35 @@ el efecto es más fuerte. El coste dirá si compensa.
 
 ---
 
+## Si no entra nunca: mira el embudo
+
+El resumen diario incluye cuántos símbolos caen en cada filtro:
+
+```
+Universo: 536
+→ liquidez ≥2.0M: 325
+→ ATR ≥7.5%: 7
+→ no vertical (ER ≤0.35): 5
+→ estirado ≥2.5 ATR: 0
+```
+
+**Ojo a una interacción fácil de no ver:** el umbral de ATR que se
+aplica de verdad NO es `MIN_ATR_PCT`, sino el mayor de los dos —
+`MIN_COST_COVER` × `COST_ROUNDTRIP_PCT`. Con 30× y 0.25% de coste
+estás pidiendo **7.5% de ATR**, no 4%.
+
+Y ese umbral se solapa con el de eficiencia: un ATR del 7.5% en velas
+de 5m lo tienen casi solo las monedas en pump, pero `MAX_ER_LONG`
+descarta precisamente los movimientos verticales. La intersección
+existe —JIMOTHY y CATE lo eran— pero es estrecha por construcción.
+
+Si quieres más entradas, la palanca honesta es **bajar
+`MIN_COST_COVER` a 20** (ATR efectivo 5%) sabiendo que el coste pesará
+más, o **subir el timeframe**, que mejora la cobertura sin tocar el
+listón.
+
+---
+
 ## Termómetro del mercado
 
 El resumen diario incluye la temperatura del universo: ATR mediano,
@@ -197,6 +226,27 @@ Recomendado para el primer LIVE: `RISK_PCT=0.25`, `MAX_CONCURRENT=1`,
 
 ---
 
+## Ciclo de vida de una orden limitada
+
+Con `ENTRY_TYPE=LIMIT` la orden **puede no ejecutarse**, y eso está
+contemplado:
+
+1. Se envía y queda como **pendiente** — no como posición.
+2. Cada ciclo se comprueba contra el exchange. Si hay posición abierta,
+   pasa a posición y te avisa.
+3. Si a los `LIMIT_TTL_MIN` minutos no ha entrado, **se cancela**.
+
+Una orden colgada no es "una entrada que aún puede salir bien": es una
+entrada calculada para un contexto que ya no existe, esperando a
+ejecutarse en otro. Esta estrategia entra en agotamientos que duran
+minutos; una orden de hace dos horas no tiene nada que ver con la señal
+que la creó.
+
+Las pendientes ocupan hueco en `MAX_CONCURRENT` mientras viven, y si un
+despliegue deja alguna sin resolver, el bot avisa al arrancar.
+
+---
+
 ## Lo que el bot no hace, a propósito
 
 - No promedia a la baja.
@@ -238,6 +288,16 @@ sorpresa.
 
 ## Avisos de Telegram
 
+`RANK_MODE` decide cuánto te habla el bot:
+
+- **`top_siempre`** (por defecto): cada `RANK_INTERVAL_MIN` te manda las
+  mejores situadas del mercado, pasen o no el listón, con una marca de
+  en qué estado está cada una. Cada mensaje es distinto —cambian los
+  símbolos y las cifras—, así que sigues mirándolos.
+- **`solo_candidatos`**: solo habla cuando alguno cumple TODOS los
+  filtros. Silencio casi absoluto, y el día que suena es importante.
+
+
 Comprueba las credenciales **antes** de desplegar:
 
 ```bash
@@ -253,12 +313,18 @@ Qué te va a llegar:
 |-------|--------|
 | 🤖 Arranque | Al iniciar, con el modo y los filtros activos |
 | 📡 Ranking | Cada `RANK_INTERVAL_MIN`, con el top por amplitud |
+| 👀 Vigilancia | Un símbolo pasa todos los filtros y se acerca al umbral, pero aún no ha girado |
 | 🔔 Señal | Cuando un símbolo cumple las condiciones |
 | 🟢 Ejecutado | Solo en LIVE, al abrir posición |
 | ⏱️ Cierre por tiempo | Si la vuelta no llega en `MAX_TRADE_BARS` |
 | ⏸️ Circuit breaker | Tras `MAX_CONSECUTIVE_LOSSES` pérdidas seguidas |
 | 📊 Resumen diario | A la hora que fijes en `DAILY_SUMMARY_HOUR_UTC` |
 | 💓 Latido | Cada `HEARTBEAT_HOURS` |
+
+El aviso de **vigilancia** llega ANTES de que exista la señal: mientras
+el precio se estira, no cuando ya se ha girado. Es el que da tiempo a
+abrir el gráfico y pasarle el script. Con un enfriamiento por símbolo
+para que uno que ronde el umbral no avise cada minuto.
 
 El resumen diario y el latido existen por una razón concreta: **el
 silencio no distingue entre "no hay nada que operar" y "el bot está
