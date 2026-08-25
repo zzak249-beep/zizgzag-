@@ -76,6 +76,10 @@ MIN_ATR_PCT = _float("MIN_ATR_PCT", 4.0)
 COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
 MIN_COST_COVER = _float("MIN_COST_COVER", 30.0)
 
+def _tf_min() -> int:
+    return {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(TIMEFRAME, 5)
+
+
 # ── Escáner de universo completo ──────────────────────────────────────
 # SCAN_ALL=true recorre TODOS los perpetuos y publica un ranking por
 # Telegram cada RANK_INTERVAL_MIN. Sustituye al radar manual de
@@ -97,8 +101,13 @@ RANK_ONLY_WHEN_CANDIDATES = RANK_MODE == "solo_candidatos"
 # Mil símbolos son mil llamadas: el semáforo evita que BingX responda 429.
 SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
 RANGE_LEN = _int("RANGE_LEN", 20)
-ER_SHORT = _int("ER_SHORT", 30)
-ER_LONG = _int("ER_LONG", 180)
+# Igual con el ratio de eficiencia: 30 velas son 2h30 en 5m y 15 HORAS
+# en 30m. Si no se ajusta, el "carácter de fondo" pasa a medir cuatro
+# días y deja de describir lo que está pasando.
+ER_SHORT_MINUTES = _int("ER_SHORT_MINUTES", 150)
+ER_LONG_MINUTES = _int("ER_LONG_MINUTES", 900)
+ER_SHORT = _int("ER_SHORT", 0) or max(10, round(ER_SHORT_MINUTES / _tf_min()))
+ER_LONG = _int("ER_LONG", 0) or max(30, round(ER_LONG_MINUTES / _tf_min()))
 ER_TREND = _float("ER_TREND", 0.40)
 
 # ── Liquidez ──────────────────────────────────────────────────────────
@@ -146,7 +155,14 @@ RR_FIXED = _float("RR_FIXED", 1.5)
 # tras retornos anormales. Si la vuelta no llega pronto, ya no estás en
 # el fenómeno que querías operar — estás en el que va en tu contra.
 # 12 velas de 5m = 60 minutos. Mismo valor que reversion_5m.pine.
-MAX_TRADE_BARS = _int("MAX_TRADE_BARS", 12)
+# ── Parámetros expresados en TIEMPO, no en barras ─────────────────────
+# Al cambiar de timeframe, un parámetro en BARRAS cambia de significado
+# sin avisar: 12 velas son 1 hora en 5m pero SEIS horas en 30m. Y la
+# reversión intradía vive en la ventana de minutos a una hora — a seis
+# horas ya se está operando otro fenómeno. Por eso el reloj se define en
+# minutos y las barras se calculan solas.
+MAX_TRADE_MINUTES = _int("MAX_TRADE_MINUTES", 60)
+MAX_TRADE_BARS = _int("MAX_TRADE_BARS", 0) or max(2, round(MAX_TRADE_MINUTES / _tf_min()))
 USE_TIME_EXIT = _bool("USE_TIME_EXIT", True)
 # Corrección a partir de datos reales: en el histórico medido, varias de
 # las MEJORES ganadoras duraron 75, 100 y 105 minutos. Cortarlas a los 60
