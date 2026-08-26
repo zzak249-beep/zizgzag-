@@ -50,12 +50,36 @@ por amplitud:
 ```
 📡 Escaneo BingX — 987 símbolos, 14 con amplitud
 
+🏆 CATE      5.89% (42×)  ER 0.31/0.22  estirado +2.8
 🔶 BASECAT  10.43% (74×)  ER 0.03/0.17  estirado +2.7
 🟩 CASHCAT   5.49% (39×)  ER 0.25/0.16  fuera +0.4
-·  CATE      4.48% (32×)  ER 0.27/0.10  en rango +0.3
+·  MERL      4.48% (32×)  ER 0.27/0.10  en rango +0.3
 ```
 
-🔶 reversión lista · 🟩 ruptura lista · `·` con amplitud, esperando.
+🏆 lista para operar YA · 🔶 estirada, falta la vela de agotamiento ·
+🟩 ruptura (informativo, la estrategia no la opera) · ▫ vertical,
+descartada por el filtro de ER · `·` con amplitud, en espera.
+
+El veredicto **no es un criterio aparte del que abre la operación**:
+el escáner llama a la misma `strategy.evaluate()` que decide si se
+abre o no, así que 🏆 en el ranking y 🔔 SEÑAL / 🟢 EJECUTADO son la
+misma cosa vista dos veces, no dos criterios que puedan discrepar.
+
+Justo después del ranking llega un segundo aviso, solo con lo que está
+LISTO ahora mismo (o, si no hay nada listo, con lo más cerca de estarlo):
+
+```
+🏆 Favoritas de este escaneo — 1 lista(s) para operar
+
+🔴 CATE CORTO — entrada 0.1234  SL 0.135  TP 0.115
+   R:R 1.80 · ATR 5.89% (42×) · estirón +2.80 ATR
+   🔥 Confirmada por cascada de liquidaciones: 17.8× lo normal,
+   5 liquidaciones de cortos en los últimos 1 min
+```
+
+La línea 🔥 solo aparece cuando hay una cascada de liquidación real
+(Binance + Bybit, gratis, ver más abajo) confirmando la dirección de
+la señal — es información añadida, no cambia si el bot abre o no.
 
 Esto sustituye al radar de TradingView, que solo admite diez símbolos
 escritos a mano. Aquí no eliges: se miran todos y suben los que valen.
@@ -93,6 +117,44 @@ coste y donde no hubo negocio, 6-13×.
 
 ---
 
+## Cascadas de liquidación (confirmación, gratis)
+
+Un módulo aparte, `liquidations.py`, escucha dos streams públicos y
+gratuitos — Binance Futures (`!forceOrder@arr`, todos los símbolos de
+golpe) y Bybit (`allLiquidation`, símbolo a símbolo) — sin API key ni
+cuenta en ninguno de los dos. BingX no publica liquidaciones, y
+Coinglass ya no tiene tier gratuito (29$/mes mínimo), así que esto es
+la fuente primaria sin intermediario de pago.
+
+**Qué mide:** no basta con que haya habido una liquidación grande —
+una liquidación suelta puede ser una sola cuenta, no un mecanismo de
+mercado. Se marca cascada cuando, en los últimos `LIQ_SHORT_WINDOW_SEC`
+(90s por defecto), hay al menos `LIQ_MIN_EVENTS` (3) liquidaciones
+distintas sumando `LIQ_MULTIPLIER` (3×) la actividad normal de ESE
+símbolo en los últimos `LIQ_BASELINE_MIN` (30 min), con un piso de
+`LIQ_MIN_USD` (5.000$) para que un símbolo casi sin actividad no dé un
+falso "3×" sobre una base casi nula. Ese umbral de velocidad+volumen es
+el mismo que usó el único backtest de esto con walk-forward que
+sobrevivió (PF>2.5 en SOL/ETH; BTC descartado por libro demasiado
+profundo para que el sobreimpulso sea operable).
+
+**Qué NO hace:** no decide si se abre una operación. `strategy.evaluate()`
+sigue siendo el único criterio de entrada, exactamente igual que antes.
+La cascada solo añade una línea 🔥 a la señal cuando la dirección
+coincide — largos liquidados (venta forzada) confirma una señal BUY
+(fade de bajada); cortos liquidados (compra forzada) confirma una señal
+SELL (fade de subida). Se puede desactivar con `LIQUIDATIONS_ENABLED=false`
+sin que cambie nada más del bot.
+
+Requiere `websockets` (ya en `requirements.txt`) y salida de red hacia
+`fstream.binance.com` y `stream.bybit.com` — en Railway funciona sin
+configuración aparte. El estado de conexión de ambos streams
+(`Binance ✓ · Bybit ✓`) sale en el resumen diario, por la misma razón
+que el latido de Telegram: si un stream se cae, hay que enterarse por
+el aviso, no descubrirlo semanas después.
+
+---
+
 ## Sección cruzada (opera todos los días)
 
 Segundo sistema, independiente del anterior y con una diferencia clave:
@@ -119,35 +181,6 @@ diario en vez de reversión — el efecto contrario. O sea que el edge vive
 donde más caro es operar. Por eso `XSECTION_MIN_VOL` es más bajo que el
 filtro de la otra estrategia: si se filtra igual, se corta justo donde
 el efecto es más fuerte. El coste dirá si compensa.
-
----
-
-## Si no entra nunca: mira el embudo
-
-El resumen diario incluye cuántos símbolos caen en cada filtro:
-
-```
-Universo: 536
-→ liquidez ≥2.0M: 325
-→ ATR ≥7.5%: 7
-→ no vertical (ER ≤0.35): 5
-→ estirado ≥2.5 ATR: 0
-```
-
-**Ojo a una interacción fácil de no ver:** el umbral de ATR que se
-aplica de verdad NO es `MIN_ATR_PCT`, sino el mayor de los dos —
-`MIN_COST_COVER` × `COST_ROUNDTRIP_PCT`. Con 30× y 0.25% de coste
-estás pidiendo **7.5% de ATR**, no 4%.
-
-Y ese umbral se solapa con el de eficiencia: un ATR del 7.5% en velas
-de 5m lo tienen casi solo las monedas en pump, pero `MAX_ER_LONG`
-descarta precisamente los movimientos verticales. La intersección
-existe —JIMOTHY y CATE lo eran— pero es estrecha por construcción.
-
-Si quieres más entradas, la palanca honesta es **bajar
-`MIN_COST_COVER` a 20** (ATR efectivo 5%) sabiendo que el coste pesará
-más, o **subir el timeframe**, que mejora la cobertura sin tocar el
-listón.
 
 ---
 
@@ -226,27 +259,6 @@ Recomendado para el primer LIVE: `RISK_PCT=0.25`, `MAX_CONCURRENT=1`,
 
 ---
 
-## Ciclo de vida de una orden limitada
-
-Con `ENTRY_TYPE=LIMIT` la orden **puede no ejecutarse**, y eso está
-contemplado:
-
-1. Se envía y queda como **pendiente** — no como posición.
-2. Cada ciclo se comprueba contra el exchange. Si hay posición abierta,
-   pasa a posición y te avisa.
-3. Si a los `LIMIT_TTL_MIN` minutos no ha entrado, **se cancela**.
-
-Una orden colgada no es "una entrada que aún puede salir bien": es una
-entrada calculada para un contexto que ya no existe, esperando a
-ejecutarse en otro. Esta estrategia entra en agotamientos que duran
-minutos; una orden de hace dos horas no tiene nada que ver con la señal
-que la creó.
-
-Las pendientes ocupan hueco en `MAX_CONCURRENT` mientras viven, y si un
-despliegue deja alguna sin resolver, el bot avisa al arrancar.
-
----
-
 ## Lo que el bot no hace, a propósito
 
 - No promedia a la baja.
@@ -276,6 +288,9 @@ los del Strategy Tester, no iguales.
 |---------|----------|
 | `main.py` | Bucle de escaneo, señales y ejecución |
 | `strategy.py` | Motor — traducción literal del Pine |
+| `scanner.py` | Escaneo del universo completo, ranking y favoritas |
+| `liquidations.py` | Cascadas de liquidación (Binance + Bybit, gratis) — confirmación, no criterio de entrada |
+| `xsection.py` | Sección cruzada (retorno de 24h) |
 | `bingx.py` | Cliente de la API (velas, saldo, órdenes) |
 | `notify.py` | Telegram y estado en disco |
 | `config.py` | Variables de entorno |
@@ -287,16 +302,6 @@ sorpresa.
 ---
 
 ## Avisos de Telegram
-
-`RANK_MODE` decide cuánto te habla el bot:
-
-- **`top_siempre`** (por defecto): cada `RANK_INTERVAL_MIN` te manda las
-  mejores situadas del mercado, pasen o no el listón, con una marca de
-  en qué estado está cada una. Cada mensaje es distinto —cambian los
-  símbolos y las cifras—, así que sigues mirándolos.
-- **`solo_candidatos`**: solo habla cuando alguno cumple TODOS los
-  filtros. Silencio casi absoluto, y el día que suena es importante.
-
 
 Comprueba las credenciales **antes** de desplegar:
 
@@ -313,18 +318,13 @@ Qué te va a llegar:
 |-------|--------|
 | 🤖 Arranque | Al iniciar, con el modo y los filtros activos |
 | 📡 Ranking | Cada `RANK_INTERVAL_MIN`, con el top por amplitud |
-| 👀 Vigilancia | Un símbolo pasa todos los filtros y se acerca al umbral, pero aún no ha girado |
-| 🔔 Señal | Cuando un símbolo cumple las condiciones |
+| 🏆 Favoritas | Justo después del ranking, solo lo que está LISTO ahora (o lo más cerca) |
+| 🔔 Señal | Cuando un símbolo cumple las condiciones (con 🔥 si hay cascada confirmando) |
 | 🟢 Ejecutado | Solo en LIVE, al abrir posición |
 | ⏱️ Cierre por tiempo | Si la vuelta no llega en `MAX_TRADE_BARS` |
 | ⏸️ Circuit breaker | Tras `MAX_CONSECUTIVE_LOSSES` pérdidas seguidas |
 | 📊 Resumen diario | A la hora que fijes en `DAILY_SUMMARY_HOUR_UTC` |
 | 💓 Latido | Cada `HEARTBEAT_HOURS` |
-
-El aviso de **vigilancia** llega ANTES de que exista la señal: mientras
-el precio se estira, no cuando ya se ha girado. Es el que da tiempo a
-abrir el gráfico y pasarle el script. Con un enfriamiento por símbolo
-para que uno que ronde el umbral no avise cada minuto.
 
 El resumen diario y el latido existen por una razón concreta: **el
 silencio no distingue entre "no hay nada que operar" y "el bot está
@@ -337,12 +337,14 @@ caído"**. Si un día no llega el latido, es lo segundo.
 ```
 main.py                    Bucle: escaneo, señales, salidas por tiempo, avisos
 strategy.py                Motor — traducción literal de reversion_5m.pine
-scanner.py                 Escaneo del universo completo y ranking
+scanner.py                 Escaneo del universo completo, ranking y favoritas
+liquidations.py            Cascadas de liquidación (Binance + Bybit, gratis)
+xsection.py                Sección cruzada (retorno de 24h)
 bingx.py                   Cliente de la API
 notify.py                  Telegram y estado en disco
 config.py                  Variables de entorno
 test_telegram.py           Comprobación previa de credenciales
-requirements.txt           httpx
+requirements.txt           httpx, websockets
 Procfile / railway.json    Arranque en Railway
 .env.example               Todas las variables documentadas
 railway_vars_SIGNAL.txt    Pegar en el raw editor de Railway

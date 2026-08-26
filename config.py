@@ -56,6 +56,11 @@ TELEGRAM_CHAT_ID = (
 
 # ── Universo y escaneo ────────────────────────────────────────────────
 TIMEFRAME = os.getenv("TIMEFRAME", "5m").strip()
+
+
+def _tf_min_early() -> int:
+    return {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(TIMEFRAME, 5)
+
 SCAN_INTERVAL_SEC = _int("SCAN_INTERVAL_SEC", 60)
 MAX_SYMBOLS = _int("MAX_SYMBOLS", 200)
 SYMBOL_WHITELIST = [s.strip().upper() for s in os.getenv("SYMBOL_WHITELIST", "").split(",") if s.strip()]
@@ -76,10 +81,6 @@ MIN_ATR_PCT = _float("MIN_ATR_PCT", 4.0)
 COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
 MIN_COST_COVER = _float("MIN_COST_COVER", 30.0)
 
-def _tf_min() -> int:
-    return {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(TIMEFRAME, 5)
-
-
 # ── Escáner de universo completo ──────────────────────────────────────
 # SCAN_ALL=true recorre TODOS los perpetuos y publica un ranking por
 # Telegram cada RANK_INTERVAL_MIN. Sustituye al radar manual de
@@ -91,23 +92,14 @@ RANK_TOP_N = _int("RANK_TOP_N", 12)
 # minutos diciendo "no hay nada" son 96 al día: dejas de mirarlos, y el
 # día que llegue una señal de verdad la vas a pasar por alto igual que
 # las otras 95. El "no hay nada" ya lo cubren el latido y el resumen.
-# "solo_candidatos": avisa únicamente cuando alguno pasa TODOS los filtros.
-# "top_siempre":     manda el top por amplitud aunque ninguno sea operable,
-#                    marcando cuál pasa y cuál no. Cada mensaje es distinto
-#                    (símbolos y cifras cambian), así que no cae en la
-#                    fatiga de alertas del mensaje idéntico repetido.
-RANK_MODE = os.getenv("RANK_MODE", "top_siempre").strip().lower()
-RANK_ONLY_WHEN_CANDIDATES = RANK_MODE == "solo_candidatos"
+RANK_ONLY_WHEN_CANDIDATES = _bool("RANK_ONLY_WHEN_CANDIDATES", True)
 # Mil símbolos son mil llamadas: el semáforo evita que BingX responda 429.
 SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
 RANGE_LEN = _int("RANGE_LEN", 20)
-# Igual con el ratio de eficiencia: 30 velas son 2h30 en 5m y 15 HORAS
-# en 30m. Si no se ajusta, el "carácter de fondo" pasa a medir cuatro
-# días y deja de describir lo que está pasando.
 ER_SHORT_MINUTES = _int("ER_SHORT_MINUTES", 150)
 ER_LONG_MINUTES = _int("ER_LONG_MINUTES", 900)
-ER_SHORT = _int("ER_SHORT", 0) or max(10, round(ER_SHORT_MINUTES / _tf_min()))
-ER_LONG = _int("ER_LONG", 0) or max(30, round(ER_LONG_MINUTES / _tf_min()))
+ER_SHORT = _int("ER_SHORT", 0) or max(10, round(ER_SHORT_MINUTES / _tf_min_early()))
+ER_LONG = _int("ER_LONG", 0) or max(30, round(ER_LONG_MINUTES / _tf_min_early()))
 ER_TREND = _float("ER_TREND", 0.40)
 
 # ── Liquidez ──────────────────────────────────────────────────────────
@@ -131,13 +123,6 @@ MAX_ER_LONG = _float("MAX_ER_LONG", 0.35)
 # que es mejor que pagar con precio.
 ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
 LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
-# Minutos que se le dan a una orden limitada para ejecutarse. Pasado ese
-# plazo se cancela. Una orden colgada no es "una entrada que aún puede
-# salir bien": es una entrada calculada para un contexto que ya no
-# existe, esperando a ejecutarse en otro. Esta estrategia entra en
-# agotamientos que duran minutos; una orden de hace dos horas no tiene
-# nada que ver con la señal que la creó.
-LIMIT_TTL_MIN = _int("LIMIT_TTL_MIN", 10)
 
 # ── Estrategia (idéntica a reversion_5m.pine) ─────────────────────────
 MA_LEN = _int("MA_LEN", 20)
@@ -155,12 +140,14 @@ RR_FIXED = _float("RR_FIXED", 1.5)
 # tras retornos anormales. Si la vuelta no llega pronto, ya no estás en
 # el fenómeno que querías operar — estás en el que va en tu contra.
 # 12 velas de 5m = 60 minutos. Mismo valor que reversion_5m.pine.
-# ── Parámetros expresados en TIEMPO, no en barras ─────────────────────
-# Al cambiar de timeframe, un parámetro en BARRAS cambia de significado
-# sin avisar: 12 velas son 1 hora en 5m pero SEIS horas en 30m. Y la
-# reversión intradía vive en la ventana de minutos a una hora — a seis
-# horas ya se está operando otro fenómeno. Por eso el reloj se define en
-# minutos y las barras se calculan solas.
+# Un parámetro en BARRAS cambia de significado al cambiar de timeframe:
+# 12 velas son 1 hora en 5m pero SEIS en 30m, y la reversión intradía
+# vive en la ventana de minutos a una hora. Se define en minutos y las
+# barras se calculan solas.
+def _tf_min() -> int:
+    return {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(TIMEFRAME, 5)
+
+
 MAX_TRADE_MINUTES = _int("MAX_TRADE_MINUTES", 60)
 MAX_TRADE_BARS = _int("MAX_TRADE_BARS", 0) or max(2, round(MAX_TRADE_MINUTES / _tf_min()))
 USE_TIME_EXIT = _bool("USE_TIME_EXIT", True)
@@ -200,17 +187,6 @@ XSECTION_N = _int("XSECTION_N", 5)
 # el efecto es más fuerte. El coste dirá si compensa.
 XSECTION_MIN_VOL = _float("XSECTION_MIN_VOL", 500_000.0)
 
-# ── Avisos de vigilancia ──────────────────────────────────────────────
-# Aviso ANTES de que dispare: cuando un símbolo pasa todos los filtros y
-# está cerca del umbral de estiramiento, pero aún le falta la vela de
-# agotamiento. Da tiempo a abrir el gráfico y pasarlo por el script
-# antes de que la señal exista — que es justo lo que no pasó con AIINU,
-# donde el aviso llegó cuando el precio ya había vuelto a su media.
-WATCH_ALERTS = _bool("WATCH_ALERTS", True)
-WATCH_STRETCH_PCT = _float("WATCH_STRETCH_PCT", 75.0)
-# Sin esto, un símbolo que ronda el umbral avisaría cada minuto.
-WATCH_COOLDOWN_MIN = _int("WATCH_COOLDOWN_MIN", 45)
-
 # ── Avisos ────────────────────────────────────────────────────────────
 DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
 DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
@@ -222,6 +198,27 @@ IDLE_ALERT_DAYS = _int("IDLE_ALERT_DAYS", 5)
 # ── Estado ────────────────────────────────────────────────────────────
 STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+
+# ── Cascadas de liquidación (confirmación, no sustituto) ───────────────
+# Gratis: streams públicos de Binance y Bybit — BingX no publica esto,
+# y Coinglass ya no tiene tier gratuito (29$/mes mínimo). Esto SOLO
+# añade una línea de confirmación a la señal que strategy.evaluate() ya
+# decidió disparar; no cambia el criterio de entrada.
+LIQUIDATIONS_ENABLED = _bool("LIQUIDATIONS_ENABLED", True)
+# Minutos de historial usados para calcular la actividad "normal" de
+# cada símbolo — sin esto no hay con qué comparar si la ventana corta
+# está o no muy por encima de lo normal.
+LIQ_BASELINE_MIN = _int("LIQ_BASELINE_MIN", 30)
+# Ventana en la que se mide si hay cascada AHORA MISMO.
+LIQ_SHORT_WINDOW_SEC = _int("LIQ_SHORT_WINDOW_SEC", 90)
+# Una liquidación suelta no es cascada — puede ser ruido de una cuenta.
+LIQ_MIN_EVENTS = _int("LIQ_MIN_EVENTS", 3)
+# Mismo umbral (3×) que usó el único backtest de esto que sobrevivió
+# walk-forward con velocidad+volumen como filtro (SOL/ETH PF>2.5).
+LIQ_MULTIPLIER = _float("LIQ_MULTIPLIER", 3.0)
+# Piso absoluto en USD: sin esto, un símbolo casi sin actividad de
+# liquidaciones da falsos "3×" sobre una base casi nula.
+LIQ_MIN_USD = _float("LIQ_MIN_USD", 5_000.0)
 
 
 def is_live() -> bool:

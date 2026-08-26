@@ -157,56 +157,6 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
     )
 
 
-def watch_status(candles: list[dict]) -> tuple[bool, float, float, str] | None:
-    """
-    ¿Está este símbolo A PUNTO de dar señal?
-
-    Aplica los MISMOS filtros previos que evaluate() — amplitud,
-    eficiencia — y devuelve el estiramiento actual. La diferencia es que
-    no exige la vela de agotamiento: avisa mientras el precio se estira,
-    no cuando ya se ha girado.
-
-    Devuelve (está_cerca, estiramiento, atr_pct, dirección probable).
-    """
-    need = max(config.MA_LEN, config.ATR_LEN) + config.MAX_BARS_STRETCH + 5
-    if len(candles) < need:
-        return None
-
-    c = candles[:-1]
-    closes = [x["close"] for x in c]
-    highs = [x["high"] for x in c]
-    lows = [x["low"] for x in c]
-
-    ma_series = ema(closes, config.MA_LEN)
-    atr_series = atr(highs, lows, closes, config.ATR_LEN)
-    if not ma_series or not atr_series:
-        return None
-
-    close = closes[-1]
-    a = atr_series[-1]
-    if a <= 0 or close <= 0:
-        return None
-
-    atr_pct = a / close * 100.0
-    cover = atr_pct / config.COST_ROUNDTRIP_PCT if config.COST_ROUNDTRIP_PCT > 0 else 0.0
-    if atr_pct < config.MIN_ATR_PCT or cover < config.MIN_COST_COVER:
-        return None
-
-    er_len = min(180, len(closes) - 1)
-    if er_len > 20:
-        neto = abs(closes[-1] - closes[-1 - er_len])
-        total = sum(abs(closes[i] - closes[i - 1]) for i in range(len(closes) - er_len, len(closes)))
-        er_long = neto / total if total > 0 else 0.0
-        if er_long > config.MAX_ER_LONG:
-            return None
-
-    stretch = (close - ma_series[-1]) / a
-    umbral = config.STRETCH_ATR * config.WATCH_STRETCH_PCT / 100.0
-    cerca = abs(stretch) >= umbral
-    lado = "CORTO" if stretch > 0 else "LARGO"
-    return cerca, stretch, atr_pct, lado
-
-
 def position_size(equity: float, entry: float, sl: float) -> float:
     """Tamaño para arriesgar RISK_PCT del capital si salta el stop."""
     risk_per_unit = abs(entry - sl)
