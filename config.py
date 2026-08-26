@@ -131,6 +131,11 @@ STRETCH_ATR = _float("STRETCH_ATR", 2.5)
 MAX_BARS_STRETCH = _int("MAX_BARS_STRETCH", 6)
 SL_ATR = _float("SL_ATR", 1.0)
 MIN_RR = _float("MIN_RR", 1.0)
+# Tope de riesgo en % del precio. El stop lo pone la zona, y a veces
+# queda lejísimos: ONG-USDT dio un stop al 16% del precio en velas de
+# 5 minutos. Con un stop así el objetivo (la media) está a horas de
+# distancia, y una sola operación puede atarte la cuenta medio día.
+MAX_RISK_PCT = _float("MAX_RISK_PCT", 6.0)
 TP_MODE = os.getenv("TP_MODE", "MEAN").strip().upper()  # MEAN | FIXED_R
 RR_FIXED = _float("RR_FIXED", 1.5)
 
@@ -188,6 +193,11 @@ XSECTION_N = _int("XSECTION_N", 5)
 XSECTION_MIN_VOL = _float("XSECTION_MIN_VOL", 500_000.0)
 
 # ── Avisos ────────────────────────────────────────────────────────────
+# Enfriamiento por símbolo para los AVISOS. Sin esto, una señal que no
+# se puede ejecutar se vuelve a detectar en cada ciclo y manda el mismo
+# mensaje cada minuto: quince avisos idénticos de ONG en un rato.
+SIGNAL_COOLDOWN_MIN = _int("SIGNAL_COOLDOWN_MIN", 60)
+
 DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
 DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
 HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)

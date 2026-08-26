@@ -476,6 +476,24 @@ class Bot:
             con_amplitud,
         )
 
+    def aviso_en_frio(self, symbol: str, clave: str) -> bool:
+        """
+        ¿Toca avisar de esto, o ya se avisó hace poco?
+
+        Una señal que no se puede ejecutar se vuelve a detectar en cada
+        ciclo, así que sin enfriamiento manda el mismo mensaje cada
+        minuto. Quince avisos idénticos no informan quince veces:
+        informan una y luego enseñan a ignorarlos.
+        """
+        avisos = self.state.data.setdefault("avisos", {})
+        k = f"{symbol}:{clave}"
+        previo = float(avisos.get(k, 0) or 0)
+        if time.time() - previo < config.SIGNAL_COOLDOWN_MIN * 60:
+            return False
+        avisos[k] = time.time()
+        self.state.save()
+        return True
+
     async def handle_signal(self, sig: strategy.Signal) -> None:
         log.info(
             "SEÑAL %s %s entrada=%.8g sl=%.8g tp=%.8g rr=%.2f atr=%.2f%%",
@@ -498,11 +516,19 @@ class Bot:
             qty = self.api.round_qty(sig.symbol, qty)
             minimo = self.api.min_qty(sig.symbol)
             if qty <= 0 or (minimo > 0 and qty < minimo):
-                await self.tg.send(
-                    f"⚠️ Señal en {sig.symbol} sin ejecutar: tamaño {qty} "
-                    f"por debajo del mínimo del contrato ({minimo}).\n"
-                    f"Con {config.RISK_PCT}% de riesgo y este stop no da para el lote mínimo."
-                )
+                if self.aviso_en_frio(sig.symbol, "lote_minimo"):
+                    riesgo_pct = abs(sig.entry - sig.sl) / sig.entry * 100.0
+                    riesgo_min = minimo * abs(sig.entry - sig.sl)
+                    pct_necesario = (riesgo_min / equity * 100.0) if equity > 0 else 0.0
+                    await self.tg.send(
+                        f"⚠️ <b>{sig.symbol}</b> sin ejecutar: tamaño {qty} "
+                        f"por debajo del lote mínimo ({minimo}).\n"
+                        f"Stop al {riesgo_pct:.1f}% · saldo {equity:.2f} USDT.\n"
+                        f"Para entrar en este símbolo harían falta "
+                        f"<b>{pct_necesario:.2f}%</b> de riesgo por operación "
+                        f"(ahora {config.RISK_PCT}%).\n"
+                        f"<i>Siguiente aviso de este símbolo en {config.SIGNAL_COOLDOWN_MIN} min.</i>"
+                    )
                 return
 
             # Segunda comprobación, contra el EXCHANGE y no contra el
