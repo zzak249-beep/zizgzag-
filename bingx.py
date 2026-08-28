@@ -30,6 +30,23 @@ class BingXError(RuntimeError):
     pass
 
 
+def _fmt(value: float, precision: int) -> str:
+    """
+    Formatea con decimales FIJOS, nunca notación científica.
+
+    BUG QUE ESTO EVITA: al pasar un float crudo en los parámetros de la
+    petición, tanto el %-format de Python como httpx lo convierten con
+    str(), que para valores pequeños usa notación científica —
+    str(0.0000012) -> '1.2e-06'. BingX no acepta ese formato en precio
+    ni en cantidad, y es justo lo que le pasa a las monedas micro-cap
+    de precio muy bajo, que son buena parte del universo que escanea
+    este bot. El error llega silencioso: la API rechaza la orden con
+    un código, no con un traceback, así que sin vigilar los logs de
+    "BingX rechazó la orden" pasa desapercibido.
+    """
+    return f"{value:.{max(precision, 0)}f}"
+
+
 class BingX:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._c = client
@@ -102,6 +119,14 @@ class BingX:
     def min_qty(self, symbol: str) -> float:
         return float(self._precision.get(symbol, {}).get("min_qty", 0.0))
 
+    def fmt_qty(self, symbol: str, qty: float) -> str:
+        p = self._precision.get(symbol, {})
+        return _fmt(qty, int(p.get("qty", 4)))
+
+    def fmt_price(self, symbol: str, price: float) -> str:
+        p = self._precision.get(symbol, {})
+        return _fmt(price, int(p.get("price", 6)))
+
     async def tickers_24h(self) -> dict[str, float]:
         """Volumen de 24h en USDT por símbolo, en UNA llamada."""
         data = await self._public("/openApi/swap/v2/quote/ticker")
@@ -165,8 +190,7 @@ class BingX:
         )
 
     async def market_order(
-        self, symbol: str, side: str, quantity: float, sl: float, tp: float,
-        client_id: str | None = None
+        self, symbol: str, side: str, quantity: float, sl: float, tp: float
     ) -> dict:
         """
         side: 'BUY' (largo) o 'SELL' (corto).
@@ -180,22 +204,20 @@ class BingX:
             "side": side,
             "positionSide": position_side,
             "type": "MARKET",
-            "quantity": quantity,
-            # Identificador propio: permite comprobar DESPUÉS si la orden
-            # existe cuando la respuesta se pierde por el camino.
-            "clientOrderID": client_id or f"rev{int(time.time()*1000)}",
+            "quantity": self.fmt_qty(symbol, quantity),
             "stopLoss": (
-                '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % sl
+                '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}'
+                % self.fmt_price(symbol, sl)
             ),
             "takeProfit": (
-                '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % tp
+                '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}'
+                % self.fmt_price(symbol, tp)
             ),
         }
         return await self._private("POST", "/openApi/swap/v2/trade/order", params)
 
     async def limit_order(
-        self, symbol: str, side: str, quantity: float, price: float, sl: float, tp: float,
-        client_id: str | None = None
+        self, symbol: str, side: str, quantity: float, price: float, sl: float, tp: float
     ) -> dict:
         """
         Entrada con precio límite. Puede no ejecutarse, y eso es
@@ -211,12 +233,13 @@ class BingX:
                 "side": side,
                 "positionSide": position_side,
                 "type": "LIMIT",
-                "price": price,
-                "quantity": quantity,
+                "price": self.fmt_price(symbol, price),
+                "quantity": self.fmt_qty(symbol, quantity),
                 "timeInForce": "GTC",
-                "clientOrderID": client_id or f"rev{int(time.time()*1000)}",
-                "stopLoss": '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % sl,
-                "takeProfit": '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % tp,
+                "stopLoss": '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}'
+                % self.fmt_price(symbol, sl),
+                "takeProfit": '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}'
+                % self.fmt_price(symbol, tp),
             },
         )
 
@@ -240,37 +263,9 @@ class BingX:
                 "side": exit_side,
                 "positionSide": position_side,
                 "type": "MARKET",
-                "quantity": quantity,
+                "quantity": self.fmt_qty(symbol, quantity),
             },
         )
-
-    async def open_orders(self, symbol: str) -> list[dict]:
-        data = await self._private("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
-        if isinstance(data, dict):
-            data = data.get("orders", [])
-        return data if isinstance(data, list) else []
-
-    async def order_exists(self, symbol: str, client_id: str) -> bool:
-        """
-        ¿Existe esta orden en el exchange?
-
-        Se llama cuando el envío falló por red: la petición pudo llegar
-        igualmente y la respuesta perderse. Sin esta comprobación, el
-        bot da por fallida una orden que SÍ existe — y luego abre otra.
-        """
-        try:
-            for o in await self.open_orders(symbol):
-                if str(o.get("clientOrderID") or o.get("clientOrderId") or "") == client_id:
-                    return True
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            for p in await self.open_positions():
-                if str(p.get("symbol")) == symbol and float(p.get("positionAmt", 0) or 0) != 0:
-                    return True
-        except Exception:  # noqa: BLE001
-            pass
-        return False
 
     async def open_positions(self) -> list[dict]:
         data = await self._private("GET", "/openApi/swap/v2/user/positions")
