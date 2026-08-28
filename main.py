@@ -514,6 +514,16 @@ class Bot:
         sin_dato = [s for s in self.symbols if s not in cover]
         return con_dato + sin_dato
 
+    async def _evaluar_symbol(self, sem: asyncio.Semaphore, sym: str) -> tuple[str, "strategy.Signal | None", str, list[dict]]:
+        async with sem:
+            try:
+                velas = await self.api.klines(sym, config.TIMEFRAME, limit=300)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("%s: sin velas (%s)", sym, exc)
+                return sym, None, "sin velas", []
+            sig, motivo = strategy.evaluate(sym, velas)
+            return sym, sig, motivo, velas
+
     async def scan_once(self) -> None:
         if self.in_cooldown():
             restante = int(float(self.state.data["cooldown_until"]) - time.time()) // 60
@@ -525,17 +535,24 @@ class Bot:
             log.info("Límite de posiciones alcanzado (%d)", abiertas)
             return
 
-        con_amplitud = 0
-        for sym in self._priority_order():
-            try:
-                velas = await self.api.klines(sym, config.TIMEFRAME, limit=300)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("%s: sin velas (%s)", sym, exc)
-                continue
+        # Evaluación CONCURRENTE del universo (mismo SCAN_CONCURRENCY que
+        # el escáner de ranking) en vez de un fetch secuencial símbolo a
+        # símbolo. Con el orden por prioridad ya calculado, gather()
+        # conserva el orden de la lista de entrada — no hace falta
+        # reordenar después. El resultado es el mismo que antes, solo
+        # que en 1/SCAN_CONCURRENCY del tiempo cuando no hay señal (el
+        # caso normal), que es justo cuando el ciclo entero se recorría
+        # sin cortar por MAX_CONCURRENT.
+        sem = asyncio.Semaphore(config.SCAN_CONCURRENCY)
+        orden = self._priority_order()
+        resultados = await asyncio.gather(*(self._evaluar_symbol(sem, s) for s in orden))
 
-            sig, motivo = strategy.evaluate(sym, velas)
-            if not motivo.startswith("sin amplitud"):
-                con_amplitud += 1
+        con_amplitud = sum(
+            1 for _, _, motivo, _ in resultados
+            if motivo and not motivo.startswith("sin amplitud") and motivo != "sin velas"
+        )
+
+        for sym, sig, motivo, velas in resultados:
             if sig is None:
                 log.debug("%s: %s", sym, motivo)
                 continue

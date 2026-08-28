@@ -74,7 +74,15 @@ MIN_ATR_PCT = _float("MIN_ATR_PCT", 4.0)
 # entra — tras un movimiento violento. El 0.14% de antes era la comisión
 # sola, que es la parte que no duele.
 COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
-MIN_COST_COVER = _float("MIN_COST_COVER", 30.0)
+# RECALIBRADO: cover = atr_pct / COST_ROUNDTRIP_PCT, así que este número
+# fija un ATR mínimo REAL = MIN_COST_COVER × COST_ROUNDTRIP_PCT. Con 30×
+# y coste 0.25%, ese mínimo era 7.5% — muy por encima del rango 5-6%
+# que el propio backtest señaló como el que sí funciona (esa cifra de
+# 30-40x salió cuando el coste medido era 0.14%, no 0.25%; al subir el
+# coste sin bajar el cover, el umbral efectivo se disparó sin querer y
+# dejó de haber candidatos). 18× con 0.25% da un mínimo de 4.5%,
+# coherente con lo medido.
+MIN_COST_COVER = _float("MIN_COST_COVER", 18.0)
 
 # ── Escáner de universo completo ──────────────────────────────────────
 # SCAN_ALL=true recorre TODOS los perpetuos y publica un ranking por
