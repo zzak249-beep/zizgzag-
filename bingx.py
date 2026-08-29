@@ -270,3 +270,57 @@ class BingX:
     async def open_positions(self) -> list[dict]:
         data = await self._private("GET", "/openApi/swap/v2/user/positions")
         return data if isinstance(data, list) else []
+
+    async def open_interest(self, symbol: str) -> float | None:
+        """
+        Foto ACTUAL del Open Interest — BingX no da serie histórica en
+        este endpoint (confirmado contra su esquema real: solo devuelve
+        openInterest/symbol/time). Para saber si SUBÍA o BAJABA durante
+        el estirón hay que muestrear esto nosotros mismos y guardar nuestro
+        propio historial corto — eso es lo que hace OpenInterestTracker
+        en oi_confirm.py, exactamente igual que liquidations.py construye
+        su propia ventana a partir de streams que tampoco dan histórico.
+        """
+        try:
+            data = await self._public("/openApi/swap/v2/quote/openInterest", {"symbol": symbol})
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            valor = data.get("openInterest") if isinstance(data, dict) else None
+            return float(valor) if valor is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    async def spread_pct(self, symbol: str) -> float | None:
+        """
+        Spread bid-ask actual, en % del precio medio. None si no se pudo
+        leer el libro — no bloquea la entrada por un fallo de red, solo
+        cuando SÍ hay dato y el spread es ancho de verdad.
+
+        POR QUÉ HACE FALTA: el volumen de 24h (MIN_QUOTE_VOLUME_24H) es
+        una foto de todo el día, no del libro AHORA MISMO. Un símbolo con
+        volumen suficiente puede tener el libro vacío en el instante de
+        la señal — típico justo después del estirón que dispara esta
+        estrategia, cuando el flujo forzado ya se llevó la liquidez
+        cercana. Sin este chequeo, una entrada a mercado en ese momento
+        paga el spread completo, no el que viste en el ranking.
+        """
+        try:
+            data = await self._public(
+                "/openApi/swap/v2/quote/depth", {"symbol": symbol, "limit": 5}
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            bids = data.get("bids") if isinstance(data, dict) else None
+            asks = data.get("asks") if isinstance(data, dict) else None
+            if not bids or not asks:
+                return None
+            mejor_bid = float(bids[0][0])
+            mejor_ask = float(asks[0][0])
+            if mejor_bid <= 0 or mejor_ask <= 0:
+                return None
+            medio = (mejor_bid + mejor_ask) / 2.0
+            return (mejor_ask - mejor_bid) / medio * 100.0
+        except (TypeError, ValueError, IndexError, KeyError):
+            return None

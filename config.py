@@ -108,6 +108,13 @@ ER_TREND = _float("ER_TREND", 0.40)
 # monedas donde el libro es un colador. Volumen de 24h en USDT.
 MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 2_000_000.0)
 
+# Spread bid-ask máximo tolerado EN VIVO, medido justo antes de abrir.
+# El volumen de 24h no dice nada del libro en el instante de la señal —
+# esto sí. Si el spread supera esto, se descarta la entrada aunque todo
+# lo demás esté en orden: es la parte del coste real que ni
+# COST_ROUNDTRIP_PCT ni el volumen de 24h pueden anticipar.
+MAX_SPREAD_PCT = _float("MAX_SPREAD_PCT", 0.15)
+
 # ── Filtro de eficiencia: descarta los verticales ─────────────────────
 # El hallazgo que faltaba por implementar. Medido: la reversión gana en
 # pumps que van y VUELVEN (JIMOTHY +0.22R, CATE PF 1.6) y pierde en los
@@ -234,6 +241,18 @@ RSI_REQUIRE = _bool("RSI_REQUIRE", True)
 RADAR30M_ENABLED = _bool("RADAR30M_ENABLED", True)
 RADAR30M_TIMEFRAME = os.getenv("RADAR30M_TIMEFRAME", "30m").strip()
 RADAR30M_INTERVAL_MIN = _int("RADAR30M_INTERVAL_MIN", 30)
+
+# ── Confirmación por Open Interest (asimétrica, ver oi_confirm.py) ────
+# Igual que las cascadas de liquidación: SOLO añade información al
+# score y a la notificación. No bloquea ninguna señal — el hallazgo
+# concreto en el que se basa la asimetría no está verificado de forma
+# independiente (viene de la página de venta de un indicador de pago,
+# no de un estudio auditado), así que se mide antes de dejarle bloquear
+# nada. BingX no da histórico de OI: se muestrea cada OI_SAMPLE_INTERVAL_MIN
+# y se compara la punta contra el principio de la ventana de OI_LOOKBACK_MIN.
+OI_CONFIRM_ENABLED = _bool("OI_CONFIRM_ENABLED", True)
+OI_SAMPLE_INTERVAL_MIN = _int("OI_SAMPLE_INTERVAL_MIN", 15)
+OI_LOOKBACK_MIN = _int("OI_LOOKBACK_MIN", 45)
 
 # ── Puntuación de confianza de entrada (score.py) ──────────────────────
 # Combina en un solo número lo que antes se mostraba disperso (RSI,

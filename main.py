@@ -24,6 +24,7 @@ import scanner
 import xsection
 import strategy
 import liquidations
+import oi_confirm
 import rsi_confirm
 import score as scoring
 import stats
@@ -102,6 +103,8 @@ class Bot:
         self.radar30 = scanner.Scanner(self.api, timeframe=config.RADAR30M_TIMEFRAME) if config.RADAR30M_ENABLED else None
         self.bias30m: dict[str, str] = {}
         self.last_radar30 = 0.0
+        self.oi = oi_confirm.OpenInterestTracker() if config.OI_CONFIRM_ENABLED else None
+        self.last_oi_sample = 0.0
 
     async def start(self) -> None:
         log.info("Modo: %s", config.describe())
@@ -128,6 +131,7 @@ class Bot:
                 await self.check_time_exits()
                 await self.maybe_radar30m()
                 await self.maybe_rank()
+                await self.maybe_sample_oi()
                 await self.scan_once()
             except Exception as exc:  # noqa: BLE001
                 log.exception("Fallo en el ciclo: %s", exc)
@@ -492,6 +496,32 @@ class Bot:
         if favoritas:
             await self.tg.send(favoritas)
 
+    async def maybe_sample_oi(self) -> None:
+        """
+        Muestrea el Open Interest de todo el universo cada
+        OI_SAMPLE_INTERVAL_MIN. BingX solo da la foto actual (ver
+        bingx.open_interest), así que ESTE muestreo periódico es lo
+        único que construye el historial corto que oi_confirm.py
+        necesita para decidir si subía o bajaba. Concurrente, mismo
+        semáforo que el resto del escaneo, para no duplicar el
+        problema de latencia que ya se corrigió en scan_once().
+        """
+        if not self.oi:
+            return
+        if time.time() - self.last_oi_sample < config.OI_SAMPLE_INTERVAL_MIN * 60:
+            return
+        self.last_oi_sample = time.time()
+
+        sem = asyncio.Semaphore(config.SCAN_CONCURRENCY)
+
+        async def _uno(sym: str) -> None:
+            async with sem:
+                oi = await self.api.open_interest(sym)
+                self.oi.record(sym, oi)
+
+        await asyncio.gather(*(_uno(s) for s in self.symbols))
+        log.debug("Open Interest muestreado para %d símbolos", len(self.symbols))
+
     def in_cooldown(self) -> bool:
         return time.time() < float(self.state.data.get("cooldown_until", 0))
 
@@ -588,8 +618,9 @@ class Bot:
                     continue
 
             cascade = self.liq.cascade_status(sym) if self.liq else None
+            oi_dir = self.oi.direction(sym) if self.oi else None
 
-            score_result = scoring.compute(sig, rsi_result, cascade, bias) if config.SCORE_ENABLED else None
+            score_result = scoring.compute(sig, rsi_result, cascade, bias, oi_dir=oi_dir) if config.SCORE_ENABLED else None
             if score_result and config.SCORE_MIN > 0 and score_result.total < config.SCORE_MIN:
                 log.info(
                     "%s: score %.0f por debajo del mínimo (%.0f) — descartada",
@@ -636,6 +667,7 @@ class Bot:
                 "qty": 0,
                 "opened_at": time.time(),
                 "score": score.total if score else None,
+                "oi_confirma": bool(score and score.detalle.get("oi", 0) > 0),
             }
             self.state.save()
             return
@@ -645,6 +677,23 @@ class Bot:
             if equity <= 0:
                 await self.tg.send(f"⚠️ Señal en {sig.symbol} sin ejecutar: saldo 0")
                 return
+
+            # Spread EN VIVO, no el volumen de 24h del ranking. Un
+            # símbolo con volumen de sobra puede tener el libro vacío
+            # justo en el instante de la señal — típico tras el estirón
+            # que la propia estrategia busca, cuando el flujo forzado ya
+            # se llevó la liquidez cercana. spread_pct() devuelve None
+            # si el libro no se pudo leer: eso NO bloquea (podría ser un
+            # fallo de red pasajero), solo bloquea un spread ancho real.
+            spread = await self.api.spread_pct(sig.symbol)
+            if spread is not None and spread > config.MAX_SPREAD_PCT:
+                await self.tg.send(
+                    f"⚠️ Señal en {sig.symbol} descartada: spread {spread:.2f}% "
+                    f"por encima del máximo ({config.MAX_SPREAD_PCT}%). El libro "
+                    f"está demasiado fino ahora mismo para entrar sin pagarlo caro."
+                )
+                return
+
             qty = strategy.position_size(equity, sig.entry, sig.sl)
             qty = self.api.round_qty(sig.symbol, qty)
             minimo = self.api.min_qty(sig.symbol)
@@ -701,6 +750,7 @@ class Bot:
             "qty": qty,
             "opened_at": time.time(),
             "score": score.total if score else None,
+            "oi_confirma": bool(score and score.detalle.get("oi", 0) > 0),
         }
         self.state.save()
         await self.tg.send(fmt_signal(sig, live=True, cascade=cascade, rsi_result=rsi_result, bias30m=bias30m, score=score))
