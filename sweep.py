@@ -43,8 +43,8 @@ import strategy
 
 # Combinaciones a probar. Pocas y con sentido, no una rejilla enorme:
 # cuantas más pruebas, más fácil encontrar un ganador por azar.
-CLAVES = ("MIN_RISK_PCT", "TARGET_CROSS", "MAX_COST_IN_R")
-COMBINACIONES = [(1.5, 2, 0.20), (1.0, 2, 0.20), (1.5, 1, 0.20), (2.0, 2, 0.25), (1.0, 1, 0.30), (2.5, 2, 0.15)]
+CLAVES = ("MAX_COMPRESSION_ATR", "MIN_EXPANSION_ATR", "MIN_VOL_MULT")
+COMBINACIONES = [(3.0, 1.8, 2.0), (4.0, 1.5, 1.5), (5.0, 1.5, 1.5), (3.0, 1.5, 2.0), (4.0, 1.8, 2.5), (6.0, 1.2, 1.2)]
 
 
 def evaluar(velas_por_symbol: dict[str, list[dict]], mitad: str) -> tuple[float, int]:

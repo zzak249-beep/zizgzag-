@@ -1,32 +1,71 @@
 """
-Motor de la estrategia. Traducción literal de reversion_5m.pine.
+Motor: arranque de impulso ("la primera subida").
 
-Si algún día cambias uno, cambia el otro. Un bot que opera algo
-distinto de lo que backtesteaste no es un bot: es una sorpresa.
+QUÉ LO DIFERENCIA DE LA RUPTURA DE RANGO QUE YA FALLÓ
+La ruptura de rango simple —cerrar por encima del máximo de N velas—
+se midió con 482 operaciones y perdió en los tres símbolos: -0.32R en
+INDEXUS con 159 operaciones, -18% en CATE, -27% en JIMOTHY. El motivo
+es que en un mercado picado el precio sale del rango constantemente y
+casi todas esas salidas mueren en el primer retroceso.
 
-REGLA DE ORO DEL CÁLCULO: solo se usan velas CERRADAS. La última vela
-que devuelve el exchange está en curso y sus valores cambian hasta que
-cierra; usarla es la forma clásica de que el backtest y el bot no
-coincidan.
+Aquí se exigen CUATRO cosas a la vez, y las cuatro tienen que darse en
+la misma vela:
+
+  1. COMPRESIÓN PREVIA. Antes del arranque tiene que haber calma: el
+     rango de las últimas N velas, medido en ATR, por debajo de un
+     umbral. Un pump nace de la quietud; si el precio ya venía dando
+     bandazos, la "ruptura" es una más del montón.
+  2. EXPANSIÓN REAL. La vela que rompe debe ser mucho más ancha que el
+     ATR y cerrar en el tercio alto de su propio rango. Una vela ancha
+     que cierra por la mitad es indecisión, no arranque.
+  3. VOLUMEN. Un pump sin volumen no es un pump: es un hueco en el
+     libro. Se exige un múltiplo de la media reciente.
+  4. QUE SEA PRONTO. Este es el filtro que de verdad separa esta
+     estrategia de la anterior: si el precio ya está a más de X ATR de
+     su media, el movimiento YA ocurrió y entrar es comprar el final.
+     La ruptura de rango no miraba esto — por eso entraba tarde una y
+     otra vez en las verticales.
+
+SALIDA: trailing por ATR. Los pumps tienen colas largas — la mayoría
+no va a ninguna parte y unos pocos corren muchísimo. Un objetivo fijo
+cobraría 2R en los que iban a hacer 10R, que es donde está el dinero
+de una estrategia de continuación.
+
+ADVERTENCIA: cero operaciones medidas. El paquete incluye backtest.py;
+mídelo antes de ponerle un euro.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import config
+
+log = logging.getLogger("strategy")
 
 
 @dataclass
 class Signal:
     symbol: str
-    side: str          # "BUY" (largo) | "SELL" (corto)
+    side: str          # "BUY" — de momento solo al alza
     entry: float
     sl: float
     tp: float
-    rr: float
     atr_pct: float
+    compresion: float  # rango previo en ATR: cuanto menor, más limpia la salida
+    expansion: float   # tamaño de la vela en ATR
+    vol_mult: float
     stretch: float
-    cost_cover: float  # cuántas veces cubre el ATR el coste de ida y vuelta
+
+
+def sma(values: list[float], length: int) -> list[float]:
+    out, acc = [], 0.0
+    for i, v in enumerate(values):
+        acc += v
+        if i >= length:
+            acc -= values[i - length]
+        out.append(acc / min(i + 1, length))
+    return out
 
 
 def ema(values: list[float], length: int) -> list[float]:
@@ -40,17 +79,11 @@ def ema(values: list[float], length: int) -> list[float]:
 
 
 def atr(highs: list[float], lows: list[float], closes: list[float], length: int) -> list[float]:
-    """ATR de Wilder, igual que ta.atr de Pine."""
     if len(closes) < 2:
         return []
     trs = [highs[0] - lows[0]]
     for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
-        )
-        trs.append(tr)
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
     out = [trs[0]]
     for tr in trs[1:]:
         out.append((out[-1] * (length - 1) + tr) / length)
@@ -58,109 +91,98 @@ def atr(highs: list[float], lows: list[float], closes: list[float], length: int)
 
 
 def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
-    """
-    Devuelve (señal, motivo). El motivo explica por qué NO hay señal,
-    que en un escáner es más útil que el silencio: sin él, "no pasa
-    nada" y "está roto" se parecen demasiado.
-    """
-    need = max(config.MA_LEN, config.ATR_LEN) + config.MAX_BARS_STRETCH + 5
+    need = config.COMPRESSION_LEN + config.ATR_LEN + config.MA_LEN + 10
     if len(candles) < need:
         return None, "pocas velas"
 
-    # Se descarta la última: está en curso.
-    c = candles[:-1]
+    c = candles[:-1]  # solo velas cerradas
     closes = [x["close"] for x in c]
     highs = [x["high"] for x in c]
     lows = [x["low"] for x in c]
-    opens = [x["open"] for x in c]
+    vols = [x["volume"] for x in c]
 
-    ma_series = ema(closes, config.MA_LEN)
-    atr_series = atr(highs, lows, closes, config.ATR_LEN)
-    if not ma_series or not atr_series:
+    a = atr(highs, lows, closes, config.ATR_LEN)
+    ma = ema(closes, config.MA_LEN)
+    if not a or not ma or a[-1] <= 0 or closes[-1] <= 0:
         return None, "sin indicadores"
 
-    close = closes[-1]
-    ma = ma_series[-1]
-    a = atr_series[-1]
-    if a <= 0 or close <= 0:
-        return None, "atr cero"
-
-    atr_pct = a / close * 100.0
+    atr_pct = a[-1] / closes[-1] * 100.0
     cover = atr_pct / config.COST_ROUNDTRIP_PCT if config.COST_ROUNDTRIP_PCT > 0 else 0.0
-
-    # EL FILTRO QUE MANDA. Va primero a propósito: sin recorrido no hay
-    # negocio, por mucho que el patrón sea de libro.
     if atr_pct < config.MIN_ATR_PCT or cover < config.MIN_COST_COVER:
         return None, f"sin amplitud ({atr_pct:.2f}%, {cover:.0f}x)"
 
-    # Ratio de eficiencia de fondo: recorrido neto / suma de movimientos.
-    # Alto = línea recta = no es terreno de reversión.
-    er_len = min(180, len(closes) - 1)
-    if er_len > 20:
-        neto = abs(closes[-1] - closes[-1 - er_len])
-        total = sum(abs(closes[i] - closes[i - 1]) for i in range(len(closes) - er_len, len(closes)))
-        er_long = neto / total if total > 0 else 0.0
-        if er_long > config.MAX_ER_LONG:
-            return None, f"vertical (ER {er_long:.2f} > {config.MAX_ER_LONG})"
+    # ── 1. Compresión previa (sin contar la vela de ruptura) ──────────
+    ini = -1 - config.COMPRESSION_LEN
+    rango_prev = max(highs[ini:-1]) - min(lows[ini:-1])
+    compresion = rango_prev / a[-1] if a[-1] > 0 else 99.0
+    if compresion > config.MAX_COMPRESSION_ATR:
+        return None, f"sin compresión previa ({compresion:.1f} ATR)"
 
-    stretch = (close - ma) / a
+    # ── 2. Expansión de la vela ──────────────────────────────────────
+    rango_vela = highs[-1] - lows[-1]
+    expansion = rango_vela / a[-1] if a[-1] > 0 else 0.0
+    if expansion < config.MIN_EXPANSION_ATR:
+        return None, f"vela estrecha ({expansion:.1f} ATR)"
 
-    # El estiramiento tiene que ser RÁPIDO: hace N velas aún no lo estaba.
-    idx_prev = -1 - config.MAX_BARS_STRETCH
-    if abs(idx_prev) > len(closes) or abs(idx_prev) > len(ma_series):
-        return None, "historial corto"
-    prev_stretch = (closes[idx_prev] - ma_series[idx_prev]) / atr_series[idx_prev]
-    was_flat = abs(prev_stretch) < config.STRETCH_ATR * 0.5
+    pos_cierre = (closes[-1] - lows[-1]) / rango_vela if rango_vela > 0 else 0.5
+    if pos_cierre < config.MIN_CLOSE_POS:
+        return None, f"cierre débil en la vela ({pos_cierre:.2f})"
 
-    over_up = stretch >= config.STRETCH_ATR and was_flat
-    over_dn = stretch <= -config.STRETCH_ATR and was_flat
-    if not (over_up or over_dn):
-        return None, f"sin estirón ({stretch:+.2f} ATR)"
+    if closes[-1] <= max(highs[ini:-1]):
+        return None, "no supera el rango comprimido"
 
-    # Vela de agotamiento: la primera que empuja en contra.
-    exhaust_up = over_up and closes[-1] < opens[-1] and closes[-1] < closes[-2]
-    exhaust_dn = over_dn and closes[-1] > opens[-1] and closes[-1] > closes[-2]
-    if not (exhaust_up or exhaust_dn):
-        return None, "estirado, sin vela de agotamiento"
+    # ── 3. Volumen ───────────────────────────────────────────────────
+    vsma = sma(vols, config.VOL_LEN)
+    vol_mult = vols[-1] / vsma[-1] if vsma and vsma[-1] > 0 else 0.0
+    if vol_mult < config.MIN_VOL_MULT:
+        return None, f"sin volumen ({vol_mult:.1f}x)"
 
-    if exhaust_up:  # corto contra la subida
-        sl = max(highs[-1], highs[-2]) + a * config.SL_ATR
-        risk = sl - close
-        tp = ma if config.TP_MODE == "MEAN" else close - risk * config.RR_FIXED
-        rr = (close - tp) / risk if risk > 0 else 0.0
-        side = "SELL"
-    else:           # largo contra la caída
-        sl = min(lows[-1], lows[-2]) - a * config.SL_ATR
-        risk = close - sl
-        tp = ma if config.TP_MODE == "MEAN" else close + risk * config.RR_FIXED
-        rr = (tp - close) / risk if risk > 0 else 0.0
-        side = "BUY"
+    # ── 4. QUE SEA PRONTO ────────────────────────────────────────────
+    # El filtro que separa esto de la ruptura de rango que ya falló.
+    stretch = (closes[-1] - ma[-1]) / a[-1]
+    if stretch > config.MAX_STRETCH_AT_ENTRY:
+        return None, f"ya extendido ({stretch:.1f} ATR): el movimiento ya ocurrió"
 
-    if risk <= 0:
+    entrada = closes[-1]
+    stop = min(lows[-1], lows[-2]) - a[-1] * config.SL_ATR
+    riesgo = entrada - stop
+    if riesgo <= 0:
         return None, "riesgo no válido"
-    if rr < config.MIN_RR:
-        return None, f"R:R insuficiente ({rr:.2f})"
+
+    riesgo_pct = riesgo / entrada * 100.0
+    coste_r = config.COST_ROUNDTRIP_PCT / riesgo_pct if riesgo_pct > 0 else 99.0
+    if coste_r > config.MAX_COST_IN_R:
+        return None, f"stop demasiado cerca (coste {coste_r:.2f}R)"
+    if riesgo_pct > config.MAX_RISK_PCT:
+        return None, f"stop demasiado lejos ({riesgo_pct:.1f}%)"
 
     return (
         Signal(
-            symbol=symbol,
-            side=side,
-            entry=close,
-            sl=sl,
-            tp=tp,
-            rr=rr,
-            atr_pct=atr_pct,
-            stretch=stretch,
-            cost_cover=cover,
+            symbol=symbol, side="BUY", entry=entrada, sl=stop,
+            tp=entrada + riesgo * config.RR_TARGET,
+            atr_pct=atr_pct, compresion=compresion, expansion=expansion,
+            vol_mult=vol_mult, stretch=stretch,
         ),
         "ok",
     )
 
 
+def trailing_stop(candles: list[dict], stop_actual: float) -> float:
+    """
+    Stop que solo sube. Los pumps corren o mueren rápido: dejar correr
+    con un trailing es lo que permite que las pocas que vuelan paguen
+    las muchas que no.
+    """
+    c = candles[:-1]
+    a = atr([x["high"] for x in c], [x["low"] for x in c], [x["close"] for x in c], config.ATR_LEN)
+    if not a:
+        return stop_actual
+    candidato = max(x["high"] for x in c[-config.TRAIL_LOOKBACK:]) - a[-1] * config.TRAIL_ATR
+    return max(stop_actual, candidato)
+
+
 def position_size(equity: float, entry: float, sl: float) -> float:
-    """Tamaño para arriesgar RISK_PCT del capital si salta el stop."""
-    risk_per_unit = abs(entry - sl)
-    if risk_per_unit <= 0 or entry <= 0:
+    riesgo = abs(entry - sl)
+    if riesgo <= 0 or entry <= 0:
         return 0.0
-    risk_cash = equity * config.RISK_PCT / 100.0
-    return risk_cash / risk_per_unit
+    return (equity * config.RISK_PCT / 100.0) / riesgo

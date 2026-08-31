@@ -1,7 +1,7 @@
 """
 Backtest local sobre histórico descargado del exchange.
 
-    python backtest.py ZEC-USDT 5m 240
+    python backtest.py BTR-USDT 30m 180
     python backtest.py ZEC-USDT 15m 240 --mensual
     python backtest.py ZEC-USDT,PUMP-USDT,LDO-USDT 30m 240
 
@@ -53,6 +53,7 @@ class Trade:
     entry_ts: int
     entry: float
     sl: float
+    sl_inicial: float = 0.0
     exit_ts: int = 0
     exit: float = 0.0
     r: float = 0.0
@@ -119,22 +120,26 @@ def simulate(symbol: str, velas: list[dict]) -> Result:
         if abierta:
             # Salida por stop, o por giro del SuperTrend.
             if vela["low"] <= abierta.sl:
+                riesgo0 = abierta.entry - abierta.sl_inicial
                 abierta.exit = abierta.sl
                 abierta.exit_ts = vela["time"]
-                abierta.r = -1.0
+                abierta.r = (abierta.sl - abierta.entry) / riesgo0 if riesgo0 > 0 else -1.0
+                abierta.r -= config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
                 abierta.motivo = "stop"
                 res.trades.append(abierta)
                 abierta = None
-            elif strategy.exit_signal(velas[: i + 1]):
-                riesgo = abierta.entry - abierta.sl
-                abierta.exit = vela["close"]
-                abierta.exit_ts = vela["time"]
-                abierta.r = (vela["close"] - abierta.entry) / riesgo if riesgo > 0 else 0.0
-                # El coste se descuenta SIEMPRE, en R, igual que en vivo.
-                abierta.r -= config.COST_ROUNDTRIP_PCT / (riesgo / abierta.entry * 100.0)
-                abierta.motivo = "supertrend"
-                res.trades.append(abierta)
-                abierta = None
+            else:
+                # Trailing: solo sube. Si el cierre lo pierde, se sale.
+                abierta.sl = strategy.trailing_stop(velas[: i + 1], abierta.sl)
+                if vela["close"] <= abierta.sl:
+                    riesgo = abierta.entry - abierta.sl_inicial
+                    abierta.exit = vela["close"]
+                    abierta.exit_ts = vela["time"]
+                    abierta.r = (vela["close"] - abierta.entry) / riesgo if riesgo > 0 else 0.0
+                    abierta.r -= config.COST_ROUNDTRIP_PCT / (riesgo / abierta.entry * 100.0)
+                    abierta.motivo = "trailing"
+                    res.trades.append(abierta)
+                    abierta = None
             i += 1
             continue
 
@@ -143,7 +148,7 @@ def simulate(symbol: str, velas: list[dict]) -> Result:
             clave = motivo.split("(")[0].strip()
             res.descartes[clave] = res.descartes.get(clave, 0) + 1
         else:
-            abierta = Trade(symbol, vela["time"], sig.entry, sig.sl)
+            abierta = Trade(symbol, vela["time"], sig.entry, sig.sl, sig.sl)
         i += 1
 
     return res
@@ -210,7 +215,7 @@ async def main() -> int:
 
     print(f"Descargando {days} días en {interval} para {len(symbols)} símbolo(s)...")
     print(f"Filtros activos: coste {config.COST_ROUNDTRIP_PCT}% · "
-          f"riesgo {config.MIN_RISK_PCT}-{config.MAX_RISK_PCT}%")
+          f"compresión ≤{config.MAX_COMPRESSION_ATR} ATR · estirón ≤{config.MAX_STRETCH_AT_ENTRY}")
 
     total_r = 0.0
     total_ops = 0
