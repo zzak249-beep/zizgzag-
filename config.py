@@ -1,60 +1,129 @@
 """
-Configuración centralizada. Todo se lee de variables de entorno
-(Railway → Variables). Ver .env.example para la lista completa.
+Configuración del bot Wavelet MRA.
+
+MODE=SIGNAL por defecto. Esta estrategia tiene CERO operaciones medidas
+y su filtro central estaba mal calibrado en el original, así que los
+números del hilo de partida (71%, Sharpe 2.44) no son una referencia
+válida: describen una versión con el filtro encendido el 92% del
+tiempo. Mide antes con backtest.py.
 """
 import os
 
 
-def _bool(name, default="false"):
-    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+def _bool(n, d=False):
+    return os.getenv(n, str(d)).strip().lower() in ("1", "true", "yes", "si", "sí")
 
 
-def _str(name, default=""):
-    """Lee una variable de entorno y le quita espacios/saltos de línea
-    accidentales (Railway/copiar-pegar suele dejar un '\\n' al final,
-    lo que rompe cabeceras HTTP como X-BX-APIKEY con un ValueError)."""
-    return os.getenv(name, default).strip()
+def _float(n, d):
+    try:
+        return float(os.getenv(n, d))
+    except (TypeError, ValueError):
+        return d
 
 
-# --- BingX ---
-BINGX_API_KEY = _str("BINGX_API_KEY")
-BINGX_API_SECRET = _str("BINGX_API_SECRET")
-BINGX_BASE_URL = _str("BINGX_BASE_URL", "https://open-api.bingx.com")
-BINGX_DEMO = _bool("BINGX_DEMO", "true")  # usa VST (demo trading) por defecto
+def _int(n, d):
+    try:
+        return int(os.getenv(n, d))
+    except (TypeError, ValueError):
+        return d
 
-# --- Telegram ---
-TELEGRAM_BOT_TOKEN = _str("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = _str("TELEGRAM_CHAT_ID")
 
-# --- Webhook ---
-WEBHOOK_SECRET = _str("WEBHOOK_SECRET")  # token que añades a la URL de la alerta
+MODE = os.getenv("MODE", "SIGNAL").strip().upper()
+LIVE_CONFIRMED = _bool("LIVE_CONFIRMED", False)
 
-# --- Modo de operación ---
-# AUTO_TRADE=false  -> solo reenvía la señal a Telegram, no ejecuta nada (modo manual)
-# AUTO_TRADE=true   -> ejecuta la orden en BingX y además avisa por Telegram
-AUTO_TRADE = _bool("AUTO_TRADE", "false")
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
+BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
+BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com").strip()
 
-# --- Riesgo / cuenta ---
-RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "2.0"))  # % del equity arriesgado (via SL)
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
 
-# --- Circuit breaker ---
-MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
-MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "6.0"))
+# ── Motor wavelet ─────────────────────────────────────────────────────
+TIMEFRAME = os.getenv("TIMEFRAME", "5m").strip()
+LOOKBACK_ENERGY = _int("LOOKBACK_ENERGY", 40)
+APPROX_LEN = _int("APPROX_LEN", 8)
+ATR_LEN = _int("ATR_LEN", 14)
 
-# --- Persistencia ---
-STATE_FILE = _str("STATE_FILE", "state.json")
+# LA CORRECCIÓN CENTRAL. Con normalización por escala, el ratio en ruido
+# puro tiene mediana 0.75 y percentil 75 en 1.00, así que 1.30 deja
+# pasar aproximadamente el cuartil superior. Sin normalizar (modo
+# original) el ruido puro ya da mediana 3.04 y habría que poner el
+# umbral en 4.0 para filtrar algo — con 1.5 se enciende el 92% del
+# tiempo y no filtra nada.
+NORMALIZE_SCALES = _bool("NORMALIZE_SCALES", True)
+DOMINANCE_THRESHOLD = _float("DOMINANCE_THRESHOLD", 1.30)
 
-# --- Mapeo símbolo TradingView -> BingX ---
-# TradingView suele mandar "BTCUSDT" o "BTCUSDT.P". BingX quiere "BTC-USDT".
-def tv_symbol_to_bingx(tv_symbol: str) -> str:
-    s = tv_symbol.upper().replace(".P", "").replace("PERP", "")
-    if "-" in s:
-        return s
-    # separar el par asumiendo que termina en USDT/USDC/USD
-    for quote in ("USDT", "USDC", "USD"):
-        if s.endswith(quote):
-            base = s[: -len(quote)]
-            return f"{base}-{quote}"
-    return s
+ALLOW_LONG = _bool("ALLOW_LONG", True)
+ALLOW_SHORT = _bool("ALLOW_SHORT", True)
+
+USE_VOL_FILTER = _bool("USE_VOL_FILTER", False)
+VOL_LEN = _int("VOL_LEN", 20)
+VOL_MULT = _float("VOL_MULT", 1.2)
+
+# ── Salidas ───────────────────────────────────────────────────────────
+SL_ATR = _float("SL_ATR", 1.5)
+TP_ATR = _float("TP_ATR", 2.5)
+MAX_TRADE_MINUTES = _int("MAX_TRADE_MINUTES", 120)
+USE_TIME_EXIT = _bool("USE_TIME_EXIT", True)
+TIME_EXIT_ONLY_LOSING = _bool("TIME_EXIT_ONLY_LOSING", True)
+
+# ── Coste y liquidez ──────────────────────────────────────────────────
+COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
+MIN_ATR_PCT = _float("MIN_ATR_PCT", 0.5)
+MIN_COST_COVER = _float("MIN_COST_COVER", 6.0)
+MAX_COST_IN_R = _float("MAX_COST_IN_R", 0.20)
+MAX_RISK_PCT = _float("MAX_RISK_PCT", 4.0)
+MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 2_000_000.0)
+
+# ── Universo ──────────────────────────────────────────────────────────
+SCAN_INTERVAL_SEC = _int("SCAN_INTERVAL_SEC", 60)
+MAX_SYMBOLS = _int("MAX_SYMBOLS", 400)
+SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
+SYMBOL_WHITELIST = [s.strip().upper() for s in os.getenv("SYMBOL_WHITELIST", "").split(",") if s.strip()]
+EXCLUDE_PREFIXES = [p.strip().upper() for p in os.getenv("EXCLUDE_PREFIXES", "NC").split(",") if p.strip()]
+
+# ── Riesgo ────────────────────────────────────────────────────────────
+RISK_PCT = _float("RISK_PCT", 0.5)
+MAX_CONCURRENT = _int("MAX_CONCURRENT", 1)
+MAX_TOTAL_POSITIONS = _int("MAX_TOTAL_POSITIONS", 3)
+LEVERAGE = _int("LEVERAGE", 2)
+MARGIN_MODE = os.getenv("MARGIN_MODE", "ISOLATED").strip().upper()
+MAX_CONSECUTIVE_LOSSES = _int("MAX_CONSECUTIVE_LOSSES", 3)
+COOLDOWN_MINUTES = _int("COOLDOWN_MINUTES", 120)
+MAX_DAILY_LOSS_R = _float("MAX_DAILY_LOSS_R", 3.0)
+COOLDOWN_BARS = _int("COOLDOWN_BARS", 4)
+ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
+LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
+LIMIT_TTL_MIN = _int("LIMIT_TTL_MIN", 10)
+
+# ── Avisos ────────────────────────────────────────────────────────────
+SIGNAL_COOLDOWN_MIN = _int("SIGNAL_COOLDOWN_MIN", 60)
+WATCHLIST_MIN = _int("WATCHLIST_MIN", 30)
+DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
+DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
+HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
+IDLE_ALERT_DAYS = _int("IDLE_ALERT_DAYS", 5)
+BTC_CONTEXT = _bool("BTC_CONTEXT", True)
+
+STATE_PATH = os.getenv("STATE_PATH", "/data/state_wavelet.json")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+
+
+def _tf_min() -> int:
+    return {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(TIMEFRAME, 5)
+
+
+def max_trade_seconds() -> int:
+    return MAX_TRADE_MINUTES * 60
+
+
+def is_live() -> bool:
+    return MODE == "LIVE" and LIVE_CONFIRMED and bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
+
+
+def describe() -> str:
+    if is_live():
+        return "LIVE — enviando órdenes reales a BingX"
+    if MODE == "LIVE":
+        return "LIVE pedido pero SIN confirmar — sigue en SIGNAL"
+    return "SIGNAL — solo avisos, no toca el exchange"

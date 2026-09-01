@@ -1,7 +1,7 @@
 """
 Backtest local sobre histórico descargado del exchange.
 
-    python backtest.py BTR-USDT 30m 180
+    python backtest.py ZEC-USDT 5m 240
     python backtest.py ZEC-USDT 15m 240 --mensual
     python backtest.py ZEC-USDT,PUMP-USDT,LDO-USDT 30m 240
 
@@ -53,7 +53,8 @@ class Trade:
     entry_ts: int
     entry: float
     sl: float
-    sl_inicial: float = 0.0
+    tp: float = 0.0
+    side: str = "BUY"
     exit_ts: int = 0
     exit: float = 0.0
     r: float = 0.0
@@ -118,28 +119,41 @@ def simulate(symbol: str, velas: list[dict]) -> Result:
         vela = velas[i]
 
         if abierta:
-            # Salida por stop, o por giro del SuperTrend.
-            if vela["low"] <= abierta.sl:
-                riesgo0 = abierta.entry - abierta.sl_inicial
+            riesgo0 = abs(abierta.entry - abierta.sl)
+            largo = abierta.side == "BUY"
+            toca_sl = vela["low"] <= abierta.sl if largo else vela["high"] >= abierta.sl
+            toca_tp = vela["high"] >= abierta.tp if largo else vela["low"] <= abierta.tp
+            venc = (vela["time"] - abierta.entry_ts) / 60000 >= config.MAX_TRADE_MINUTES
+
+            # Si en la misma vela se tocan SL y TP, se supone el PEOR
+            # caso. Suponer el mejor es la forma más común de inflar un
+            # backtest sin darse cuenta.
+            if toca_sl:
                 abierta.exit = abierta.sl
-                abierta.exit_ts = vela["time"]
-                abierta.r = (abierta.sl - abierta.entry) / riesgo0 if riesgo0 > 0 else -1.0
-                abierta.r -= config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
                 abierta.motivo = "stop"
-                res.trades.append(abierta)
-                abierta = None
+                abierta.r = -1.0 - config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
+            elif toca_tp:
+                abierta.exit = abierta.tp
+                abierta.motivo = "objetivo"
+                bruto = (abierta.tp - abierta.entry) if largo else (abierta.entry - abierta.tp)
+                abierta.r = bruto / riesgo0 - config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
+            elif venc:
+                precio = vela["close"]
+                bruto = (precio - abierta.entry) if largo else (abierta.entry - precio)
+                a_favor = bruto > 0
+                if config.TIME_EXIT_ONLY_LOSING and a_favor:
+                    i += 1
+                    continue
+                abierta.exit = precio
+                abierta.motivo = "tiempo"
+                abierta.r = bruto / riesgo0 - config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
             else:
-                # Trailing: solo sube. Si el cierre lo pierde, se sale.
-                abierta.sl = strategy.trailing_stop(velas[: i + 1], abierta.sl)
-                if vela["close"] <= abierta.sl:
-                    riesgo = abierta.entry - abierta.sl_inicial
-                    abierta.exit = vela["close"]
-                    abierta.exit_ts = vela["time"]
-                    abierta.r = (vela["close"] - abierta.entry) / riesgo if riesgo > 0 else 0.0
-                    abierta.r -= config.COST_ROUNDTRIP_PCT / (riesgo / abierta.entry * 100.0)
-                    abierta.motivo = "trailing"
-                    res.trades.append(abierta)
-                    abierta = None
+                i += 1
+                continue
+
+            abierta.exit_ts = vela["time"]
+            res.trades.append(abierta)
+            abierta = None
             i += 1
             continue
 
@@ -148,7 +162,7 @@ def simulate(symbol: str, velas: list[dict]) -> Result:
             clave = motivo.split("(")[0].strip()
             res.descartes[clave] = res.descartes.get(clave, 0) + 1
         else:
-            abierta = Trade(symbol, vela["time"], sig.entry, sig.sl, sig.sl)
+            abierta = Trade(symbol, vela["time"], sig.entry, sig.sl, sig.tp, sig.side)
         i += 1
 
     return res
@@ -215,7 +229,7 @@ async def main() -> int:
 
     print(f"Descargando {days} días en {interval} para {len(symbols)} símbolo(s)...")
     print(f"Filtros activos: coste {config.COST_ROUNDTRIP_PCT}% · "
-          f"compresión ≤{config.MAX_COMPRESSION_ATR} ATR · estirón ≤{config.MAX_STRETCH_AT_ENTRY}")
+          f"riesgo {config.MIN_RISK_PCT}-{config.MAX_RISK_PCT}%")
 
     total_r = 0.0
     total_ops = 0

@@ -1,38 +1,47 @@
 """
-Motor: arranque de impulso ("la primera subida").
+Motor: descomposición multiescala tipo à trous + cruce sobre la
+aproximación, con el filtro de régimen CORREGIDO.
 
-QUÉ LO DIFERENCIA DE LA RUPTURA DE RANGO QUE YA FALLÓ
-La ruptura de rango simple —cerrar por encima del máximo de N velas—
-se midió con 482 operaciones y perdió en los tres símbolos: -0.32R en
-INDEXUS con 159 operaciones, -18% en CATE, -27% en JIMOTHY. El motivo
-es que en un mercado picado el precio sale del rango constantemente y
-casi todas esas salidas mueren en el primer retroceso.
+═══════════════════════════════════════════════════════════════════════
+EL FALLO DEL ORIGINAL, Y POR QUÉ IMPORTA
+═══════════════════════════════════════════════════════════════════════
+El script de partida compara la energía de las escalas gruesas (4 y 8
+barras) contra las finas (1 y 2) y llama "tendencia" a que el ratio
+supere 1.5.
 
-Aquí se exigen CUATRO cosas a la vez, y las cuatro tienen que darse en
-la misma vela:
+Simulado sobre un PASEO ALEATORIO PURO —ruido sin ninguna tendencia—
+ese ratio da:
 
-  1. COMPRESIÓN PREVIA. Antes del arranque tiene que haber calma: el
-     rango de las últimas N velas, medido en ATR, por debajo de un
-     umbral. Un pump nace de la quietud; si el precio ya venía dando
-     bandazos, la "ruptura" es una más del montón.
-  2. EXPANSIÓN REAL. La vela que rompe debe ser mucho más ancha que el
-     ATR y cerrar en el tercio alto de su propio rango. Una vela ancha
-     que cierra por la mitad es indecisión, no arranque.
-  3. VOLUMEN. Un pump sin volumen no es un pump: es un hueco en el
-     libro. Se exige un múltiplo de la media reciente.
-  4. QUE SEA PRONTO. Este es el filtro que de verdad separa esta
-     estrategia de la anterior: si el precio ya está a más de X ATR de
-     su media, el movimiento YA ocurrió y entrar es comprar el final.
-     La ruptura de rango no miraba esto — por eso entraba tarde una y
-     otra vez en las verticales.
+    mediana 3.04  ·  por encima de 1.5 el 92.6% del tiempo
 
-SALIDA: trailing por ATR. Los pumps tienen colas largas — la mayoría
-no va a ninguna parte y unos pocos corren muchísimo. Un objetivo fijo
-cobraría 2R en los que iban a hacer 10R, que es donde está el dinero
-de una estrategia de continuación.
+O sea que el filtro se enciende casi siempre aunque no pase nada. No
+distingue tendencia de aleatoriedad: solo descarta mercados
+fuertemente oscilantes (ahí el ratio baja a ~1.2).
 
-ADVERTENCIA: cero operaciones medidas. El paquete incluye backtest.py;
-mídelo antes de ponerle un euro.
+La causa es matemática, no de implementación: la diferencia entre dos
+medias de 8 barras tiene mucha más varianza que entre dos de 1 barra,
+así que el numerador arranca inflado. En un análisis wavelet serio la
+energía se NORMALIZA por escala antes de compararla.
+
+LA CORRECCIÓN: dividir la energía de cada escala por su longitud. Con
+eso, el mismo ruido puro da mediana 0.75 y percentil 75 en 1.00 — y
+entonces un umbral alrededor de 1.0-1.3 significa algo de verdad.
+
+Se deja el modo original disponible (NORMALIZE=false) para poder
+comparar los dos en el backtester en vez de creerme a mí.
+
+═══════════════════════════════════════════════════════════════════════
+LO QUE ESTO ES Y NO ES
+═══════════════════════════════════════════════════════════════════════
+No es una DWT ortogonal. Es una aproximación redundante y CAUSAL del
+algoritmo à trous: usa solo datos pasados, sin repintado. Eso es una
+virtud frente a la mayoría de "wavelet denoising" que circula, que
+aplica la transformada sobre la serie completa —futuro incluido— y
+produce backtests preciosos e irreproducibles.
+
+Y no asumas el 71% / Sharpe 2.44 del hilo original: esos números salen
+de una estrategia con el filtro encendido el 92% del tiempo, o sea de
+un cruce de medias sin filtro efectivo.
 """
 from __future__ import annotations
 
@@ -43,19 +52,25 @@ import config
 
 log = logging.getLogger("strategy")
 
+ESCALAS_FINAS = (1, 2)
+ESCALAS_GRUESAS = (4, 8)
+
 
 @dataclass
 class Signal:
     symbol: str
-    side: str          # "BUY" — de momento solo al alza
+    side: str            # "BUY" | "SELL"
     entry: float
     sl: float
     tp: float
+    ratio: float         # dominancia grueso/fino ya normalizada
+    umbral: float
+    h8: float            # pendiente de la escala gruesa
     atr_pct: float
-    compresion: float  # rango previo en ATR: cuanto menor, más limpia la salida
-    expansion: float   # tamaño de la vela en ATR
-    vol_mult: float
-    stretch: float
+    riesgo_pct: float
+    coste_r: float
+    timeframe: str = ""
+    btc_24h: float | None = None
 
 
 def sma(values: list[float], length: int) -> list[float]:
@@ -68,42 +83,63 @@ def sma(values: list[float], length: int) -> list[float]:
     return out
 
 
-def ema(values: list[float], length: int) -> list[float]:
-    if not values:
-        return []
-    k = 2.0 / (length + 1.0)
-    out = [values[0]]
-    for v in values[1:]:
-        out.append(v * k + out[-1] * (1.0 - k))
-    return out
-
-
-def atr(highs: list[float], lows: list[float], closes: list[float], length: int) -> list[float]:
+def atr_series(highs, lows, closes, length: int) -> list[float]:
     if len(closes) < 2:
         return []
     trs = [highs[0] - lows[0]]
     for i in range(1, len(closes)):
-        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+        trs.append(max(highs[i] - lows[i],
+                       abs(highs[i] - closes[i - 1]),
+                       abs(lows[i] - closes[i - 1])))
     out = [trs[0]]
     for tr in trs[1:]:
         out.append((out[-1] * (length - 1) + tr) / length)
     return out
 
 
+def haar_detail(closes: list[float], n: int) -> list[float]:
+    """
+    Detalle causal a escala n: diferencia entre la media de las últimas
+    n barras y la media de las n anteriores. Es el paso "à trous" del
+    original, y solo mira hacia atrás.
+    """
+    m = sma(closes, n)
+    out = []
+    for i in range(len(closes)):
+        j = i - n
+        out.append(0.0 if j < 0 else (m[i] - m[j]) / (2 ** 0.5))
+    return out
+
+
+def regime(closes: list[float], lookback: int, normalizar: bool) -> tuple[float, float]:
+    """Devuelve (ratio, h8). El ratio ya viene normalizado si procede."""
+    detalles = {n: haar_detail(closes, n) for n in (1, 2, 4, 8)}
+    energia = {}
+    for n, serie in detalles.items():
+        ventana = serie[-lookback:]
+        e = sum(x * x for x in ventana)
+        # LA CORRECCIÓN: cada escala se divide por su longitud. Sin esto,
+        # las gruesas ganan siempre por pura acumulación de varianza.
+        energia[n] = e / n if normalizar else e
+
+    fino = sum(energia[n] for n in ESCALAS_FINAS)
+    grueso = sum(energia[n] for n in ESCALAS_GRUESAS)
+    ratio = grueso / fino if fino > 0 else 0.0
+    return ratio, detalles[8][-1]
+
+
 def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
-    need = config.COMPRESSION_LEN + config.ATR_LEN + config.MA_LEN + 10
+    need = config.LOOKBACK_ENERGY + 32
     if len(candles) < need:
         return None, "pocas velas"
 
-    c = candles[:-1]  # solo velas cerradas
+    c = candles[:-1]  # solo velas cerradas: la última aún se mueve
     closes = [x["close"] for x in c]
     highs = [x["high"] for x in c]
     lows = [x["low"] for x in c]
-    vols = [x["volume"] for x in c]
 
-    a = atr(highs, lows, closes, config.ATR_LEN)
-    ma = ema(closes, config.MA_LEN)
-    if not a or not ma or a[-1] <= 0 or closes[-1] <= 0:
+    a = atr_series(highs, lows, closes, config.ATR_LEN)
+    if not a or a[-1] <= 0 or closes[-1] <= 0:
         return None, "sin indicadores"
 
     atr_pct = a[-1] / closes[-1] * 100.0
@@ -111,78 +147,89 @@ def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
     if atr_pct < config.MIN_ATR_PCT or cover < config.MIN_COST_COVER:
         return None, f"sin amplitud ({atr_pct:.2f}%, {cover:.0f}x)"
 
-    # ── 1. Compresión previa (sin contar la vela de ruptura) ──────────
-    ini = -1 - config.COMPRESSION_LEN
-    rango_prev = max(highs[ini:-1]) - min(lows[ini:-1])
-    compresion = rango_prev / a[-1] if a[-1] > 0 else 99.0
-    if compresion > config.MAX_COMPRESSION_ATR:
-        return None, f"sin compresión previa ({compresion:.1f} ATR)"
+    ratio, h8 = regime(closes, config.LOOKBACK_ENERGY, config.NORMALIZE_SCALES)
+    if ratio < config.DOMINANCE_THRESHOLD:
+        return None, f"sin dominancia ({ratio:.2f} de {config.DOMINANCE_THRESHOLD})"
 
-    # ── 2. Expansión de la vela ──────────────────────────────────────
-    rango_vela = highs[-1] - lows[-1]
-    expansion = rango_vela / a[-1] if a[-1] > 0 else 0.0
-    if expansion < config.MIN_EXPANSION_ATR:
-        return None, f"vela estrecha ({expansion:.1f} ATR)"
+    # Cruce del precio sobre su aproximación (SMA corta).
+    aprox = sma(closes, config.APPROX_LEN)
+    cruza_arriba = closes[-1] > aprox[-1] and closes[-2] <= aprox[-2]
+    cruza_abajo = closes[-1] < aprox[-1] and closes[-2] >= aprox[-2]
 
-    pos_cierre = (closes[-1] - lows[-1]) / rango_vela if rango_vela > 0 else 0.5
-    if pos_cierre < config.MIN_CLOSE_POS:
-        return None, f"cierre débil en la vela ({pos_cierre:.2f})"
+    # La escala gruesa debe apuntar en la misma dirección que el cruce:
+    # sin esto se compran cruces contra la estructura de fondo.
+    largo = cruza_arriba and h8 > 0 and config.ALLOW_LONG
+    corto = cruza_abajo and h8 < 0 and config.ALLOW_SHORT
 
-    if closes[-1] <= max(highs[ini:-1]):
-        return None, "no supera el rango comprimido"
+    if not (largo or corto):
+        if cruza_arriba or cruza_abajo:
+            return None, "cruce contra la escala gruesa"
+        return None, f"sin cruce (ratio {ratio:.2f})"
 
-    # ── 3. Volumen ───────────────────────────────────────────────────
-    vsma = sma(vols, config.VOL_LEN)
-    vol_mult = vols[-1] / vsma[-1] if vsma and vsma[-1] > 0 else 0.0
-    if vol_mult < config.MIN_VOL_MULT:
-        return None, f"sin volumen ({vol_mult:.1f}x)"
-
-    # ── 4. QUE SEA PRONTO ────────────────────────────────────────────
-    # El filtro que separa esto de la ruptura de rango que ya falló.
-    stretch = (closes[-1] - ma[-1]) / a[-1]
-    if stretch > config.MAX_STRETCH_AT_ENTRY:
-        return None, f"ya extendido ({stretch:.1f} ATR): el movimiento ya ocurrió"
+    if config.USE_VOL_FILTER:
+        vols = [x["volume"] for x in c]
+        vsma = sma(vols, config.VOL_LEN)
+        if vsma[-1] <= 0 or vols[-1] < vsma[-1] * config.VOL_MULT:
+            return None, "sin volumen"
 
     entrada = closes[-1]
-    stop = min(lows[-1], lows[-2]) - a[-1] * config.SL_ATR
-    riesgo = entrada - stop
+    if largo:
+        sl = entrada - a[-1] * config.SL_ATR
+        tp = entrada + a[-1] * config.TP_ATR
+        side = "BUY"
+    else:
+        sl = entrada + a[-1] * config.SL_ATR
+        tp = entrada - a[-1] * config.TP_ATR
+        side = "SELL"
+
+    riesgo = abs(entrada - sl)
     if riesgo <= 0:
         return None, "riesgo no válido"
-
     riesgo_pct = riesgo / entrada * 100.0
     coste_r = config.COST_ROUNDTRIP_PCT / riesgo_pct if riesgo_pct > 0 else 99.0
+
     if coste_r > config.MAX_COST_IN_R:
         return None, f"stop demasiado cerca (coste {coste_r:.2f}R)"
     if riesgo_pct > config.MAX_RISK_PCT:
         return None, f"stop demasiado lejos ({riesgo_pct:.1f}%)"
 
     return (
-        Signal(
-            symbol=symbol, side="BUY", entry=entrada, sl=stop,
-            tp=entrada + riesgo * config.RR_TARGET,
-            atr_pct=atr_pct, compresion=compresion, expansion=expansion,
-            vol_mult=vol_mult, stretch=stretch,
-        ),
+        Signal(symbol=symbol, side=side, entry=entrada, sl=sl, tp=tp,
+               ratio=ratio, umbral=config.DOMINANCE_THRESHOLD, h8=h8,
+               atr_pct=atr_pct, riesgo_pct=riesgo_pct, coste_r=coste_r),
         "ok",
     )
 
 
-def trailing_stop(candles: list[dict], stop_actual: float) -> float:
-    """
-    Stop que solo sube. Los pumps corren o mueren rápido: dejar correr
-    con un trailing es lo que permite que las pocas que vuelan paguen
-    las muchas que no.
-    """
-    c = candles[:-1]
-    a = atr([x["high"] for x in c], [x["low"] for x in c], [x["close"] for x in c], config.ATR_LEN)
-    if not a:
-        return stop_actual
-    candidato = max(x["high"] for x in c[-config.TRAIL_LOOKBACK:]) - a[-1] * config.TRAIL_ATR
-    return max(stop_actual, candidato)
-
-
 def position_size(equity: float, entry: float, sl: float) -> float:
+    """
+    Riesgo fijo por operación. El original ofrecía además Kelly, que se
+    ha dejado fuera a propósito: Kelly necesita conocer el edge REAL, y
+    estimarlo con las primeras decenas de operaciones produce tamaños
+    disparatados justo cuando menos se sabe. Cuando el diario tenga
+    varios cientos de operaciones, será el momento de plantearlo.
+    """
     riesgo = abs(entry - sl)
     if riesgo <= 0 or entry <= 0:
         return 0.0
     return (equity * config.RISK_PCT / 100.0) / riesgo
+
+
+def watch_status(candles: list[dict]) -> dict | None:
+    """Estado del régimen para el aviso de vigilancia."""
+    if len(candles) < config.LOOKBACK_ENERGY + 32:
+        return None
+    c = candles[:-1]
+    closes = [x["close"] for x in c]
+    a = atr_series([x["high"] for x in c], [x["low"] for x in c], closes, config.ATR_LEN)
+    if not a or closes[-1] <= 0:
+        return None
+    ratio, h8 = regime(closes, config.LOOKBACK_ENERGY, config.NORMALIZE_SCALES)
+    aprox = sma(closes, config.APPROX_LEN)
+    return {
+        "ratio": ratio,
+        "h8": h8,
+        "atr_pct": a[-1] / closes[-1] * 100.0,
+        "dist_aprox": (closes[-1] - aprox[-1]) / a[-1] if a[-1] > 0 else 0.0,
+        "dominante": ratio >= config.DOMINANCE_THRESHOLD,
+    }
