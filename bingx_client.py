@@ -25,9 +25,12 @@ class BingXError(Exception):
 
 class BingXClient:
     def __init__(self, api_key=None, api_secret=None, base_url=None):
-        self.api_key = api_key or config.BINGX_API_KEY
-        self.api_secret = api_secret or config.BINGX_API_SECRET
-        self.base_url = base_url or config.BINGX_BASE_URL
+        # .strip() defensivo: una key/secret con un '\n' o espacio colado
+        # (típico al pegar variables en Railway) rompe la cabecera HTTP
+        # X-BX-APIKEY con un ValueError críptico en pleno reconcile/entrada.
+        self.api_key = (api_key or config.BINGX_API_KEY or "").strip()
+        self.api_secret = (api_secret or config.BINGX_API_SECRET or "").strip()
+        self.base_url = (base_url or config.BINGX_BASE_URL or "").strip()
         if not self.api_key or not self.api_secret:
             log.warning("BINGX_API_KEY / BINGX_API_SECRET no configuradas.")
 

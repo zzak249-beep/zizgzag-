@@ -9,18 +9,25 @@ def _bool(name, default="false"):
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _str(name, default=""):
+    """Lee una variable de entorno y le quita espacios/saltos de línea
+    accidentales (Railway/copiar-pegar suele dejar un '\\n' al final,
+    lo que rompe cabeceras HTTP como X-BX-APIKEY con un ValueError)."""
+    return os.getenv(name, default).strip()
+
+
 # --- BingX ---
-BINGX_API_KEY = os.getenv("BINGX_API_KEY", "")
-BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
-BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com")
+BINGX_API_KEY = _str("BINGX_API_KEY")
+BINGX_API_SECRET = _str("BINGX_API_SECRET")
+BINGX_BASE_URL = _str("BINGX_BASE_URL", "https://open-api.bingx.com")
 BINGX_DEMO = _bool("BINGX_DEMO", "true")  # usa VST (demo trading) por defecto
 
 # --- Telegram ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = _str("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = _str("TELEGRAM_CHAT_ID")
 
 # --- Webhook ---
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # token que añades a la URL de la alerta
+WEBHOOK_SECRET = _str("WEBHOOK_SECRET")  # token que añades a la URL de la alerta
 
 # --- Modo de operación ---
 # AUTO_TRADE=false  -> solo reenvía la señal a Telegram, no ejecuta nada (modo manual)
@@ -37,7 +44,7 @@ MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "6.0"))
 
 # --- Persistencia ---
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
+STATE_FILE = _str("STATE_FILE", "state.json")
 
 # --- Mapeo símbolo TradingView -> BingX ---
 # TradingView suele mandar "BTCUSDT" o "BTCUSDT.P". BingX quiere "BTC-USDT".
