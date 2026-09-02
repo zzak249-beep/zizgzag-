@@ -40,6 +40,8 @@ TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "")
 
 # ── Motor wavelet ─────────────────────────────────────────────────────
 TIMEFRAME = os.getenv("TIMEFRAME", "5m").strip()
+# Varios timeframes a la vez, separados por comas. Por defecto solo uno.
+TIMEFRAMES = [t.strip() for t in os.getenv("TIMEFRAMES", "").split(",") if t.strip()] or [TIMEFRAME]
 LOOKBACK_ENERGY = _int("LOOKBACK_ENERGY", 40)
 APPROX_LEN = _int("APPROX_LEN", 8)
 ATR_LEN = _int("ATR_LEN", 14)
@@ -73,6 +75,10 @@ MIN_ATR_PCT = _float("MIN_ATR_PCT", 0.5)
 MIN_COST_COVER = _float("MIN_COST_COVER", 6.0)
 MAX_COST_IN_R = _float("MAX_COST_IN_R", 0.20)
 MAX_RISK_PCT = _float("MAX_RISK_PCT", 4.0)
+# Suelo de riesgo: si el stop queda demasiado cerca, el coste pesa
+# demasiado. MAX_COST_IN_R ya lo cubre, pero el backtester heredado lo
+# consulta por separado.
+MIN_RISK_PCT = _float("MIN_RISK_PCT", 0.0)
 MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 2_000_000.0)
 
 # ── Universo ──────────────────────────────────────────────────────────
@@ -104,6 +110,11 @@ DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
 HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
 IDLE_ALERT_DAYS = _int("IDLE_ALERT_DAYS", 5)
 BTC_CONTEXT = _bool("BTC_CONTEXT", True)
+# Filtro opcional y APAGADO: no abrir largos si BTC cae fuerte, porque
+# las alts caen más. Sin datos propios que lo respalden, activarlo sería
+# añadir una creencia al sistema.
+BTC_FILTER = _bool("BTC_FILTER", False)
+BTC_MIN_24H = _float("BTC_MIN_24H", -3.0)
 
 STATE_PATH = os.getenv("STATE_PATH", "/data/state_wavelet.json")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
