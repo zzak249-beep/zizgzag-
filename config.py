@@ -58,13 +58,41 @@ DOMINANCE_THRESHOLD = _float("DOMINANCE_THRESHOLD", 1.30)
 ALLOW_LONG = _bool("ALLOW_LONG", True)
 ALLOW_SHORT = _bool("ALLOW_SHORT", True)
 
-USE_VOL_FILTER = _bool("USE_VOL_FILTER", False)
+# ── Las tres correcciones del cruce de medias ─────────────────────────
+# Un cruce sin filtros dispara 30-50 veces por trimestre con 60-65% de
+# perdedoras y factor de ganancias ~1.0: breakeven menos comisiones. La
+# literatura coincide en tres arreglos, y aquí están los tres.
+#
+# (1) RÉGIMEN — ya lo cubre DOMINANCE_THRESHOLD, que es el equivalente
+#     al filtro de ADX que recomiendan: no operar cruces en mercado
+#     plano.
+#
+# (2) VOLUMEN en la vela del cruce. Activado por defecto: las fuentes
+#     dicen que "este filtro por sí solo elimina una porción
+#     significativa de los whipsaws", porque los cruces con poco volumen
+#     en mercado fino se giran casi siempre.
+USE_VOL_FILTER = _bool("USE_VOL_FILTER", True)
 VOL_LEN = _int("VOL_LEN", 20)
 VOL_MULT = _float("VOL_MULT", 1.2)
+
+# (3) TENDENCIA DEL TIMEFRAME SUPERIOR. Es la corrección que más
+#     recortaba señales en los estudios ("elimina la mayoría de los
+#     fallos a contratendencia"). Solo largos si el precio está sobre su
+#     media larga, solo cortos si está por debajo. Reduce las señales
+#     aproximadamente a la mitad — esa es la idea.
+USE_HTF_FILTER = _bool("USE_HTF_FILTER", True)
+HTF_MA_LEN = _int("HTF_MA_LEN", 200)
 
 # ── Salidas ───────────────────────────────────────────────────────────
 SL_ATR = _float("SL_ATR", 1.5)
 TP_ATR = _float("TP_ATR", 2.5)
+# "Los trailing stops típicamente superan a las salidas por cruce
+# contrario porque capturan la continuación después de ganar el edge
+# inicial." Disponible, apagado: cámbialo y compara en el backtester en
+# vez de creértelo.
+USE_TRAILING = _bool("USE_TRAILING", False)
+TRAIL_ATR = _float("TRAIL_ATR", 2.0)
+TRAIL_START_R = _float("TRAIL_START_R", 1.0)
 MAX_TRADE_MINUTES = _int("MAX_TRADE_MINUTES", 120)
 USE_TIME_EXIT = _bool("USE_TIME_EXIT", True)
 TIME_EXIT_ONLY_LOSING = _bool("TIME_EXIT_ONLY_LOSING", True)

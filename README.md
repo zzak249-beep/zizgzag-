@@ -105,6 +105,80 @@ exactamente lo que operarías.
 
 ---
 
+## Lo que esta estrategia es, sin el envoltorio
+
+Quitando la capa wavelet, el disparador es **un cruce de precio sobre
+SMA(8)**. Y sobre eso hay evidencia concreta:
+
+> *"En mercados en rango —que son la mayoría, la mayor parte del
+> tiempo— cada cruce parece una ruptura y cada uno se gira a los pocos
+> bares."*
+
+Un cruce sin filtros dispara 30-50 operaciones por trimestre, **60-65%
+son perdedoras**, y el factor de ganancias queda en **~1,0**: breakeven
+menos comisiones. Y sobre 5 minutos en particular: *"disparan demasiado
+y hacen más whipsaw; se pueden operar, pero es mucho más difícil
+sacarles beneficio"*.
+
+Las fuentes coinciden en tres correcciones, y las tres están puestas:
+
+| Corrección | Cómo se implementa | Estado |
+|---|---|---|
+| **Régimen** (ADX > 20-25) | `DOMINANCE_THRESHOLD` normalizado | activo |
+| **Volumen** en la vela del cruce | `USE_VOL_FILTER`, 1,2× la media | **activo** |
+| **Tendencia de fondo** | `USE_HTF_FILTER`, SMA(200) | **activo** |
+
+El de volumen es el que las fuentes destacan: *"este filtro por sí solo
+elimina una porción significativa de los whipsaws"*.
+
+### Lo que cuesta cada filtro, medido
+
+| Configuración | Ops (tendencia) | Ops (ruido) |
+|---|---|---|
+| Solo régimen | 89 | 18 |
+| + volumen | 18 | 4 |
+| + volumen + tendencia | 15 | 4 |
+
+Los filtros recortan las señales a una sexta parte. **Eso es lo
+esperado y lo que buscas**: de las 89 originales, la mayoría eran
+whipsaws que el propio estudio predice.
+
+También hay `USE_TRAILING` disponible y apagado — las fuentes dicen que
+un trailing supera a la salida fija porque captura la continuación,
+pero eso es una hipótesis que hay que medir, no una certeza.
+
+---
+
+## El sesgo que arruina los escáneres, y cómo se controla aquí
+
+Este bot mira **327 símbolos**. Eso no es una ventaja gratis: es hacer
+327 apuestas a la vez. Por puro azar, algunas van a salir bien.
+
+La literatura sobre *data snooping* es contundente. Un estudio sobre
+447 "anomalías" publicadas encontró que **el 85% no explicaba nada**, y
+que del resto **el 93% no sobrevivía** a exigir un t-estadístico ≥ 3 en
+vez del 2 habitual. Harvey, Liu y Zhu recomiendan ese umbral
+precisamente cuando se ha buscado mucho.
+
+Por eso `backtest.py` ya no se limita a darte la expectativa: calcula
+el **t-estadístico** y lo compara con tres umbrales.
+
+```
+t-estadístico: +4.74   (n=300)
+  umbral clásico 2.00 · data snooping 3.00 · Bonferroni 300 símbolos: 3.76
+  -> PASA incluso ajustando por multiplicidad
+```
+
+Con una expectativa de +0,15 R y 300 operaciones, pasa. Sin edge real,
+sale "no distinguible de cero" aunque el total sea positivo.
+
+**Y una trampa que conviene evitar:** si backtesteas 50 símbolos y te
+quedas con los 5 mejores, eso es data snooping puro — el sesgo de
+elegir los k mejores de n es casi tan grande como elegir el mejor de
+n^k. Mira **el agregado**, no los ganadores.
+
+---
+
 ## Despliegue
 
 Servicio **aparte**, volumen en `/data`, `railway_vars_SIGNAL.txt` en el
