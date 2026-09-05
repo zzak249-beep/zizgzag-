@@ -70,7 +70,60 @@ def _primera(nombres, default, tipo="str"):
     return default
 
 
-class Config:
+# Parámetros del motor con nombres alternativos. sweep_engine.py usa el
+# prefijo SWEEP_ para algunos (SWEEP_ATR_LENGTH), y no todos los módulos
+# coinciden. En vez de ir descubriéndolos uno a uno con un crash por
+# cada deploy, Config resuelve el prefijo automáticamente.
+_PREFIJOS = ("SWEEP_", "WAVELET_")
+
+
+class _ConfigMeta(type):
+    """Resuelve atributos que no existen literalmente en Config.
+
+    Orden: variable de entorno con ese nombre exacto -> mismo nombre sin
+    prefijo SWEEP_/WAVELET_ -> mismo nombre CON prefijo. Si nada encaja,
+    lanza AttributeError con un mensaje que dice qué falta y dónde
+    definirlo, en vez del críptico "type object 'Config' has no
+    attribute".
+    """
+
+    def __getattr__(cls, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        crudo = os.getenv(name)
+        if crudo is not None and crudo.strip():
+            crudo = crudo.strip()
+            VARIABLES_ENCONTRADAS[name] = f"{name}={crudo} (resuelta al vuelo)"
+            for conv in (int, float):
+                try:
+                    return conv(crudo)
+                except ValueError:
+                    pass
+            if crudo.lower() in ("true", "false"):
+                return crudo.lower() == "true"
+            return crudo
+
+        candidatos = []
+        for pref in _PREFIJOS:
+            if name.startswith(pref):
+                candidatos.append(name[len(pref):])
+            else:
+                candidatos.append(pref + name)
+
+        for alt in candidatos:
+            valor = cls.__dict__.get(alt)
+            if valor is not None:
+                VARIABLES_ENCONTRADAS[name] = f"-> {alt} (alias)"
+                return valor
+
+        raise AttributeError(
+            f"Config no tiene '{name}' ni un equivalente ({', '.join(candidatos)}). "
+            f"Defínelo como variable de entorno en Railway o añádelo a config.py."
+        )
+
+
+class Config(metaclass=_ConfigMeta):
     # --- BingX ---
     BINGX_API_KEY = _str("BINGX_API_KEY")
     BINGX_API_SECRET = _str("BINGX_API_SECRET")
@@ -93,7 +146,10 @@ class Config:
     TELEGRAM_CHAT_ID = _str("TELEGRAM_CHAT_ID")
 
     # --- Universo y ritmo ---
-    SYMBOLS = _primera(["SYMBOLS", "SYMBOL_WHITELIST"], "BTC-USDT")  # "ALL" = todos los USDT-M
+    # Default "ALL" (todos los perpetuos USDT-M), que es como venía
+    # operando el bot. SYMBOL_WHITELIST no se acepta como alias: en tu
+    # Railway está vacío, y una lista vacía no significa "solo BTC".
+    SYMBOLS = _primera(["SYMBOLS"], "ALL")
     TIMEFRAME = _str("TIMEFRAME", "5m")
     POLL_INTERVAL_SECONDS = _int("POLL_INTERVAL_SECONDS", 60)
     # El escaneo va por lotes para no abrir cientos de conexiones a la vez
@@ -118,7 +174,12 @@ class Config:
     # OJO: QTY_PCT es porcentaje del equity en NOCIONAL, no riesgo. El
     # riesgo real de cada operación depende de dónde caiga el nivel
     # barrido y varía entre entradas.
-    QTY_PCT = _primera(["QTY_PCT", "RISK_PCT", "RISK_PCT_PER_TRADE"], 10.0, "float")
+    # SOLO QTY_PCT. NO se acepta RISK_PCT como alias: en otros bots de la
+    # flota RISK_PCT es el % de equity ARRIESGADO en la distancia al stop,
+    # mientras que aquí QTY_PCT es el % puesto en NOCIONAL. Son magnitudes
+    # distintas y mezclarlas hizo que un RISK_PCT=0.5 se leyera como
+    # "0.5% de nocional" -> posiciones de 0.33 USDT.
+    QTY_PCT = _primera(["QTY_PCT"], 10.0, "float")
     # Suelo de tamaño: valor MÍNIMO de la posición en USDT (qty × precio),
     # NO margen. Con LEVERAGE=10, 9 USDT de nocional inmovilizan 0.9 de
     # margen. Evita posiciones de céntimos en cuentas pequeñas, donde las
@@ -131,8 +192,9 @@ class Config:
     # fuera evidente por qué. A 40% el corte baja a 22.5 USDT.
     MAX_NOTIONAL_PCT = _float("MAX_NOTIONAL_PCT", 40.0)
     LEVERAGE = _primera(["LEVERAGE"], 10, "int")
-    MAX_CONCURRENT_POSITIONS = _primera(
-        ["MAX_CONCURRENT_POSITIONS", "MAX_CONCURRENT", "MAX_TOTAL_POSITIONS"], 5, "int")
+    # Sin alias, por lo mismo: MAX_CONCURRENT de otro bot vale 1 y aquí
+    # dejaba el aforo en 1 en vez de 5.
+    MAX_CONCURRENT_POSITIONS = _primera(["MAX_CONCURRENT_POSITIONS"], 5, "int")
     MIN_BALANCE_USDT = _float("MIN_BALANCE_USDT", 0.0)
     # No abrir en un símbolo que ya tiene posición (propia o ajena): en
     # hedge se fusionarían y ningún bot sabría cuál es la suya.
