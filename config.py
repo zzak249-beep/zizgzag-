@@ -1,10 +1,8 @@
 """
-Configuración centralizada. Todo se lee de variables de entorno
-(Railway → Variables). Ver .env.example para la lista completa.
+config.py — Configuración del Sweep Reversal Map Bot.
 
-OJO con los nombres: este bot NO lee DRY_RUN, MODE ni LIVE_CONFIRMED
-(esas son de otros bots de la flota). Los únicos interruptores reales
-son AUTO_TRADE y BINGX_DEMO.
+Todo se lee de variables de entorno (Railway → Variables). Los valores
+por defecto reproducen los que aparecen en el log de arranque actual.
 """
 import os
 
@@ -14,133 +12,133 @@ def _bool(name, default="false"):
 
 
 def _str(name, default=""):
-    """Lee una variable de entorno y le quita espacios/saltos de línea
-    accidentales (Railway/copiar-pegar suele dejar un '\\n' al final,
-    lo que rompe cabeceras HTTP como X-BX-APIKEY con un ValueError)."""
+    """Quita espacios/saltos de línea accidentales: pegar variables en
+    Railway suele dejar un '\\n' al final, y eso rompe cabeceras HTTP
+    como X-BX-APIKEY con un ValueError críptico."""
     return os.getenv(name, default).strip()
 
 
-# --- BingX ---
-BINGX_API_KEY = _str("BINGX_API_KEY")
-BINGX_API_SECRET = _str("BINGX_API_SECRET")
-BINGX_BASE_URL = _str("BINGX_BASE_URL", "https://open-api.bingx.com")
-BINGX_DEMO = _bool("BINGX_DEMO", "true")  # usa VST (demo trading) por defecto
-
-# Modo de posición de la cuenta. HEDGE (por defecto) manda positionSide
-# explícito y NUNCA el campo reduceOnly, que BingX rechaza con el error
-# 109400 en ese modo. Ponlo a false solo si la cuenta está en One-Way.
-HEDGE_MODE = _bool("HEDGE_MODE", "true")
-
-# --- Telegram ---
-TELEGRAM_BOT_TOKEN = _str("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = _str("TELEGRAM_CHAT_ID")
-
-# --- Webhook ---
-WEBHOOK_SECRET = _str("WEBHOOK_SECRET")  # token que añades a la URL de la alerta
-
-# --- Modo de operación ---
-# AUTO_TRADE=false  -> solo reenvía la señal a Telegram, no ejecuta nada (modo manual)
-# AUTO_TRADE=true   -> ejecuta la orden en BingX y además avisa por Telegram
-AUTO_TRADE = _bool("AUTO_TRADE", "false")
-
-# --- Riesgo / cuenta ---
-RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "2.0"))  # % del equity arriesgado (via SL)
-
-# Suelo de tamaño: valor MÍNIMO de la posición en USDT (nocional = qty ×
-# precio), NO margen. Con LEVERAGE=10, 9 USDT de nocional inmovilizan 0.9
-# USDT de margen.
-#
-# Por qué hace falta: el sizing por riesgo da nocional = riesgo / stop%.
-# En un símbolo con stop del 15% eso deja posiciones de céntimos, donde
-# las comisiones se comen cualquier resultado. Ponlo a 0 para desactivarlo.
-MIN_NOTIONAL_USDT = float(os.getenv("MIN_NOTIONAL_USDT", "9.0"))
-
-# Tope duro al subir hasta el suelo anterior: forzar el mínimo en un
-# símbolo de stop muy ancho puede arriesgar mucho más que
-# RISK_PCT_PER_TRADE. Si para llegar al mínimo hay que superar este % del
-# equity, la señal se DESCARTA en vez de operarse con un riesgo que no
-# habías autorizado.
-MAX_RISK_PCT_ABS = float(os.getenv("MAX_RISK_PCT_ABS", "4.0"))
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
-# Tope de seguridad ABSOLUTO, independiente de MAX_CONCURRENT_POSITIONS y del
-# estado local (que puede resetearse si Railway no tiene un Volume montado
-# para STATE_FILE). Se comprueba contra las posiciones REALES en BingX que
-# sean DE ESTE BOT -- no contra toda la cuenta: la comparten otros bots y
-# operativa manual, y contarlo todo bloqueaba este bot por posiciones ajenas.
-HARD_MAX_TOTAL_POSITIONS = int(os.getenv("HARD_MAX_TOTAL_POSITIONS", "5"))
-
-# Volumen mínimo en USDT de las últimas 24h para que un símbolo se vigile
-# en modo SYMBOLS=ALL. Filtra alts ilíquidos donde el spread/slippage real
-# se come cualquier ventaja del filtro antes de que se mueva el precio
-# (ver RESEARCH.md sección 5). No aplica si SYMBOLS es una lista explícita.
-MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "2000000"))
-
-# Prefijos de símbolo a excluir del universo (BASE del par, separados por
-# coma). Ej. EXCLUDE_PREFIXES="NC" descarta NCCOGOLD2USD-USDT y compañía.
-# Esta variable existía en Railway pero NADIE la leía en este repo, así que
-# no filtraba nada: ahora la aplica bingx_client.get_all_symbols().
-EXCLUDE_PREFIXES = tuple(
-    p.strip().upper() for p in _str("EXCLUDE_PREFIXES", "").split(",") if p.strip()
-)
-
-# --- Circuit breaker ---
-MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
-MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "6.0"))
-
-# --- Persistencia ---
-STATE_FILE = _str("STATE_FILE", "state.json")
-
-# --- Origen de la señal ---
-# "python": el propio bot calcula la señal wavelet leyendo velas de BingX
-#           cada 5 minutos (NO necesita plan de pago de TradingView).
-# "tradingview": usa el webhook de TradingView como hasta ahora (requiere
-#                plan Essential o superior para alertas por webhook).
-SIGNAL_SOURCE = _str("SIGNAL_SOURCE", "python")
-ENABLE_SCHEDULER = _bool("ENABLE_SCHEDULER", "true")  # los tests lo ponen a false
-
-# Temporalidad de las velas y cada cuántos minutos barre el poller. Deben
-# coincidir: con velas de 5m y un barrido cada 15 se perderían señales, y
-# al revés se evaluaría varias veces la misma vela.
-SIGNAL_TIMEFRAME = _str("SIGNAL_TIMEFRAME", _str("TIMEFRAME", "5m"))
-SIGNAL_INTERVAL_MINUTES = int(_str("SIGNAL_INTERVAL_MINUTES", "5"))
-
-# Símbolos a vigilar en formato BingX (BASE-QUOTE), separados por coma.
-# Escribe "ALL" para que el bot descubra y vigile TODOS los perpetuos
-# USDT-margin de BingX automáticamente (ver scanner.py / poller.py).
-_symbols_raw = _str("SYMBOLS", "BTC-USDT")
-SCAN_ALL_SYMBOLS = _symbols_raw.strip().upper() == "ALL"
-SYMBOLS = [] if SCAN_ALL_SYMBOLS else [s.strip().upper() for s in _symbols_raw.split(",") if s.strip()]
-
-# Cuántos símbolos como máximo procesa un ciclo del escaneo "ALL" (evita
-# ciclos de 5 min que tarden demasiado si BingX tiene cientos de perpetuos).
-SCAN_ALL_MAX_SYMBOLS = int(_str("SCAN_ALL_MAX_SYMBOLS", "150"))
-# Cada cuántas horas se refresca la lista de símbolos en modo "ALL"
-SCAN_ALL_REFRESH_HOURS = float(_str("SCAN_ALL_REFRESH_HOURS", "6"))
-
-# Resumen periódico por Telegram del estado del filtro en todo el universo
-# vigilado (puramente informativo, no ejecuta nada)
-SCAN_REPORT_ENABLED = _bool("SCAN_REPORT_ENABLED", "false")
-SCAN_REPORT_INTERVAL_HOURS = float(_str("SCAN_REPORT_INTERVAL_HOURS", "4"))
-
-# --- Parámetros del filtro Wavelet MRA Haar (equivalentes a los inputs del Pine) ---
-WAVELET_LOOKBACK_ENERGY = int(_str("WAVELET_LOOKBACK_ENERGY", "40"))
-WAVELET_K_DOMINANCE = float(_str("WAVELET_K_DOMINANCE", "1.5"))
-WAVELET_COOLDOWN_BARS = int(_str("WAVELET_COOLDOWN_BARS", "4"))
-WAVELET_ATR_LENGTH = int(_str("WAVELET_ATR_LENGTH", "14"))
-WAVELET_ATR_MULT_SL = float(_str("WAVELET_ATR_MULT_SL", "1.5"))
-WAVELET_ATR_MULT_TP = float(_str("WAVELET_ATR_MULT_TP", "2.5"))
+def _int(name, default):
+    try:
+        return int(_str(name, str(default)))
+    except ValueError:
+        return int(default)
 
 
-# --- Mapeo símbolo TradingView -> BingX ---
-# TradingView suele mandar "BTCUSDT" o "BTCUSDT.P". BingX quiere "BTC-USDT".
-def tv_symbol_to_bingx(tv_symbol: str) -> str:
-    s = tv_symbol.upper().replace(".P", "").replace("PERP", "")
-    if "-" in s:
-        return s
-    # separar el par asumiendo que termina en USDT/USDC/USD
-    for quote in ("USDT", "USDC", "USD"):
-        if s.endswith(quote):
-            base = s[: -len(quote)]
-            return f"{base}-{quote}"
-    return s
+def _float(name, default):
+    try:
+        return float(_str(name, str(default)))
+    except ValueError:
+        return float(default)
+
+
+class Config:
+    # --- BingX ---
+    BINGX_API_KEY = _str("BINGX_API_KEY")
+    BINGX_API_SECRET = _str("BINGX_API_SECRET")
+    BINGX_BASE_URL = _str("BINGX_BASE_URL", "https://open-api.bingx.com")
+    BINGX_RECV_WINDOW_MS = _int("BINGX_RECV_WINDOW_MS", 5000)
+
+    # DEMO_MODE opera contra el saldo de práctica (sufijo -VST).
+    DEMO_MODE = _bool("DEMO_MODE", "false")
+
+    # Interruptor real de ejecución. Con LIVE_TRADING=false el bot calcula
+    # señales y avisa por Telegram, pero no manda ninguna orden.
+    LIVE_TRADING = _bool("LIVE_TRADING", "false")
+
+    # --- Telegram ---
+    TELEGRAM_BOT_TOKEN = _str("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID = _str("TELEGRAM_CHAT_ID")
+
+    # --- Universo y ritmo ---
+    SYMBOLS = _str("SYMBOLS", "BTC-USDT")   # "ALL" para todos los perpetuos USDT-M
+    TIMEFRAME = _str("TIMEFRAME", "5m")
+    POLL_INTERVAL_SECONDS = _int("POLL_INTERVAL_SECONDS", 60)
+    # El escaneo va por lotes para no abrir cientos de conexiones a la vez
+    # ni comerse el rate limit de BingX.
+    SYMBOL_BATCH_SIZE = _int("SYMBOL_BATCH_SIZE", 20)
+    SYMBOL_BATCH_DELAY_SECONDS = _float("SYMBOL_BATCH_DELAY_SECONDS", 1.0)
+
+    # --- Motor de señal (sweep_engine) ---
+    SWING_LENGTH = _int("SWING_LENGTH", 5)
+    STRUCTURE_LENGTH = _int("STRUCTURE_LENGTH", 3)
+    MAX_CONFIRMATION_BARS = _int("MAX_CONFIRMATION_BARS", 12)
+    MIN_DISPLACEMENT_ATR = _float("MIN_DISPLACEMENT_ATR", 0.2)
+    ATR_LENGTH = _int("ATR_LENGTH", 14)
+
+    # --- Salidas ---
+    # El SL va al nivel barrido con un colchón en ATR (si se pone justo en
+    # el nivel, el mismo ruido que provocó el barrido lo toca enseguida).
+    SL_ATR_BUFFER = _float("SL_ATR_BUFFER", 0.3)
+    TP_RR = _float("TP_RR", 2.0)
+
+    # --- Riesgo / cuenta ---
+    # OJO: QTY_PCT es porcentaje del equity en NOCIONAL, no riesgo. El
+    # riesgo real de cada operación depende de dónde caiga el nivel
+    # barrido y varía entre entradas.
+    QTY_PCT = _float("QTY_PCT", 10.0)
+    # Suelo de tamaño: valor MÍNIMO de la posición en USDT (qty × precio),
+    # NO margen. Con LEVERAGE=10, 9 USDT de nocional inmovilizan 0.9 de
+    # margen. Evita posiciones de céntimos en cuentas pequeñas, donde las
+    # comisiones se comen cualquier resultado. 0 lo desactiva.
+    MIN_NOTIONAL_USDT = _float("MIN_NOTIONAL_USDT", 9.0)
+    # Freno del suelo anterior: si forzar el mínimo supera este % del
+    # equity, se descarta la señal en vez de abrir algo desproporcionado.
+    MAX_NOTIONAL_PCT = _float("MAX_NOTIONAL_PCT", 25.0)
+    LEVERAGE = _int("LEVERAGE", 10)
+    MAX_CONCURRENT_POSITIONS = _int("MAX_CONCURRENT_POSITIONS", 5)
+    MIN_BALANCE_USDT = _float("MIN_BALANCE_USDT", 0.0)
+    # No abrir en un símbolo que ya tiene posición (propia o ajena): en
+    # hedge se fusionarían y ningún bot sabría cuál es la suya.
+    SKIP_IF_SYMBOL_HAS_POSITION = _bool("SKIP_IF_SYMBOL_HAS_POSITION", "true")
+
+    # --- Infra ---
+    HEALTH_PORT = _int("PORT", 8080)
+    LOG_LEVEL = _str("LOG_LEVEL", "INFO")
+
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def validate(cls) -> None:
+        """Falla al arrancar en vez de a mitad del primer ciclo."""
+        errores = []
+
+        if cls.LIVE_TRADING and not (cls.BINGX_API_KEY and cls.BINGX_API_SECRET):
+            errores.append("LIVE_TRADING=true pero faltan BINGX_API_KEY/BINGX_API_SECRET")
+
+        if cls.TIMEFRAME[-1].lower() not in ("m", "h", "d"):
+            errores.append(f"TIMEFRAME no soportado: {cls.TIMEFRAME}")
+
+        if cls.MAX_CONCURRENT_POSITIONS < 1:
+            errores.append("MAX_CONCURRENT_POSITIONS debe ser >= 1")
+
+        if cls.QTY_PCT <= 0 or cls.QTY_PCT > 100:
+            errores.append(f"QTY_PCT fuera de rango: {cls.QTY_PCT}")
+
+        if cls.TP_RR <= 0:
+            errores.append(f"TP_RR debe ser > 0: {cls.TP_RR}")
+
+        # Aviso, no error: es una configuración legítima pero arriesgada, y
+        # conviene que quede escrito en el log del arranque.
+        exposicion = cls.QTY_PCT * cls.MAX_CONCURRENT_POSITIONS
+        if exposicion > 100:
+            print(f"⚠️  AVISO: QTY_PCT={cls.QTY_PCT}% × {cls.MAX_CONCURRENT_POSITIONS} "
+                  f"posiciones = {exposicion}% del equity en nocional simultáneo.")
+
+        if errores:
+            raise SystemExit("Configuración inválida:\n  - " + "\n  - ".join(errores))
+
+    @classmethod
+    def summary(cls) -> str:
+        modo = "DEMO/VST" if cls.DEMO_MODE else "REAL"
+        trading = "ACTIVO (envía órdenes reales)" if cls.LIVE_TRADING else "SOLO SEÑALES"
+        return (
+            "Sweep Reversal Map — BingX\n"
+            f"Modo cuenta: {modo} | Trading: {trading}\n"
+            f"Símbolos: {cls.SYMBOLS} | Timeframe: {cls.TIMEFRAME}\n"
+            f"qty_pct={cls.QTY_PCT}% | leverage={cls.LEVERAGE}x | "
+            f"max_posiciones_simultaneas={cls.MAX_CONCURRENT_POSITIONS}\n"
+            f"swing={cls.SWING_LENGTH} | structure={cls.STRUCTURE_LENGTH} | "
+            f"max_confirmation_bars={cls.MAX_CONFIRMATION_BARS} | "
+            f"min_displacement={cls.MIN_DISPLACEMENT_ATR}x ATR\n"
+            f"SL: nivel barrido ± {cls.SL_ATR_BUFFER}x ATR | TP: RR {cls.TP_RR}x"
+        )
