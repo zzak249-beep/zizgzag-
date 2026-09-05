@@ -88,6 +88,9 @@ class Bot:
         # ocupar la misma.
         self._own_lock = threading.Lock()
         self._own: dict[tuple, dict] = {}
+        # Motivos por los que se descartaron señales en el ciclo. Sin
+        # esto, "no abre trades" obliga a adivinar entre diez causas.
+        self._descartes: dict[str, int] = {}
         # Símbolos ocupados por posiciones que NO son de este bot: no se
         # abre encima de ellas, pero tampoco cuentan para el aforo.
         self._foreign_symbols: set[str] = set()
@@ -154,6 +157,10 @@ class Bot:
     def _confirm_slot(self, symbol: str, side: str, info: dict) -> None:
         with self._own_lock:
             self._own[(symbol, side)] = {"reserved": False, **info}
+
+    def _descartar(self, motivo: str) -> None:
+        with self._own_lock:
+            self._descartes[motivo] = self._descartes.get(motivo, 0) + 1
 
     def own_count(self) -> int:
         with self._own_lock:
@@ -294,6 +301,7 @@ class Bot:
         # división por cero en el sizing) o del lado equivocado, que se
         # dispararía nada más abrir.
         if sl_price <= 0 or tp_price <= 0 or sl_price == entry_price:
+            self._descartar("SL/TP invalidos tras el calculo")
             logger.warning("%s: SL/TP inválidos tras el cálculo (SL=%s TP=%s entrada=%s), señal descartada",
                            symbol, sl_price, tp_price, entry_price)
             return
@@ -307,6 +315,7 @@ class Bot:
             return
 
         if Config.MIN_BALANCE_USDT and equity < Config.MIN_BALANCE_USDT:
+            self._descartar("balance por debajo de MIN_BALANCE_USDT")
             self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False,
                             reason="balance por debajo del mínimo configurado")
             return
@@ -318,10 +327,12 @@ class Bot:
             max_notional_pct=Config.MAX_NOTIONAL_PCT,
         )
         if not sizing.ok:
+            self._descartar(f"sizing: {sizing.reason[:60]}")
             self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False, reason=sizing.reason)
             return
 
         if not Config.LIVE_TRADING:
+            self._descartar("LIVE_TRADING desactivado")
             self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False,
                             reason="LIVE_TRADING desactivado")
             return
@@ -329,6 +340,7 @@ class Bot:
         # Reserva de plaza: a partir de aquí el aforo ya cuenta esta
         # entrada, así que ningún otro hilo puede ocupar la misma.
         if not self._reserve_slot(symbol, side):
+            self._descartar("aforo lleno o simbolo ya ocupado")
             self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False,
                             reason="máximo de posiciones simultáneas alcanzado")
             return
@@ -383,7 +395,14 @@ class Bot:
         Config.validate()
         start_health_server(Config.HEALTH_PORT)
         logger.info("Iniciando bot.\n%s", Config.summary())
+        # Por qué podría NO abrir operaciones. Va al log SIEMPRE: si el
+        # bot está en modo señal por una variable mal nombrada, aquí se
+        # ve en una línea en vez de deducirlo por ausencia de órdenes.
+        logger.info("%s", Config.diagnostico())
         self.tg.info("Bot iniciado.\n" + Config.summary())
+        if not Config.LIVE_TRADING:
+            self.tg.info("⚠️ LIVE_TRADING desactivado: este bot NO va a mandar "
+                         "órdenes, solo avisos.")
 
         self.refresh_contracts(force=True)
 
@@ -403,6 +422,16 @@ class Bot:
                     with ThreadPoolExecutor(max_workers=len(batch)) as pool:
                         list(pool.map(lambda s: self.process_symbol(s, equity), batch))
                     time.sleep(Config.SYMBOL_BATCH_DELAY_SECONDS)
+
+                with self._own_lock:
+                    descartes = dict(self._descartes)
+                    self._descartes.clear()
+                if descartes:
+                    logger.info("Señales descartadas este ciclo: %s",
+                                ", ".join(f"{k} x{v}" for k, v in sorted(descartes.items())))
+                else:
+                    logger.info("Ciclo sin señales descartadas (aforo %d/%d)",
+                                self.own_count(), Config.MAX_CONCURRENT_POSITIONS)
 
             except Exception as exc:
                 logger.exception("Error en el ciclo principal: %s", exc)

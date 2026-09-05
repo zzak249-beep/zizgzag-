@@ -32,6 +32,44 @@ def _float(name, default):
         return float(default)
 
 
+# Nombres de variable que se encontraron y cuáles no: se imprime al
+# arrancar. Sin esto, una variable con otro nombre en Railway hace que
+# el bot coja el default en silencio -- y si el default es "no operar",
+# el bot parece roto sin estarlo.
+VARIABLES_ENCONTRADAS = {}
+
+
+def _primera(nombres, default, tipo="str"):
+    """Lee la primera variable de entorno que exista de la lista.
+
+    La flota ha usado nombres distintos para el mismo interruptor
+    (LIVE_TRADING, AUTO_TRADE, MODE=LIVE...). En vez de fallar en
+    silencio con el default, se prueban todos y se deja constancia de
+    cuál se usó.
+    """
+    for nombre in nombres:
+        crudo = os.getenv(nombre)
+        if crudo is None or not crudo.strip():
+            continue
+        crudo = crudo.strip()
+        VARIABLES_ENCONTRADAS[nombres[0]] = f"{nombre}={crudo}"
+        if tipo == "bool":
+            return crudo.lower() in ("1", "true", "yes", "on", "live", "real")
+        if tipo == "int":
+            try:
+                return int(float(crudo))
+            except ValueError:
+                return default
+        if tipo == "float":
+            try:
+                return float(crudo)
+            except ValueError:
+                return default
+        return crudo
+    VARIABLES_ENCONTRADAS[nombres[0]] = f"(ninguna encontrada, default={default})"
+    return default
+
+
 class Config:
     # --- BingX ---
     BINGX_API_KEY = _str("BINGX_API_KEY")
@@ -40,18 +78,22 @@ class Config:
     BINGX_RECV_WINDOW_MS = _int("BINGX_RECV_WINDOW_MS", 5000)
 
     # DEMO_MODE opera contra el saldo de práctica (sufijo -VST).
-    DEMO_MODE = _bool("DEMO_MODE", "false")
+    DEMO_MODE = _primera(["DEMO_MODE", "BINGX_DEMO"], False, "bool")
 
     # Interruptor real de ejecución. Con LIVE_TRADING=false el bot calcula
     # señales y avisa por Telegram, pero no manda ninguna orden.
-    LIVE_TRADING = _bool("LIVE_TRADING", "false")
+    # Se aceptan los nombres que la flota ha usado para lo mismo. Si
+    # ninguno existe, NO se opera: el default seguro es no mandar órdenes.
+    LIVE_TRADING = _primera(
+        ["LIVE_TRADING", "AUTO_TRADE", "TRADING_ACTIVO", "MODE", "LIVE_CONFIRMED"],
+        False, "bool")
 
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN = _str("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = _str("TELEGRAM_CHAT_ID")
 
     # --- Universo y ritmo ---
-    SYMBOLS = _str("SYMBOLS", "BTC-USDT")   # "ALL" para todos los perpetuos USDT-M
+    SYMBOLS = _primera(["SYMBOLS", "SYMBOL_WHITELIST"], "BTC-USDT")  # "ALL" = todos los USDT-M
     TIMEFRAME = _str("TIMEFRAME", "5m")
     POLL_INTERVAL_SECONDS = _int("POLL_INTERVAL_SECONDS", 60)
     # El escaneo va por lotes para no abrir cientos de conexiones a la vez
@@ -76,7 +118,7 @@ class Config:
     # OJO: QTY_PCT es porcentaje del equity en NOCIONAL, no riesgo. El
     # riesgo real de cada operación depende de dónde caiga el nivel
     # barrido y varía entre entradas.
-    QTY_PCT = _float("QTY_PCT", 10.0)
+    QTY_PCT = _primera(["QTY_PCT", "RISK_PCT", "RISK_PCT_PER_TRADE"], 10.0, "float")
     # Suelo de tamaño: valor MÍNIMO de la posición en USDT (qty × precio),
     # NO margen. Con LEVERAGE=10, 9 USDT de nocional inmovilizan 0.9 de
     # margen. Evita posiciones de céntimos en cuentas pequeñas, donde las
@@ -84,9 +126,13 @@ class Config:
     MIN_NOTIONAL_USDT = _float("MIN_NOTIONAL_USDT", 9.0)
     # Freno del suelo anterior: si forzar el mínimo supera este % del
     # equity, se descarta la señal en vez de abrir algo desproporcionado.
-    MAX_NOTIONAL_PCT = _float("MAX_NOTIONAL_PCT", 25.0)
-    LEVERAGE = _int("LEVERAGE", 10)
-    MAX_CONCURRENT_POSITIONS = _int("MAX_CONCURRENT_POSITIONS", 5)
+    # 40% y no 25%: con MIN_NOTIONAL_USDT=9 y un tope del 25%, cualquier
+    # equity por debajo de 36 USDT rechazaba TODAS las señales sin que
+    # fuera evidente por qué. A 40% el corte baja a 22.5 USDT.
+    MAX_NOTIONAL_PCT = _float("MAX_NOTIONAL_PCT", 40.0)
+    LEVERAGE = _primera(["LEVERAGE"], 10, "int")
+    MAX_CONCURRENT_POSITIONS = _primera(
+        ["MAX_CONCURRENT_POSITIONS", "MAX_CONCURRENT", "MAX_TOTAL_POSITIONS"], 5, "int")
     MIN_BALANCE_USDT = _float("MIN_BALANCE_USDT", 0.0)
     # No abrir en un símbolo que ya tiene posición (propia o ajena): en
     # hedge se fusionarían y ningún bot sabría cuál es la suya.
@@ -126,6 +172,44 @@ class Config:
 
         if errores:
             raise SystemExit("Configuración inválida:\n  - " + "\n  - ".join(errores))
+
+    @classmethod
+    def diagnostico(cls) -> str:
+        """Por qué el bot podría no estar abriendo operaciones.
+
+        Se imprime al arrancar. Recorre todas las puertas en el mismo
+        orden en que las evalúa _handle_entry, para que la causa sea
+        visible en el log en vez de haber que deducirla.
+        """
+        lineas = ["── Diagnóstico: ¿puede abrir operaciones? ──"]
+
+        if not cls.LIVE_TRADING:
+            lineas.append("  ❌ NO. Trading desactivado -> no se manda ninguna orden.")
+            lineas.append("     Define LIVE_TRADING=true (o AUTO_TRADE=true) en Railway.")
+        else:
+            lineas.append("  ✅ Trading activado.")
+
+        if not (cls.BINGX_API_KEY and cls.BINGX_API_SECRET):
+            lineas.append("  ❌ Faltan BINGX_API_KEY / BINGX_API_SECRET.")
+
+        if cls.DEMO_MODE:
+            lineas.append("  ⚠️  DEMO_MODE activo: órdenes contra saldo de práctica (-VST).")
+
+        corte = cls.MIN_NOTIONAL_USDT / (cls.MAX_NOTIONAL_PCT / 100.0) if cls.MAX_NOTIONAL_PCT else 0
+        if corte:
+            lineas.append(
+                f"  ℹ️  Suelo de nocional {cls.MIN_NOTIONAL_USDT} USDT con tope "
+                f"{cls.MAX_NOTIONAL_PCT}%: con equity < {corte:.2f} USDT se "
+                f"rechazan TODAS las señales.")
+
+        if cls.MIN_BALANCE_USDT:
+            lineas.append(f"  ℹ️  MIN_BALANCE_USDT={cls.MIN_BALANCE_USDT}: por debajo no se opera.")
+
+        lineas.append("  Variables leídas del entorno:")
+        for clave, valor in sorted(VARIABLES_ENCONTRADAS.items()):
+            lineas.append(f"    {clave}: {valor}")
+
+        return "\n".join(lineas)
 
     @classmethod
     def summary(cls) -> str:
