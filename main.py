@@ -37,7 +37,7 @@ from bingx_client import BingXClient, BingXAPIError, ERR_POSITION_NOT_EXIST
 from config import Config
 import risk_manager
 import sweep_engine
-from state_manager import StateManager, timeframe_to_ms
+from state_manager import StateManager
 from telegram_notifier import TelegramNotifier
 
 logging.basicConfig(
@@ -46,6 +46,64 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("sweep_bot.main")
+
+
+def timeframe_to_ms(timeframe: str) -> int:
+    """'5m' -> 300000.
+
+    Definida AQUÍ y no importada de state_manager: el repo ha tenido
+    varias versiones de ese módulo y no todas la exportan, lo que hacía
+    caer el arranque con ImportError antes de ejecutar una sola línea.
+    main.py no debe romperse por qué versión de state_manager haya.
+    """
+    unit = timeframe[-1].lower()
+    value = int(timeframe[:-1])
+    mult = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}.get(unit)
+    if mult is None:
+        raise ValueError(f"Timeframe no soportado: {timeframe}")
+    return value * mult
+
+
+class _CooldownSeñales:
+    """Respaldo mínimo por si el StateManager del repo no trae los
+    métodos de cooldown/leverage. Se usa solo lo que falte, así que un
+    state_manager completo sigue mandando."""
+
+    def __init__(self):
+        self._ultima = {}
+        self._leverage = set()
+
+    def can_signal(self, symbol, candle_time_ms, cooldown_bars, timeframe_ms):
+        last = self._ultima.get(symbol)
+        if last is None:
+            return True
+        return (candle_time_ms - last) / timeframe_ms >= cooldown_bars
+
+    def mark_signal(self, symbol, candle_time_ms):
+        self._ultima[symbol] = candle_time_ms
+
+    def leverage_already_set(self, symbol):
+        return symbol in self._leverage
+
+    def mark_leverage_set(self, symbol):
+        self._leverage.add(symbol)
+
+
+def _con_respaldo(state):
+    """Rellena en el state manager los métodos que le falten.
+
+    Evita el AttributeError a mitad de ciclo -- que en un bot de trading
+    aparece justo cuando hay una señal, no al arrancar."""
+    respaldo = _CooldownSeñales()
+    faltan = []
+    for nombre in ("can_signal", "mark_signal", "leverage_already_set", "mark_leverage_set"):
+        if not hasattr(state, nombre):
+            setattr(state, nombre, getattr(respaldo, nombre))
+            faltan.append(nombre)
+    if faltan:
+        logger.warning("StateManager sin %s -- se usa el respaldo interno "
+                       "(el cooldown no sobrevivirá a un reinicio)", ", ".join(faltan))
+    return state
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -77,7 +135,7 @@ class Bot:
             recv_window_ms=Config.BINGX_RECV_WINDOW_MS,
         )
         self.tg = TelegramNotifier(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
-        self.state = StateManager()
+        self.state = _con_respaldo(StateManager())
         self.timeframe_ms = timeframe_to_ms(Config.TIMEFRAME)
         self._contracts: dict[str, dict] = {}
         self._contracts_fetched_at = 0.0
