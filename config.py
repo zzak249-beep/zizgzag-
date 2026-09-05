@@ -76,6 +76,26 @@ def _primera(nombres, default, tipo="str"):
 # cada deploy, Config resuelve el prefijo automáticamente.
 _PREFIJOS = ("SWEEP_", "WAVELET_")
 
+# Parámetros del motor que no estaban en config y hubo que inventar un
+# valor. NO son tuyos: son el valor NEUTRO (filtro desactivado), elegido
+# para no alterar la estrategia con un umbral inventado. Si tu Pine usa
+# otro, defínelo en Railway.
+#
+# La alternativa era que el bot siguiera cascando un símbolo tras otro.
+_DEFAULTS_NEUTROS = {
+    "MIN_PENETRATION_ATR": 0.0,      # 0 = no se exige penetración mínima
+    "MIN_DISPLACEMENT_ATR": 0.2,     # este sí sale de tu log de arranque
+    "MAX_PENETRATION_ATR": 999.0,    # sin techo
+    "MIN_SWEEP_ATR": 0.0,
+    "MIN_BODY_ATR": 0.0,
+    "MIN_WICK_RATIO": 0.0,
+    "BUFFER_ATR": 0.0,
+}
+
+# Nombres a los que se les aplicó un default neutro, para avisar al
+# arrancar en vez de que pase desapercibido.
+DEFAULTS_APLICADOS = {}
+
 
 class _ConfigMeta(type):
     """Resuelve atributos que no existen literalmente en Config.
@@ -88,7 +108,11 @@ class _ConfigMeta(type):
     """
 
     def __getattr__(cls, name):
-        if name.startswith("_"):
+        # Solo se resuelven nombres de CONSTANTE (mayúsculas). Sin este
+        # filtro, el metaclass intercepta también métodos y atributos
+        # internos de Python y devuelve un AttributeError con un mensaje
+        # sobre variables de Railway que no viene a cuento.
+        if name.startswith("_") or not name.isupper():
             raise AttributeError(name)
 
         crudo = os.getenv(name)
@@ -116,6 +140,16 @@ class _ConfigMeta(type):
             if valor is not None:
                 VARIABLES_ENCONTRADAS[name] = f"-> {alt} (alias)"
                 return valor
+
+        base = name
+        for pref in _PREFIJOS:
+            if base.startswith(pref):
+                base = base[len(pref):]
+                break
+        if base in _DEFAULTS_NEUTROS:
+            valor = _DEFAULTS_NEUTROS[base]
+            DEFAULTS_APLICADOS[name] = valor
+            return valor
 
         raise AttributeError(
             f"Config no tiene '{name}' ni un equivalente ({', '.join(candidatos)}). "
@@ -158,17 +192,38 @@ class Config(metaclass=_ConfigMeta):
     SYMBOL_BATCH_DELAY_SECONDS = _float("SYMBOL_BATCH_DELAY_SECONDS", 1.0)
 
     # --- Motor de señal (sweep_engine) ---
+    # Los nombres son EXACTAMENTE los que lee sweep_engine.replay_signal
+    # y compute_sweep_sl_tp. Los valores por defecto son los que aparecen
+    # en tu log de arranque original.
     SWING_LENGTH = _int("SWING_LENGTH", 5)
     STRUCTURE_LENGTH = _int("STRUCTURE_LENGTH", 3)
     MAX_CONFIRMATION_BARS = _int("MAX_CONFIRMATION_BARS", 12)
     MIN_DISPLACEMENT_ATR = _float("MIN_DISPLACEMENT_ATR", 0.2)
-    ATR_LENGTH = _int("ATR_LENGTH", 14)
+    SWEEP_ATR_LENGTH = _int("SWEEP_ATR_LENGTH", _int("ATR_LENGTH", 14))
+    ATR_LENGTH = SWEEP_ATR_LENGTH   # alias, mismo valor
+
+    # Penetración mínima por encima del swing para considerar que hubo
+    # barrido, en múltiplos de ATR. Con 0.0 basta con TOCAR el nivel:
+    #   high[i] >= swing_high + 0
+    # Es el valor neutro (filtro desactivado). Subirlo exige que el
+    # barrido sea más profundo y reduce los falsos disparos por un
+    # roce del nivel. No sé cuál usa tu Pine: si era otro, ponlo en
+    # Railway como MIN_PENETRATION_ATR.
+    MIN_PENETRATION_ATR = _float("MIN_PENETRATION_ATR", 0.0)
 
     # --- Salidas ---
     # El SL va al nivel barrido con un colchón en ATR (si se pone justo en
     # el nivel, el mismo ruido que provocó el barrido lo toca enseguida).
-    SL_ATR_BUFFER = _float("SL_ATR_BUFFER", 0.3)
-    TP_RR = _float("TP_RR", 2.0)
+    # El TP es un múltiplo de esa distancia de riesgo (RR).
+    #
+    # Nombres tal cual los pide compute_sweep_sl_tp: SWEEP_SL_ATR_BUFFER
+    # y SWEEP_RR_RATIO. Ojo, SWEEP_RR_RATIO NO se resolvía por el alias
+    # de prefijo (habría buscado "RR_RATIO", que no existía) -- habría
+    # sido el siguiente crash.
+    SWEEP_SL_ATR_BUFFER = _float("SWEEP_SL_ATR_BUFFER", _float("SL_ATR_BUFFER", 0.3))
+    SWEEP_RR_RATIO = _float("SWEEP_RR_RATIO", _float("TP_RR", 2.0))
+    SL_ATR_BUFFER = SWEEP_SL_ATR_BUFFER   # alias para summary()
+    TP_RR = SWEEP_RR_RATIO                # alias para summary()
 
     # --- Riesgo / cuenta ---
     # OJO: QTY_PCT es porcentaje del equity en NOCIONAL, no riesgo. El
@@ -285,6 +340,52 @@ class Config(metaclass=_ConfigMeta):
             f"max_posiciones_simultaneas={cls.MAX_CONCURRENT_POSITIONS}\n"
             f"swing={cls.SWING_LENGTH} | structure={cls.STRUCTURE_LENGTH} | "
             f"max_confirmation_bars={cls.MAX_CONFIRMATION_BARS} | "
-            f"min_displacement={cls.MIN_DISPLACEMENT_ATR}x ATR\n"
+            f"min_displacement={cls.MIN_DISPLACEMENT_ATR}x ATR | "
+            f"min_penetration={cls.MIN_PENETRATION_ATR}x ATR\n"
             f"SL: nivel barrido ± {cls.SL_ATR_BUFFER}x ATR | TP: RR {cls.TP_RR}x"
         )
+
+
+# --------------------------------------------------------------------- #
+def parametros_que_pide(ruta_modulo: str = "sweep_engine.py"):
+    """Lee el CÓDIGO de sweep_engine y saca todos los `params.X` que usa.
+
+    Sirve para dejar de descubrir parámetros que faltan de uno en uno,
+    con un crash por deploy. Se ejecuta al arrancar y reporta la lista
+    completa: los que Config resuelve, los que caen a un default neutro
+    y los que no existen.
+
+    Devuelve (resueltos, con_default, ausentes).
+    """
+    import ast
+    import os.path
+
+    if not os.path.exists(ruta_modulo):
+        return [], [], []
+
+    try:
+        arbol = ast.parse(open(ruta_modulo, encoding="utf-8").read())
+    except Exception:
+        return [], [], []
+
+    nombres = set()
+    for nodo in ast.walk(arbol):
+        # params.X / cfg.X / config.X / Config.X
+        if isinstance(nodo, ast.Attribute) and isinstance(nodo.value, ast.Name):
+            if nodo.value.id in ("params", "cfg", "config", "Config"):
+                if nodo.attr.isupper():
+                    nombres.add(nodo.attr)
+
+    resueltos, con_default, ausentes = [], [], []
+    for nombre in sorted(nombres):
+        antes = dict(DEFAULTS_APLICADOS)
+        try:
+            getattr(Config, nombre)
+        except AttributeError:
+            ausentes.append(nombre)
+            continue
+        if nombre in DEFAULTS_APLICADOS and nombre not in antes:
+            con_default.append(nombre)
+        else:
+            resueltos.append(nombre)
+    return resueltos, con_default, ausentes

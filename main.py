@@ -457,6 +457,30 @@ class Bot:
         # bot está en modo señal por una variable mal nombrada, aquí se
         # ve en una línea en vez de deducirlo por ausencia de órdenes.
         logger.info("%s", Config.diagnostico())
+
+        # Auditoría de parámetros: lee sweep_engine.py y comprueba TODOS
+        # los `params.X` que usa, de una vez. Sin esto, cada parámetro
+        # ausente se descubría con un crash por ciclo y por símbolo.
+        try:
+            import config as _cfg_mod
+            resueltos, con_default, ausentes = _cfg_mod.parametros_que_pide()
+            if resueltos or con_default or ausentes:
+                logger.info("── Parámetros que pide sweep_engine ──")
+                if resueltos:
+                    logger.info("  ✅ resueltos (%d): %s", len(resueltos), ", ".join(resueltos))
+                if con_default:
+                    logger.warning("  ⚠️  con valor NEUTRO inventado (%d): %s",
+                                   len(con_default), ", ".join(con_default))
+                    logger.warning("     No son tus valores. Defínelos en Railway si tu "
+                                   "Pine usa otros, o la estrategia no será la misma.")
+                if ausentes:
+                    logger.error("  ❌ SIN resolver (%d): %s", len(ausentes), ", ".join(ausentes))
+                    logger.error("     El bot va a fallar al evaluar señales hasta que "
+                                 "los definas como variables en Railway.")
+                    self.tg.error("parámetros del motor",
+                                  "Faltan por definir: " + ", ".join(ausentes))
+        except Exception:
+            logger.exception("No se pudo auditar los parámetros de sweep_engine")
         self.tg.info("Bot iniciado.\n" + Config.summary())
         if not Config.LIVE_TRADING:
             self.tg.info("⚠️ LIVE_TRADING desactivado: este bot NO va a mandar "
