@@ -133,6 +133,9 @@ class Bot:
         self.client = BingXClient(
             Config.BINGX_API_KEY, Config.BINGX_API_SECRET, Config.BINGX_BASE_URL,
             recv_window_ms=Config.BINGX_RECV_WINDOW_MS,
+            # El pool debe cubrir todos los hilos del lote; si se queda
+            # corto, cada llamada extra abre y tira una conexión nueva.
+            pool_maxsize=max(16, Config.SYMBOL_BATCH_SIZE + 8),
         )
         self.tg = TelegramNotifier(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
         self.state = _con_respaldo(StateManager())

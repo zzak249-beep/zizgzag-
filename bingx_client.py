@@ -69,7 +69,7 @@ class BingXAPIError(Exception):
 
 class BingXClient:
     def __init__(self, api_key: str, api_secret: str, base_url: str, recv_window_ms: int = 5000,
-                 timeout: float = 15.0, max_retries: int = 3):
+                 timeout: float = 15.0, max_retries: int = 3, pool_maxsize: int = 32):
         self.api_key = api_key
         self.api_secret = api_secret.encode("utf-8")
         self.base_url = base_url.rstrip("/")
@@ -78,6 +78,25 @@ class BingXClient:
         self.max_retries = max_retries
         self._session = requests.Session()
         self._session.headers.update({"X-BX-APIKEY": self.api_key})
+
+        # Pool de conexiones dimensionado a la concurrencia real. El
+        # default de requests es pool_maxsize=10; el escaneo lanza un
+        # hilo por símbolo del lote (SYMBOL_BATCH_SIZE, 20 por defecto),
+        # así que las conexiones que no caben se crean, se usan y se
+        # descartan -- un handshake TLS nuevo por llamada y el log lleno
+        # de "Connection pool is full, discarding connection".
+        #
+        # pool_block=True: si no hay hueco, el hilo ESPERA en vez de
+        # abrir una conexión de usar y tirar. Además actúa como freno
+        # natural contra el rate limit de BingX.
+        adaptador = requests.adapters.HTTPAdapter(
+            pool_connections=pool_maxsize,
+            pool_maxsize=pool_maxsize,
+            pool_block=True,
+            max_retries=0,   # los reintentos los gestiona _request
+        )
+        self._session.mount("https://", adaptador)
+        self._session.mount("http://", adaptador)
         self._contract_cache: dict[str, dict] = {}
         self._contract_cache_ts: float = 0.0
 
