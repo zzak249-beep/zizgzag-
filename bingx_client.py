@@ -1,274 +1,292 @@
 """
-bingx_client.py — Cliente REST para BingX Perpetual Futures (USDT-M).
+Cliente para BingX Perpetual Swap (v2) — repo joyful-art.
 
-Notas de implementación importantes (aprendidas de bots anteriores en
-esta misma cuenta, ver README):
+Firma HMAC-SHA256: el query string se construye UNA sola vez, ordenado,
+y se usa exactamente igual para firmar y para enviar (evita el bug clásico
+de firmar en un orden y transmitir en otro).
 
-1. TODO va en el query string de la URL, incluida la firma, incluso en
-   peticiones POST. El body se manda siempre vacío. Si se deja que
-   `requests` serialice el dict por su cuenta (params=... o data=...)
-   puede re-codificarlo de forma distinta a como se firmó -> error de
-   firma 100001. Por eso aquí se construye la URL final a mano y se
-   pasa tal cual, sin params/data adicionales.
-2. Cuenta en modo Hedge: para abrir se usa side=BUY/SELL con
-   positionSide=LONG/SHORT; para cerrar se manda el side contrario
-   manteniendo el mismo positionSide (NUNCA reduceOnly ni
-   positionSide=BOTH).
-3. Los klines se devuelven como lista de objetos con claves nombradas
-   ("open","close","high","low","volume","time") y NO como arrays
-   posicionales — nótese que "close" va antes que "high" en la
-   respuesta real de BingX. Aquí se parsea siempre por nombre de
-   clave para no repetir ese bug.
-4. Se manda siempre recvWindow para evitar firmas rechazadas por
-   desfases de reloj.
-5. Símbolos en formato "BASE-QUOTE" (ej. "BTC-USDT"). En DEMO_MODE se
-   usa el sufijo "-VST" (saldo de práctica de BingX) en vez de
-   "-USDT", sobre el mismo API.
-6. El SL y el TP van como ÓRDENES CONDICIONALES SEPARADAS con stopPrice
-   numérico, no como JSON embebido en la orden de entrada. El JSON
-   embebido obliga a decidir si se percent-codifica antes de firmar, y
-   ahí es donde se rompen las firmas. A cambio queda una ventana entre
-   la entrada y el SL en la que la posición está desnuda -> por eso
-   open_protected_position() verifica y, si no consigue proteger,
-   CIERRA.
+CORRECCIONES respecto a la versión anterior:
+  - En modo HEDGE, BingX rechaza con 109400 cualquier orden que lleve el
+    campo reduceOnly, TAMBIÉN al cerrar. El comentario anterior decía que
+    solo fallaba al abrir; era falso, y por eso close_position() no
+    funcionaba nunca: ni el cierre normal ni el de emergencia ni el
+    /emergency-stop. En hedge no hace falta el campo: side + positionSide
+    ya determinan que se reduce.
+  - Se cierra por el positionAmt REAL leído de BingX, no por la cantidad
+    calculada al abrir (difieren tras fills parciales o SL/TP parciales).
+  - get_symbol_filters filtra por símbolo: /quote/contracts puede ignorar
+    el parámetro y devolver la lista entera, y coger el primero a ciegas
+    daba la precisión de OTRO contrato.
+  - open_protected_position(): abre y no deja la posición sin stop.
 """
-
-from __future__ import annotations
-
 import hashlib
 import hmac
 import logging
 import time
-from typing import Any, Optional
-from urllib.parse import quote_plus
 
 import requests
 
-logger = logging.getLogger("wavelet_bot.bingx")
+import config
 
-# Códigos de error de negocio de BingX que el bot necesita reconocer
-# explícitamente (el resto se trata como error genérico).
-ERR_SIGNATURE_FAILED = 100001
-ERR_INSUFFICIENT_BALANCE = 100202
-ERR_INVALID_PARAMETER = 100400
-ERR_PRICE_DEVIATION = 100440
-ERR_POSITION_NOT_EXIST = 109420
-# En modo Hedge, BingX rechaza cualquier orden que lleve reduceOnly -- y,
-# según cuenta, también closePosition. Se reconoce para reintentar con el
-# equivalente basado en quantity.
+log = logging.getLogger("bingx")
+
+TIMEOUT = 15
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 0.6
+
+# La cuenta opera en modo HEDGE (positionSide=LONG/SHORT explícito).
+# Se puede forzar One-Way con HEDGE_MODE=false en el entorno.
+HEDGE_MODE = bool(getattr(config, "HEDGE_MODE", True))
+
 ERR_HEDGE_FIELD_NOT_ALLOWED = 109400
+ERR_POSITION_NOT_EXIST = 109420
 
 
-class BingXAPIError(Exception):
-    def __init__(self, code: int, msg: str, path: str):
-        self.code = code
-        self.msg = msg
-        self.path = path
-        super().__init__(f"BingX [{path}] code={code} msg={msg}")
+class BingXError(Exception):
+    pass
 
 
 class BingXClient:
-    def __init__(self, api_key: str, api_secret: str, base_url: str, recv_window_ms: int = 5000,
-                 timeout: float = 15.0, max_retries: int = 3):
-        self.api_key = api_key
-        self.api_secret = api_secret.encode("utf-8")
-        self.base_url = base_url.rstrip("/")
-        self.recv_window_ms = recv_window_ms
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self._session = requests.Session()
-        self._session.headers.update({"X-BX-APIKEY": self.api_key})
-        self._contract_cache: dict[str, dict] = {}
-        self._contract_cache_ts: float = 0.0
+    def __init__(self, api_key=None, api_secret=None, base_url=None):
+        # .strip() defensivo: una key/secret con un '\n' o espacio colado
+        # (típico al pegar variables en Railway) rompe la cabecera HTTP
+        # X-BX-APIKEY con un ValueError críptico en pleno reconcile/entrada.
+        self.api_key = (api_key or config.BINGX_API_KEY or "").strip()
+        self.api_secret = (api_secret or config.BINGX_API_SECRET or "").strip()
 
-    # ── Firma ────────────────────────────────────────────────────────
-    @staticmethod
-    def _build_query_string(params: dict[str, Any]) -> str:
-        # Orden ALFABÉTICO por clave: verificado con el vector de prueba
-        # oficial de BingX (REST API.md) — con orden de inserción
-        # arbitrario la firma NO coincide con la esperada por el
-        # servidor. Además de firmar, esta es la misma cadena que se
-        # manda, así que ambas quedan siempre consistentes entre sí.
-        parts = []
-        for key, value in sorted(params.items()):
-            if value is None:
-                continue
-            if isinstance(value, bool):
-                value = "true" if value else "false"
-            elif isinstance(value, float):
-                # format(x, "f") por defecto trunca a 6 decimales, lo que
-                # PIERDE precisión real en cantidades pequeñas (monedas de
-                # precio alto). 8 decimales cubre la máxima precisión real
-                # de cualquier contrato BingX sin exponer ruido de coma
-                # flotante binaria.
-                value = f"{value:.8f}".rstrip("0").rstrip(".")
-                if value == "" or value == "-":
-                    value = "0"
-            parts.append(f"{key}={quote_plus(str(value))}")
-        return "&".join(parts)
+        # BingX usa una URL DISTINTA para demo (VST) que para producción.
+        # Si el caller no pasa base_url, se resuelve según BINGX_DEMO --
+        # así BINGX_DEMO=true apunta de verdad a dinero simulado y no es
+        # solo una etiqueta sin efecto.
+        if base_url:
+            self.base_url = base_url.strip()
+        elif config.BINGX_DEMO:
+            self.base_url = "https://open-api-vst.bingx.com"
+        else:
+            self.base_url = (config.BINGX_BASE_URL or "https://open-api.bingx.com").strip()
 
-    def _sign(self, query_string: str) -> str:
-        return hmac.new(self.api_secret, query_string.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    def _request(self, method: str, path: str, params: Optional[dict[str, Any]] = None,
-                 signed: bool = True) -> Any:
-        params = dict(params or {})
-        if signed:
-            params["timestamp"] = int(time.time() * 1000)
-            params["recvWindow"] = self.recv_window_ms
-
-        query_string = self._build_query_string(params)
-
-        if signed:
-            signature = self._sign(query_string)
-            query_string = f"{query_string}&signature={signature}"
-
-        url = f"{self.base_url}{path}"
-        if query_string:
-            url = f"{url}?{query_string}"
-
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                resp = self._session.request(method, url, timeout=self.timeout)
-                data = resp.json()
-                code = data.get("code")
-                if code not in (0, None):
-                    raise BingXAPIError(code, data.get("msg", ""), path)
-                return data.get("data", data)
-            except BingXAPIError:
-                raise  # error de negocio de BingX: no tiene sentido reintentar igual
-            except (requests.RequestException, ValueError) as exc:
-                last_exc = exc
-                wait = min(2 ** attempt, 8)
-                logger.warning("Fallo de red en %s (intento %d/%d): %s — reintento en %ds",
-                                path, attempt, self.max_retries, exc, wait)
-                time.sleep(wait)
-        raise RuntimeError(f"No se pudo completar {path} tras {self.max_retries} intentos: {last_exc}")
-
-    # ── Mercado ──────────────────────────────────────────────────────
-    def get_contracts(self) -> list[dict]:
-        """Lista de contratos USDT-M con precisión de cantidad/precio y mínimos."""
-        return self._request("GET", "/openApi/swap/v2/quote/contracts", signed=False)
-
-    def get_contract(self, symbol: str, ttl_seconds: float = 3600.0) -> dict:
-        """Ficha de UN contrato, cacheada. Se busca por símbolo dentro de la
-        lista completa: el endpoint puede ignorar el filtro y devolverlos
-        todos, y coger el primero a ciegas daría la precisión de otro
-        contrato -> cantidades mal redondeadas y órdenes rechazadas."""
-        now = time.time()
-        if not self._contract_cache or (now - self._contract_cache_ts) > ttl_seconds:
-            try:
-                rows = self.get_contracts() or []
-                self._contract_cache = {
-                    str(r.get("symbol")): r for r in rows if isinstance(r, dict) and r.get("symbol")
-                }
-                self._contract_cache_ts = now
-            except Exception:
-                logger.exception("No se pudo refrescar la lista de contratos")
-        return self._contract_cache.get(symbol, {})
-
-    def round_qty(self, symbol: str, qty: float) -> float:
-        c = self.get_contract(symbol)
-        try:
-            precision = int(c.get("quantityPrecision", 3) or 0)
-        except (TypeError, ValueError):
-            precision = 3
-        try:
-            min_qty = float(c.get("tradeMinQuantity", c.get("minQty", 0)) or 0)
-        except (TypeError, ValueError):
-            min_qty = 0.0
-        rounded = round(float(qty), precision)
-        if min_qty and 0 < rounded < min_qty:
-            rounded = min_qty
-        return rounded
-
-    def round_price(self, symbol: str, price: float) -> float:
-        c = self.get_contract(symbol)
-        try:
-            precision = int(c.get("pricePrecision", 6) or 0)
-        except (TypeError, ValueError):
-            precision = 6
-        return round(float(price), precision)
-
-    def get_klines(self, symbol: str, interval: str, limit: int = 200) -> list[dict]:
-        """
-        Devuelve velas ordenadas cronológicamente ascendente (la más
-        antigua primero, la más reciente al final), cada una como dict
-        con claves: open, high, low, close, volume, time (ms).
-        """
-        raw = self._request(
-            "GET", "/openApi/swap/v2/quote/klines",
-            {"symbol": symbol, "interval": interval, "limit": limit},
-            signed=False,
+        self._filters_cache = {}  # symbol -> (fetched_at, filters_dict)
+        if not self.api_key or not self.api_secret:
+            log.warning("BINGX_API_KEY / BINGX_API_SECRET no configuradas.")
+        log.info(
+            "BingXClient inicializado contra %s (%s) | modo posición: %s",
+            self.base_url,
+            "DEMO/VST" if config.BINGX_DEMO else "PRODUCCIÓN REAL",
+            "HEDGE" if HEDGE_MODE else "ONE-WAY",
         )
-        candles = [
-            {
-                "time": int(c["time"]),
-                "open": float(c["open"]),
-                "high": float(c["high"]),
-                "low": float(c["low"]),
-                "close": float(c["close"]),
-                "volume": float(c["volume"]),
-            }
-            for c in raw
-        ]
-        candles.sort(key=lambda c: c["time"])
-        return candles
 
-    # ── Cuenta ───────────────────────────────────────────────────────
-    def get_balance(self) -> dict:
-        """Balance de la cuenta USDT-M (equity, disponible, etc.)."""
-        data = self._request("GET", "/openApi/swap/v2/user/balance", {})
-        # La respuesta trae {"balance": {...}} en algunas cuentas y
-        # el dict plano en otras; se normaliza aquí.
-        if isinstance(data, dict) and "balance" in data:
-            return data["balance"]
-        return data
+    # ------------------------------------------------------------------ #
+    def _signed_request(self, method: str, path: str, params: dict):
+        params = {k: v for k, v in params.items() if v is not None}
+        params["recvWindow"] = params.get("recvWindow", "10000")
+        timestamp = str(int(time.time() * 1000))
 
-    def get_positions(self, symbol: Optional[str] = None) -> list[dict]:
+        # BingX firma así (parseParam de su SDK oficial): todos los
+        # parámetros ordenados alfabéticamente, concatenados EN CRUDO como
+        # "clave=valor" (nada de urlencode/percent-encoding) y con
+        # "timestamp" añadido el último, fuera del sort. Dos bugs igual de
+        # importantes, ya corregidos:
+        #   1. timestamp dentro del sorted().
+        #   2. urlencode() sobre el query string -- rompe la firma en
+        #      cualquier orden con stopLoss/takeProfit, porque ese valor es
+        #      JSON embebido lleno de caracteres que urlencode transforma
+        #      (%7B, %22...) y que BingX firma en su forma literal.
+        ordered_items = sorted(params.items())
+        query_string = "&".join(f"{k}={v}" for k, v in ordered_items)
+        query_string = f"{query_string}&timestamp={timestamp}" if query_string else f"timestamp={timestamp}"
+
+        signature = hmac.new(
+            self.api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        url = f"{self.base_url}{path}?{query_string}&signature={signature}"
+        headers = {"X-BX-APIKEY": self.api_key}
+
+        # Reintentos solo para fallos de red/timeout, NUNCA para rechazos
+        # de la API (esos son definitivos: fondos insuficientes, símbolo
+        # inválido... reintentarlos no cambia el resultado y puede duplicar
+        # efectos secundarios).
+        last_network_exc = None
+        data = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.request(method, url, headers=headers, timeout=TIMEOUT)
+                data = resp.json()
+                last_network_exc = None
+                break
+            except Exception as e:
+                last_network_exc = e
+                if attempt < MAX_RETRIES:
+                    log.warning(
+                        "Fallo de red llamando a %s (intento %d/%d): %s — reintentando",
+                        path, attempt, MAX_RETRIES, e,
+                    )
+                    time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+
+        if last_network_exc is not None:
+            raise BingXError(f"Fallo de red/parseo llamando a {path}: {last_network_exc}") from last_network_exc
+
+        if data.get("code") not in (0, None):
+            raise BingXError(f"BingX API error en {path}: {data}")
+        return data.get("data", data)
+
+    # ------------------------------------------------------------------ #
+    def get_balance(self) -> float:
+        """Devuelve el equity disponible en USDT de la cuenta de swap."""
+        data = self._signed_request("GET", "/openApi/swap/v2/user/balance", {})
+        balances = data.get("balance", data)
+        if isinstance(balances, dict):
+            return float(balances.get("equity", balances.get("balance", 0)))
+        if isinstance(balances, list):
+            for b in balances:
+                if b.get("asset") == "USDT":
+                    return float(b.get("equity", b.get("balance", 0)))
+        return 0.0
+
+    def get_positions(self, symbol: str = None):
         params = {"symbol": symbol} if symbol else {}
-        data = self._request("GET", "/openApi/swap/v2/user/positions", params)
-        return data or []
+        data = self._signed_request("GET", "/openApi/swap/v2/user/positions", params)
+        return data if isinstance(data, list) else data.get("positions", [])
 
     def get_position_amt(self, symbol: str, position_side: str) -> float:
         """Tamaño REAL abierto en BingX para ese símbolo y lado (absoluto).
-        0.0 si no hay nada. Cerrar SIEMPRE con esto, nunca con la cantidad
-        calculada al abrir: difiere por fills parciales o por un SL/TP que
-        ya redujo parte de la posición."""
+        0.0 si no hay nada. Cerrar SIEMPRE con esto: la cantidad calculada
+        al abrir difiere tras un fill parcial o un SL/TP que ya redujo
+        parte, y una cantidad mayor que la real hace que BingX rechace la
+        orden o, peor, abra posición en sentido contrario."""
         wanted = (position_side or "").upper()
         try:
             positions = self.get_positions(symbol)
         except Exception:
-            logger.exception("No se pudo leer la posición real de %s", symbol)
+            log.exception("No se pudo leer la posición real de %s", symbol)
             return 0.0
         for p in positions:
             if str(p.get("symbol")) != symbol:
                 continue
             side = str(p.get("positionSide", "")).upper()
-            if side and side != wanted:
+            if HEDGE_MODE and side and side != wanted:
                 continue
             amt = float(p.get("positionAmt", 0) or 0)
             if amt:
                 return abs(amt)
         return 0.0
 
-    def get_open_orders(self, symbol: str) -> list[dict]:
-        data = self._request("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
-        if isinstance(data, dict):
-            data = data.get("orders", [])
-        return data if isinstance(data, list) else []
+    def set_leverage(self, symbol: str, side: str, leverage: int):
+        """side: 'LONG' o 'SHORT' (modo hedge, que es el que usa este bot)."""
+        return self._signed_request(
+            "POST",
+            "/openApi/swap/v2/trade/leverage",
+            {"symbol": symbol, "side": side, "leverage": leverage},
+        )
 
-    def has_stop_and_take_profit(self, symbol: str, position_side: str = None) -> tuple[bool, bool]:
-        """(hay_sl, hay_tp) para el símbolo/lado. Se consulta DESPUÉS de
-        colocar las condicionales: BingX puede aceptar la orden de entrada
-        y rechazar la protección, y sin esta comprobación la posición se
-        queda desnuda sin que nadie se entere."""
+    def set_margin_mode(self, symbol: str, mode: str = "ISOLATED"):
+        return self._signed_request(
+            "POST",
+            "/openApi/swap/v2/trade/marginType",
+            {"symbol": symbol, "marginType": mode},
+        )
+
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,           # "BUY" / "SELL"
+        position_side: str,  # "LONG" / "SHORT"
+        quantity: float,
+        stop_loss: float = None,
+        take_profit: float = None,
+        reduce_only: bool = False,
+    ):
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": "MARKET",
+            "quantity": quantity,
+        }
+        # En modo HEDGE, BingX rechaza con 109400 ("In the Hedge mode, the
+        # 'ReduceOnly' field can not be filled") CUALQUIER orden que lleve
+        # el campo reduceOnly -- al abrir Y al cerrar, con valor "true" o
+        # "false", solo por estar presente. Y no hace falta: en hedge,
+        # side + positionSide ya determinan unívocamente que se reduce
+        # (SELL + positionSide=LONG solo puede cerrar el largo, nunca abre
+        # un corto). El campo se manda solo en One-Way, donde sí evita que
+        # la posición se dé la vuelta.
+        if reduce_only and not HEDGE_MODE:
+            params["reduceOnly"] = "true"
+        if stop_loss:
+            params["stopLoss"] = (
+                '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}'
+                % stop_loss
+            )
+        if take_profit:
+            params["takeProfit"] = (
+                '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}'
+                % take_profit
+            )
+        return self._signed_request("POST", "/openApi/swap/v2/trade/order", params)
+
+    def place_stop_market(self, symbol: str, side: str, position_side: str,
+                          stop_price: float, quantity: float):
+        """SL como orden condicional independiente, con stopPrice numérico.
+
+        Es el plan B cuando el SL embebido en la orden de entrada no se
+        confirma. Se manda con quantity y NUNCA con closePosition, que en
+        hedge puede rechazarse igual que reduceOnly."""
+        return self._signed_request("POST", "/openApi/swap/v2/trade/order", {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": "STOP_MARKET",
+            "stopPrice": self.round_price(symbol, stop_price),
+            "quantity": self.round_qty(symbol, quantity),
+        })
+
+    def place_take_profit_market(self, symbol: str, side: str, position_side: str,
+                                 stop_price: float, quantity: float):
+        return self._signed_request("POST", "/openApi/swap/v2/trade/order", {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": self.round_price(symbol, stop_price),
+            "quantity": self.round_qty(symbol, quantity),
+        })
+
+    def get_open_orders(self, symbol: str):
+        """Órdenes abiertas (incluye las condicionales de SL/TP) para un
+        símbolo. Se usa justo después de abrir una posición para confirmar
+        que el SL/TP realmente se adjuntó -- si BingX lo rechaza en
+        silencio, la posición queda desprotegida y nunca se cierra sola."""
+        data = self._signed_request(
+            "GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol}
+        )
+        orders = data if isinstance(data, list) else data.get("orders", [])
+        return orders
+
+    def has_stop_and_take_profit(self, symbol: str) -> bool:
+        """True si hay al menos una orden STOP_MARKET/STOP y una
+        TAKE_PROFIT_MARKET/TAKE_PROFIT abiertas para el símbolo."""
+        try:
+            orders = self.get_open_orders(symbol)
+        except Exception:
+            log.exception("No se pudo verificar SL/TP de %s tras abrir la orden", symbol)
+            return False
+        types = {o.get("type", "").upper() for o in orders}
+        has_sl = any("STOP" in t and "TAKE" not in t for t in types)
+        has_tp = any("TAKE" in t for t in types)
+        return has_sl and has_tp
+
+    def protection_status(self, symbol: str, position_side: str = None):
+        """(hay_sl, hay_tp) por lado. Más fino que has_stop_and_take_profit:
+        permite dejar abierta una posición que tiene SL pero no TP en vez de
+        cerrarla, porque con el stop puesto el riesgo ya está acotado."""
         wanted = (position_side or "").upper()
         try:
             orders = self.get_open_orders(symbol)
         except Exception:
-            logger.exception("No se pudo verificar SL/TP de %s", symbol)
+            log.exception("No se pudo verificar SL/TP de %s", symbol)
             return (False, False)
         has_sl = has_tp = False
         for o in orders:
@@ -282,129 +300,73 @@ class BingXClient:
                 has_sl = True
         return (has_sl, has_tp)
 
-    def set_leverage(self, symbol: str, side: str, leverage: int) -> None:
-        """side: 'LONG' o 'SHORT' (modo Hedge)."""
-        self._request("POST", "/openApi/swap/v2/trade/leverage", {
-            "symbol": symbol, "side": side, "leverage": leverage,
-        })
+    def cancel_all_open_orders(self, symbol: str):
+        """Cancela las órdenes abiertas del símbolo (condicionales de SL/TP
+        incluidas). Tras cerrar una posición hay que llamarla: si no, las
+        condicionales huérfanas siguen vivas y al dispararse más tarde
+        pueden ABRIR una posición nueva no deseada."""
+        return self._signed_request(
+            "DELETE", "/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol}
+        )
 
-    # ── Trading ──────────────────────────────────────────────────────
-    def place_market_order(self, symbol: str, side: str, position_side: str, quantity: float) -> dict:
-        return self._request("POST", "/openApi/swap/v2/trade/order", {
-            "symbol": symbol,
-            "side": side,                # BUY / SELL
-            "positionSide": position_side,  # LONG / SHORT
-            "type": "MARKET",
-            "quantity": quantity,
-        })
+    def close_position(self, symbol: str, position_side: str, quantity: float = None):
+        """Cierra a mercado con la orden contraria.
 
-    def place_stop_market(self, symbol: str, side: str, position_side: str,
-                           stop_price: float, close_position: bool = False,
-                           quantity: Optional[float] = None) -> dict:
-        """close_position=False por defecto: en Hedge, closePosition puede
-        rechazarse igual que reduceOnly (109400). Con quantity explícita
-        funciona en ambos modos."""
-        params = {
-            "symbol": symbol,
-            "side": side,
-            "positionSide": position_side,
-            "type": "STOP_MARKET",
-            "stopPrice": self.round_price(symbol, stop_price),
-        }
-        if close_position:
-            params["closePosition"] = True
-        elif quantity is not None:
-            params["quantity"] = self.round_qty(symbol, quantity)
-        return self._request("POST", "/openApi/swap/v2/trade/order", params)
-
-    def place_take_profit_market(self, symbol: str, side: str, position_side: str,
-                                  stop_price: float, close_position: bool = False,
-                                  quantity: Optional[float] = None) -> dict:
-        params = {
-            "symbol": symbol,
-            "side": side,
-            "positionSide": position_side,
-            "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": self.round_price(symbol, stop_price),
-        }
-        if close_position:
-            params["closePosition"] = True
-        elif quantity is not None:
-            params["quantity"] = self.round_qty(symbol, quantity)
-        return self._request("POST", "/openApi/swap/v2/trade/order", params)
-
-    def cancel_all_open_orders(self, symbol: str) -> dict:
-        return self._request("DELETE", "/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
-
-    def close_position_market(self, symbol: str, side: str, position_side: str,
-                               quantity: Optional[float] = None) -> Optional[dict]:
-        """Cierre a mercado. Si no se pasa quantity, se lee el tamaño real.
-
-        Se intenta primero con quantity (funciona en Hedge y en One-Way).
-        Solo si eso falla se prueba closePosition, que en Hedge puede dar
-        109400 igual que reduceOnly.
+        quantity=None (recomendado) lee el tamaño REAL de la posición.
+        Devuelve None si no había nada que cerrar, para que el caller no
+        confunda "no había posición" con "el cierre falló".
         """
         position_side = (position_side or "").upper()
         if quantity is None:
             quantity = self.get_position_amt(symbol, position_side)
         quantity = abs(float(quantity or 0))
         if quantity <= 0:
-            logger.info("%s (%s): no hay posición que cerrar", symbol, position_side)
+            log.info("%s (%s): no hay posición abierta que cerrar", symbol, position_side)
             return None
-        base = {
-            "symbol": symbol,
-            "side": side,
-            "positionSide": position_side,
-            "type": "MARKET",
-        }
-        try:
-            return self._request("POST", "/openApi/swap/v2/trade/order",
-                                 {**base, "quantity": self.round_qty(symbol, quantity)})
-        except BingXAPIError as exc:
-            if exc.code == ERR_POSITION_NOT_EXIST:
-                logger.info("%s (%s): la posición ya no existe", symbol, position_side)
-                return None
-            logger.warning("%s: cierre por quantity falló (%s) — probando closePosition",
-                           symbol, exc)
-            return self._request("POST", "/openApi/swap/v2/trade/order",
-                                 {**base, "closePosition": True})
+
+        quantity = self.round_qty(symbol, quantity)
+        side = "SELL" if position_side == "LONG" else "BUY"
+        return self.place_market_order(
+            symbol, side, position_side, quantity, reduce_only=True
+        )
 
     def close_position_and_verify(self, symbol: str, position_side: str,
-                                   retries: int = 2) -> bool:
-        """Cierra y COMPRUEBA contra BingX que quedó en cero, cancelando
-        después las condicionales huérfanas (si se quedan vivas pueden
-        dispararse más tarde y ABRIR una posición nueva)."""
+                                  retries: int = 2) -> bool:
+        """Cierra y COMPRUEBA contra BingX que quedó a cero, cancelando
+        después las condicionales huérfanas. Un 'ok' de la API no garantiza
+        el cierre: la orden puede quedar parcialmente ejecutada."""
         position_side = (position_side or "").upper()
-        exit_side = "SELL" if position_side == "LONG" else "BUY"
         for attempt in range(1, retries + 2):
             try:
-                self.close_position_market(symbol, exit_side, position_side)
+                self.close_position(symbol, position_side)
             except Exception:
-                logger.exception("%s (%s): fallo enviando el cierre (intento %d)",
-                                 symbol, position_side, attempt)
+                log.exception("%s (%s): fallo enviando el cierre (intento %d)",
+                              symbol, position_side, attempt)
             time.sleep(1.0)
             if self.get_position_amt(symbol, position_side) <= 0:
                 try:
                     self.cancel_all_open_orders(symbol)
                 except Exception:
-                    logger.warning("%s: cerrada, pero quedaron condicionales sin cancelar", symbol)
-                logger.info("%s (%s): cerrada y verificada", symbol, position_side)
+                    log.warning("%s: cerrada, pero quedaron condicionales sin cancelar", symbol)
+                log.info("%s (%s): cerrada y verificada", symbol, position_side)
                 return True
-        logger.error("%s (%s): NO se pudo cerrar tras %d intentos — REVISAR A MANO",
-                     symbol, position_side, retries + 1)
+            log.warning("%s (%s): sigue abierta tras el cierre — reintentando",
+                        symbol, position_side)
+        log.error("%s (%s): NO se pudo cerrar tras %d intentos — REVISAR A MANO",
+                  symbol, position_side, retries + 1)
         return False
 
-    # ── Apertura protegida ───────────────────────────────────────────
+    # ------------------------------------------------------------------ #
     def open_protected_position(self, symbol: str, position_side: str, quantity: float,
-                                 stop_loss: float, take_profit: float,
-                                 leverage: Optional[int] = None) -> dict:
+                                stop_loss: float, take_profit: float,
+                                leverage: int = None, margin_mode: str = "ISOLATED") -> dict:
         """Abre y NO deja la posición sin protección.
 
-        Secuencia: apalancamiento -> entrada a mercado -> leer el tamaño
-        REAL rellenado -> SL -> TP -> verificar contra openOrders que ambos
-        existen. Si al terminar falta el SL, la posición se CIERRA: una
-        entrada sin stop en una cuenta cruzada es peor que no haber
-        entrado.
+        Intenta primero con el SL/TP embebido en la orden de entrada (es
+        atómico: no hay ventana en la que la posición exista sin stop). Si
+        BingX no los confirma, los coloca como condicionales separadas. Si
+        tras eso sigue sin haber SL, CIERRA la posición: una entrada sin
+        stop en una cuenta cruzada es peor que no haber entrado.
 
         Devuelve {"ok", "quantity", "has_sl", "has_tp", "closed", "error"}.
         """
@@ -416,20 +378,29 @@ class BingXClient:
         result = {"ok": False, "quantity": 0.0, "has_sl": False,
                   "has_tp": False, "closed": False, "error": None}
 
-        # Coherencia dirección/precios: un SL al otro lado del precio de
-        # entrada se dispara al instante y cierra nada más abrir.
+        # Coherencia dirección/precios: un SL al otro lado de la entrada se
+        # dispara al instante y cierra nada más abrir.
         if position_side == "LONG" and not (stop_loss < take_profit):
-            raise ValueError(f"{symbol} LONG: SL {stop_loss} debe ser < TP {take_profit}")
+            result["error"] = f"LONG: SL {stop_loss} debe ser < TP {take_profit}"
+            return result
         if position_side == "SHORT" and not (stop_loss > take_profit):
-            raise ValueError(f"{symbol} SHORT: SL {stop_loss} debe ser > TP {take_profit}")
+            result["error"] = f"SHORT: SL {stop_loss} debe ser > TP {take_profit}"
+            return result
+
+        # Margen aislado: con CROSS, una pérdida grande aquí se come margen
+        # de otras posiciones y de todo el equity, no solo lo previsto por
+        # el sizing. Falla en silencio porque BingX devuelve error si ya
+        # estaba en ISOLATED, y eso no debe bloquear una entrada válida.
+        try:
+            self.set_margin_mode(symbol, margin_mode)
+        except Exception:
+            log.warning("%s: no se pudo confirmar margin mode %s", symbol, margin_mode)
 
         if leverage:
             try:
                 self.set_leverage(symbol, position_side, int(leverage))
             except Exception as exc:
-                # No aborta: BingX devuelve error si ya estaba en ese valor.
-                logger.warning("%s: no se pudo fijar apalancamiento %s (%s)",
-                               symbol, leverage, exc)
+                log.warning("%s: no se pudo fijar apalancamiento %s (%s)", symbol, leverage, exc)
 
         qty = self.round_qty(symbol, quantity)
         if qty <= 0:
@@ -437,41 +408,43 @@ class BingXClient:
             return result
 
         try:
-            self.place_market_order(symbol, entry_side, position_side, qty)
+            self.place_market_order(symbol, entry_side, position_side, qty,
+                                    stop_loss=stop_loss, take_profit=take_profit)
         except Exception as exc:
             result["error"] = f"entrada rechazada: {exc}"
-            logger.error("%s (%s): %s", symbol, position_side, result["error"])
+            log.error("%s (%s): %s", symbol, position_side, result["error"])
             return result
 
-        # Tamaño REAL rellenado. Proteger por la cantidad pedida dejaría
-        # parte de la posición sin cubrir si el fill fue parcial.
+        # Tamaño REAL rellenado: proteger por la cantidad pedida dejaría
+        # parte sin cubrir si el fill fue parcial.
         time.sleep(0.5)
         filled = self.get_position_amt(symbol, position_side)
         if filled <= 0:
             result["error"] = "la entrada no aparece como posición abierta"
-            logger.error("%s (%s): %s", symbol, position_side, result["error"])
+            log.error("%s (%s): %s", symbol, position_side, result["error"])
             return result
         result["quantity"] = filled
 
-        for label, placer, price in (
-            ("SL", self.place_stop_market, stop_loss),
-            ("TP", self.place_take_profit_market, take_profit),
-        ):
-            for attempt in (1, 2):
-                try:
-                    placer(symbol, exit_side, position_side, price, quantity=filled)
-                    break
-                except Exception as exc:
-                    logger.warning("%s (%s): fallo colocando %s (intento %d): %s",
-                                   symbol, position_side, label, attempt, exc)
-                    time.sleep(0.5)
+        has_sl, has_tp = self.protection_status(symbol, position_side)
 
-        has_sl, has_tp = self.has_stop_and_take_profit(symbol, position_side)
+        # Plan B: el SL/TP embebido no se confirmó -> condicionales sueltas.
+        if not has_sl:
+            try:
+                self.place_stop_market(symbol, exit_side, position_side, stop_loss, filled)
+            except Exception as exc:
+                log.warning("%s: fallo colocando el SL como orden separada: %s", symbol, exc)
+        if not has_tp:
+            try:
+                self.place_take_profit_market(symbol, exit_side, position_side, take_profit, filled)
+            except Exception as exc:
+                log.warning("%s: fallo colocando el TP como orden separada: %s", symbol, exc)
+
+        has_sl, has_tp = self.protection_status(symbol, position_side)
         result["has_sl"], result["has_tp"] = has_sl, has_tp
 
         if not has_sl:
-            logger.error("%s (%s): SIN STOP tras abrir — cerrando la posición",
-                         symbol, position_side)
+            log.error("%s (%s): SIN STOP tras abrir — cerrando la posición",
+                      symbol, position_side)
             result["closed"] = self.close_position_and_verify(symbol, position_side)
             result["error"] = "no se pudo colocar el SL; posición cerrada"
             return result
@@ -479,33 +452,195 @@ class BingXClient:
         if not has_tp:
             # Con SL puesto el riesgo está acotado: se deja abierta y se
             # avisa, en vez de cerrar una operación válida por el TP.
-            logger.warning("%s (%s): abierta con SL pero SIN TP", symbol, position_side)
+            log.warning("%s (%s): abierta con SL pero SIN TP", symbol, position_side)
 
         result["ok"] = True
         return result
 
-    # ── Auditoría ────────────────────────────────────────────────────
-    def find_unprotected_positions(self) -> list[dict]:
-        """Posiciones abiertas sin SL. SOLO informa — no cierra nada.
+    # ------------------------------------------------------------------ #
+    def get_symbol_filters(self, symbol: str):
+        """Precisión de cantidad/precio del símbolo (evita rechazos por
+        decimales).
 
-        Quien llame decide qué hacer, y debe filtrar por las que el bot
-        abrió de verdad: esta cuenta también lleva operaciones manuales, y
-        cerrarlas automáticamente sería destruir operativa ajena al bot.
+        Se filtra por símbolo sobre la respuesta: este endpoint puede
+        devolver la lista completa de contratos aunque se le pase symbol, y
+        coger items[0] a ciegas daría la precisión de OTRO contrato -- con
+        lo que la cantidad se redondea mal y BingX rechaza la orden.
         """
-        salida = []
+        data = self._signed_request(
+            "GET", "/openApi/swap/v2/quote/contracts", {"symbol": symbol}
+        )
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if isinstance(item, dict) and item.get("symbol") == symbol:
+                return item
+        if len(items) == 1 and isinstance(items[0], dict) and items[0].get("symbol"):
+            return items[0]
+        log.warning("No se encontró el contrato %s en la respuesta de BingX", symbol)
+        return {}
+
+    def get_symbol_filters_cached(self, symbol: str, ttl_seconds: int = 3600):
+        """Igual que get_symbol_filters pero cacheado en memoria (evita una
+        llamada extra en cada entrada; la precisión casi nunca cambia)."""
+        now = time.time()
+        cached = self._filters_cache.get(symbol)
+        if cached and (now - cached[0]) < ttl_seconds:
+            return cached[1]
+        filters = self.get_symbol_filters(symbol)
+        self._filters_cache[symbol] = (now, filters)
+        return filters
+
+    def round_qty(self, symbol: str, qty: float) -> float:
+        """Ajusta qty a la precisión/tamaño mínimo que exige BingX. Si no
+        consigue leer los filtros, redondea a 3 decimales como fallback en
+        vez de reventar la entrada."""
         try:
-            positions = self.get_positions()
+            filters = self.get_symbol_filters_cached(symbol)
+            precision = int(filters.get("quantityPrecision", 3))
+            min_qty = float(filters.get("tradeMinQuantity", filters.get("minQty", 0)) or 0)
         except Exception:
-            logger.exception("No se pudieron listar las posiciones")
-            return salida
-        for p in positions:
-            amt = float(p.get("positionAmt", 0) or 0)
-            if amt == 0:
+            log.warning("No se pudo leer precisión de %s, uso fallback de 3 decimales", symbol)
+            precision, min_qty = 3, 0.0
+
+        rounded = round(float(qty), precision)
+        if min_qty and 0 < rounded < min_qty:
+            rounded = min_qty
+        return rounded
+
+    def round_qty_up(self, symbol: str, qty: float) -> float:
+        """Como round_qty pero SIEMPRE hacia arriba (math.ceil a la
+        precisión del contrato).
+
+        Necesario para el suelo de nocional: round_qty redondea al más
+        cercano, así que subir la cantidad al mínimo y luego redondear
+        podía dejarla otra vez por debajo del mínimo. Aquí se garantiza
+        que el resultado nunca baja del valor pedido.
+        """
+        import math
+        try:
+            filters = self.get_symbol_filters_cached(symbol)
+            precision = int(filters.get("quantityPrecision", 3))
+            min_qty = float(filters.get("tradeMinQuantity", filters.get("minQty", 0)) or 0)
+        except Exception:
+            precision, min_qty = 3, 0.0
+        if precision < 0:
+            precision = 0
+        factor = 10 ** precision
+        subida = math.ceil(float(qty) * factor) / factor
+        if min_qty and 0 < subida < min_qty:
+            subida = min_qty
+        return subida
+
+    def round_price(self, symbol: str, price: float) -> float:
+        """Redondea el precio a la precisión del contrato. Sin esto, en
+        tokens de precio bajo un SL puede acabar en 0.0 o igualado a la
+        entrada -- el mismo bug que apareció en fibstruct con 1000CHEEMS."""
+        try:
+            filters = self.get_symbol_filters_cached(symbol)
+            precision = int(filters.get("pricePrecision", 6))
+        except Exception:
+            precision = 6
+        return round(float(price), precision)
+
+    # ------------------------------------------------------------------ #
+    # Mercado público (sin firma) — velas para calcular la señal nosotros
+    # mismos en vez de depender de TradingView.
+    # ------------------------------------------------------------------ #
+    def get_klines(self, symbol: str, interval: str = "5m", limit: int = 200):
+        """Devuelve velas OHLCV crudas de BingX (no requiere API key)."""
+        url = f"{self.base_url}/openApi/swap/v3/quote/klines"
+        try:
+            resp = requests.get(
+                url,
+                params={"symbol": symbol, "interval": interval, "limit": limit},
+                timeout=TIMEOUT,
+            )
+            data = resp.json()
+        except Exception as e:
+            raise BingXError(f"Fallo obteniendo klines de {symbol}: {e}") from e
+        if data.get("code") not in (0, None):
+            raise BingXError(f"BingX API error en klines de {symbol}: {data}")
+        return data.get("data", [])
+
+    def get_all_symbols(self, quote_filter: str = "USDT"):
+        """Lista todos los perpetuos disponibles en BingX (endpoint público).
+        quote_filter=None para traerlos todos.
+
+        Aplica EXCLUDE_PREFIXES si está definido en config: antes esa
+        variable existía en Railway pero no la leía nadie en este repo, así
+        que símbolos como NCCOGOLD2USD-USDT seguían entrando en el universo
+        pese a estar excluidos.
+        """
+        url = f"{self.base_url}/openApi/swap/v2/quote/contracts"
+        try:
+            resp = requests.get(url, timeout=TIMEOUT)
+            data = resp.json()
+        except Exception as e:
+            raise BingXError(f"Fallo listando símbolos de BingX: {e}") from e
+        if data.get("code") not in (0, None):
+            raise BingXError(f"BingX API error listando símbolos: {data}")
+
+        prefijos = tuple(getattr(config, "EXCLUDE_PREFIXES", ()) or ())
+        rows = data.get("data", [])
+        symbols = []
+        for r in rows:
+            sym = r.get("symbol")
+            if not sym:
                 continue
-            symbol = str(p.get("symbol"))
-            side = str(p.get("positionSide", "")).upper()
-            has_sl, has_tp = self.has_stop_and_take_profit(symbol, side)
-            if not has_sl:
-                salida.append({"symbol": symbol, "positionSide": side,
-                               "quantity": abs(amt), "has_tp": has_tp})
-        return salida
+            status = r.get("status", r.get("apiStateOpen", 1))
+            if status in (0, False, "OFFLINE"):
+                continue
+            if quote_filter and not sym.endswith(f"-{quote_filter}"):
+                continue
+            base = sym.split("-")[0].upper()
+            if prefijos and base.startswith(prefijos):
+                continue
+            symbols.append(sym)
+        return sorted(set(symbols))
+
+    # ------------------------------------------------------------------ #
+    # PnL realizado — para saber cuánto se ganó/perdió cuando una posición
+    # se cierra sola por el SL/TP (BingX la cierra él mismo; este bot se
+    # entera por reconciliación, no por una orden propia).
+    # ------------------------------------------------------------------ #
+    def get_income(self, symbol: str, income_type: str = "REALIZED_PNL",
+                   start_time: int = None, limit: int = 100):
+        params = {"symbol": symbol, "incomeType": income_type, "limit": limit}
+        if start_time:
+            params["startTime"] = start_time
+        data = self._signed_request("GET", "/openApi/swap/v2/user/income", params)
+        return data if isinstance(data, list) else data.get("income", [])
+
+    def get_realized_pnl_since(self, symbol: str, start_time_ms: int = None) -> float:
+        rows = self.get_income(symbol, "REALIZED_PNL", start_time_ms)
+        return sum(float(r.get("income", 0)) for r in rows)
+
+    # ------------------------------------------------------------------ #
+    # Liquidez — para filtrar símbolos ilíquidos ANTES de operarlos, no
+    # después de comerse el spread.
+    # ------------------------------------------------------------------ #
+    def get_all_tickers(self):
+        """Estadísticas de 24h de todos los símbolos (precio, volumen...)."""
+        data = self._signed_request("GET", "/openApi/swap/v2/quote/ticker", {})
+        return data if isinstance(data, list) else data.get("tickers", [])
+
+    def get_24h_quote_volumes(self) -> dict:
+        """symbol -> volumen en USDT de las últimas 24h (0 si no se puede
+        determinar). Prueba varios nombres de campo porque la documentación
+        de BingX no es consistente entre versiones."""
+        volumes = {}
+        try:
+            tickers = self.get_all_tickers()
+        except Exception:
+            log.exception("No se pudieron leer los tickers de 24h para filtrar liquidez")
+            return volumes
+        for t in tickers:
+            sym = t.get("symbol")
+            if not sym:
+                continue
+            vol = t.get("quoteVolume") or t.get("quoteVol") or t.get("volume") or 0
+            try:
+                volumes[sym] = float(vol)
+            except (TypeError, ValueError):
+                volumes[sym] = 0.0
+        return volumes

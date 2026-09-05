@@ -1,414 +1,637 @@
 """
-main.py — Sweep Reversal Map Bot — BingX
+Wavelet MRA Haar 5m — Webhook receiver para TradingView -> BingX + Telegram.
 
-Mismo esqueleto que el bot wavelet (mismo bingx_client, misma forma de
-reconciliar posiciones desde BingX, mismo patrón de batches), cambiando
-solo el motor de señal (sweep_engine.replay_signal en vez de
-wavelet_engine.compute_signal) y el cálculo de SL/TP (depende del
-nivel barrido, no de un ATR simétrico).
+Flujo:
+  TradingView (alert() del Pine, formato JSON) --POST--> /webhook/<WEBHOOK_SECRET>
+  -> valida y parsea el JSON
+  -> si AUTO_TRADE=true: ejecuta en BingX (con circuit breaker + sizing)
+  -> en todos los casos: manda la señal a Telegram (para operar manualmente
+     si AUTO_TRADE=false, o como confirmación si AUTO_TRADE=true)
+  -> persiste el estado para reconciliación tras un restart de Railway
 
-DOS CORRECCIONES IMPORTANTES respecto a la versión anterior:
+ÁMBITO: esta cuenta de BingX la comparten varios bots de la flota y
+operativa manual del usuario. Todo lo que este bot GESTIONA (contar para
+los topes, cerrar por falta de SL, la parada de emergencia) se limita por
+defecto a las posiciones que él mismo abrió y registró en el estado. Lo
+ajeno se informa, no se toca.
 
-1. AFORO CON CERROJO. El límite de posiciones simultáneas se comprobaba
-   contra un snapshot congelado al principio del ciclo y compartido por
-   todos los hilos del batch. Con cientos de símbolos en paralelo, N
-   señales del mismo batch leían todas "0 posiciones" y entraban todas:
-   con el límite en 5 se llegaron a abrir 14. Ahora hay un contador vivo
-   protegido por un Lock, y cada entrada RESERVA su plaza antes de
-   mandar la orden.
-
-2. ÁMBITO. Esta cuenta de BingX la comparten varios bots y operativa
-   manual. El límite cuenta solo las posiciones que ESTE bot abrió; las
-   ajenas no se cuentan, no se gestionan y no se notifican como cierres
-   propios. Lo único que hacen las ajenas es bloquear su propio símbolo
-   (no se abre encima de una posición existente, sea de quien sea).
+Configura la alerta en TradingView con "Webhook URL":
+  https://<tu-app>.up.railway.app/webhook/<WEBHOOK_SECRET>
+y como mensaje: {{strategy.order.alert_message}}  (o deja que sea el propio
+JSON que genera `alert(json_..., alert.freq_once_per_bar_close)` del script;
+en ese caso usa "Any alert() function call" al crear la alerta).
 """
-
 import logging
 import sys
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import pandas as pd
+from flask import Flask, jsonify, request
 
-from bingx_client import BingXClient, BingXAPIError, ERR_POSITION_NOT_EXIST
-from config import Config
-import risk_manager
-import sweep_engine
-from state_manager import StateManager, timeframe_to_ms
-from telegram_notifier import TelegramNotifier
+import bingx_client
+import config
+import telegram_notifier
+from state_manager import StateManager
 
 logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL.upper(), logging.INFO),
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    stream=sys.stdout,
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("sweep_bot.main")
+log = logging.getLogger("main")
 
+app = Flask(__name__)
+bx = bingx_client.BingXClient()
+state = StateManager()
 
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"ok")
+log.info(
+    "=" * 70 + "\nENTORNO BINGX: %s | AUTO_TRADE=%s\n" + "=" * 70,
+    "DEMO / VST (dinero simulado)" if config.BINGX_DEMO else "⚠️ PRODUCCIÓN — DINERO REAL ⚠️",
+    config.AUTO_TRADE,
+)
 
-    def log_message(self, *args):
-        pass
+# --------------------------------------------------------------------------- #
+# GUARDIA DE ARRANQUE PARA DINERO REAL. Con AUTO_TRADE=true y BINGX_DEMO=false
+# el bot puede abrir/cerrar posiciones reales. Los endpoints /emergency-stop y
+# /reset-breaker son el ÚNICO freno manual que existe, y ambos dependen de
+# WEBHOOK_SECRET -- si está vacío, esas rutas son inalcanzables (Flask no
+# admite un segmento de URL vacío) y no hay forma de pararlo desde fuera sin
+# tocar variables de Railway y esperar un redeploy. Se rehúsa a arrancar en
+# real sin ese freno en vez de descubrirlo el día que algo va mal.
+if config.AUTO_TRADE and not config.BINGX_DEMO and not config.WEBHOOK_SECRET:
+    log.critical(
+        "AUTO_TRADE=true y BINGX_DEMO=false (dinero real) pero WEBHOOK_SECRET "
+        "está vacío -- /emergency-stop y /reset-breaker quedarían inutilizables. "
+        "Define WEBHOOK_SECRET en Railway (ej. `openssl rand -hex 24`) antes de arrancar en real."
+    )
+    sys.exit(1)
 
+# Aviso si el estado (posiciones, circuit breaker, cooldown) no está en una
+# ruta que sobreviva a un redeploy. Railway borra el disco del contenedor en
+# cada redeploy salvo que STATE_FILE apunte a un Volume montado (ver README
+# sección 0). Una ruta relativa como "state.json" NUNCA sobrevive.
+if config.AUTO_TRADE and not config.BINGX_DEMO and not config.STATE_FILE.startswith("/"):
+    _msg = (
+        f"⚠️ STATE_FILE='{config.STATE_FILE}' es una ruta relativa -- se perderá en el "
+        "próximo redeploy (circuit breaker y cooldown se resetearán a cero). Monta un "
+        "Volume en Railway y pon STATE_FILE=/data/state.json (o la ruta del Volume)."
+    )
+    log.warning(_msg)
+    telegram_notifier.send(_msg)
 
-def start_health_server(port: int) -> None:
-    def _serve():
+if not config.BINGX_DEMO and config.AUTO_TRADE:
+    telegram_notifier.send(
+        "🔴 *Bot arrancado en PRODUCCIÓN con AUTO_TRADE=true* — las órdenes "
+        "que ejecute serán con dinero real."
+    )
+
+# Reconciliación al arrancar (best-effort; si BingX no está configurado,
+# se registra el error y el bot sigue en modo señal/Telegram).
+if config.BINGX_API_KEY:
+    try:
+        state.reconcile(bx)
+    except Exception:
+        log.exception("Reconciliación inicial falló, continuando de todas formas")
+
+    # Valida que los símbolos de SYMBOLS existen en BingX -- si hay un typo
+    # (ej. "BTCUSDT" en vez de "BTC-USDT"), es mejor avisar ahora que
+    # descubrirlo por un error silencioso repetido cada 5 minutos.
+    _invalid_symbols = []
+    for _sym in config.SYMBOLS:
         try:
-            HTTPServer(("0.0.0.0", port), _HealthHandler).serve_forever()
-        except OSError as exc:
-            logger.warning("No se pudo levantar el servidor de salud en :%d (%s)", port, exc)
+            _filters = bx.get_symbol_filters(_sym)
+            if not _filters:
+                _invalid_symbols.append(_sym)
+        except Exception:
+            log.exception("No se pudo validar el símbolo %s al arrancar", _sym)
+            _invalid_symbols.append(_sym)
+    if _invalid_symbols:
+        _msg = f"⚠️ Símbolos en SYMBOLS que BingX no reconoce: {_invalid_symbols}. Revisa el formato (BASE-QUOTE, ej. BTC-USDT)."
+        log.warning(_msg)
+        telegram_notifier.send(_msg)
 
-    threading.Thread(target=_serve, daemon=True).start()
-    logger.info("Servidor de salud escuchando en :%d/health", port)
+# --------------------------------------------------------------------------- #
+# Generador de señales propio (no depende de TradingView). Se activa por
+# defecto (SIGNAL_SOURCE=python). Si prefieres seguir usando el webhook de
+# TradingView, pon SIGNAL_SOURCE=tradingview y ENABLE_SCHEDULER=false.
+# --------------------------------------------------------------------------- #
+_scheduler = None
+if config.SIGNAL_SOURCE == "python" and config.ENABLE_SCHEDULER:
+    import poller
+    import sys as _sys
+    _scheduler = poller.start(_sys.modules[__name__], bx, state)
 
 
-class Bot:
-    def __init__(self):
-        self.client = BingXClient(
-            Config.BINGX_API_KEY, Config.BINGX_API_SECRET, Config.BINGX_BASE_URL,
-            recv_window_ms=Config.BINGX_RECV_WINDOW_MS,
-        )
-        self.tg = TelegramNotifier(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
-        self.state = StateManager()
-        self.timeframe_ms = timeframe_to_ms(Config.TIMEFRAME)
-        self._contracts: dict[str, dict] = {}
-        self._contracts_fetched_at = 0.0
+# --------------------------------------------------------------------------- #
+def _live_positions():
+    """Todas las posiciones abiertas en la cuenta (incluye las ajenas)."""
+    return [
+        p for p in bx.get_positions()
+        if float(p.get("positionAmt", p.get("positionSize", 0)) or 0) != 0
+    ]
 
-        # Aforo: posiciones que ESTE bot tiene abiertas o está abriendo.
-        # (symbol, positionSide) -> dict. Las plazas reservadas cuentan
-        # desde antes de mandar la orden para que dos hilos no puedan
-        # ocupar la misma.
-        self._own_lock = threading.Lock()
-        self._own: dict[tuple, dict] = {}
-        # Símbolos ocupados por posiciones que NO son de este bot: no se
-        # abre encima de ellas, pero tampoco cuentan para el aforo.
-        self._foreign_symbols: set[str] = set()
 
-    def refresh_contracts(self, force: bool = False) -> None:
-        if not force and (time.time() - self._contracts_fetched_at) < 3600:
-            return
-        raw = self.client.get_contracts()
-        contracts = {}
-        for c in raw:
-            symbol = c.get("symbol", "")
-            if not symbol.endswith("-USDT") or int(c.get("status", 0)) != 1:
-                continue
-            contracts[symbol] = {
-                "quantityPrecision": int(c.get("quantityPrecision", 4)),
-                "pricePrecision": int(c.get("pricePrecision", 4)),
-                "tradeMinQuantity": float(c.get("tradeMinQuantity", 0) or 0),
-                "tradeMinUSDT": float(c.get("tradeMinUSDT", 0) or 0),
-            }
-        self._contracts = contracts
-        self._contracts_fetched_at = time.time()
-        logger.info("Contratos USDT-M activos: %d", len(contracts))
+# --------------------------------------------------------------------------- #
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify(
+        status="ok",
+        bingx_env=("demo/VST" if config.BINGX_DEMO else "PRODUCCIÓN REAL"),
+        bingx_base_url=bx.base_url,
+        auto_trade=config.AUTO_TRADE,
+        signal_source=config.SIGNAL_SOURCE,
+        symbols=("ALL (perpetuos USDT)" if config.SCAN_ALL_SYMBOLS else config.SYMBOLS),
+        open_positions=state.open_count(),
+        halted=state.state.get("trading_halted"),
+    )
 
-    def symbol_universe(self) -> list[str]:
-        if Config.SYMBOLS.strip().upper() == "ALL":
-            base = list(self._contracts.keys())
-        else:
-            base = [s.strip() for s in Config.SYMBOLS.split(",") if s.strip()]
-        if Config.DEMO_MODE:
-            return [s.replace("-USDT", "-VST") for s in base]
-        return base
 
-    def contract_meta(self, symbol: str) -> dict:
-        key = symbol.replace("-VST", "-USDT")
-        return self._contracts.get(key, {
-            "quantityPrecision": 4, "pricePrecision": 4,
-            "tradeMinQuantity": 0.0, "tradeMinUSDT": 0.0,
-        })
-
-    # ── Aforo ────────────────────────────────────────────────────────
-    def _reserve_slot(self, symbol: str, side: str) -> bool:
-        """Reserva plaza para una entrada. True si se puede abrir.
-
-        Se llama ANTES de mandar la orden y dentro del cerrojo: es lo que
-        impide que varios hilos del mismo batch pasen a la vez el control
-        de aforo. Si la entrada falla, hay que llamar a _release_slot().
-        """
-        with self._own_lock:
-            if symbol in self._foreign_symbols:
-                return False
-            if any(s == symbol for s, _ in self._own):
-                return False
-            if len(self._own) >= Config.MAX_CONCURRENT_POSITIONS:
-                return False
-            self._own[(symbol, side)] = {"reserved": True, "at": time.time()}
-            return True
-
-    def _release_slot(self, symbol: str, side: str) -> None:
-        with self._own_lock:
-            entry = self._own.get((symbol, side))
-            if entry and entry.get("reserved"):
-                self._own.pop((symbol, side), None)
-
-    def _confirm_slot(self, symbol: str, side: str, info: dict) -> None:
-        with self._own_lock:
-            self._own[(symbol, side)] = {"reserved": False, **info}
-
-    def own_count(self) -> int:
-        with self._own_lock:
-            return len(self._own)
-
-    def reconcile_positions(self) -> dict:
-        """Sincroniza el aforo con la realidad de BingX.
-
-        Solo gestiona lo nuestro. Las posiciones ajenas se apuntan para
-        no abrir encima de su símbolo, pero no se cuentan, no se cierran
-        y no generan avisos de cierre.
-        """
-        try:
-            positions = self.client.get_positions()
-        except Exception as exc:
-            logger.error("No se pudieron leer posiciones: %s", exc)
-            with self._own_lock:
-                return dict(self._own)
-
-        current = {}
-        for p in positions:
-            amt = float(p.get("positionAmt", p.get("positionSize", 0)) or 0)
-            if amt == 0:
-                continue
-            current[(p.get("symbol"), p.get("positionSide", "BOTH"))] = p
-
-        cerradas = []
-        with self._own_lock:
-            for key, old in list(self._own.items()):
-                if old.get("reserved"):
-                    # Entrada en vuelo en otro hilo: no tocar.
-                    continue
-                if key not in current:
-                    cerradas.append((key, old))
-                    self._own.pop(key, None)
-            propios = set(self._own.keys())
-            self._foreign_symbols = {
-                sym for (sym, _side) in current.keys()
-                if not any(s == sym for s, _ in propios)
-            }
-            aforo = len(self._own)
-            ajenas = len(self._foreign_symbols)
-
-        for (symbol, side), old in cerradas:
-            exit_price = old.get("markPrice") or old.get("avgPrice") or 0
-            self.tg.exit_notice(symbol, side, float(exit_price or 0))
-            logger.info("Posición propia cerrada: %s %s", symbol, side)
-
-        logger.info("Aforo: %d/%d propias · %d posiciones ajenas en la cuenta (no se tocan)",
-                    aforo, Config.MAX_CONCURRENT_POSITIONS, ajenas)
-
-        with self._own_lock:
-            return dict(self._own)
-
-    def get_equity(self) -> float:
-        try:
-            bal = self.client.get_balance()
-            for key in ("equity", "balance", "availableMargin"):
-                if key in bal:
-                    return float(bal[key])
-            if isinstance(bal, list) and bal:
-                return float(bal[0].get("equity", bal[0].get("balance", 0)))
-        except Exception as exc:
-            logger.error("No se pudo leer el balance: %s", exc)
-        return 0.0
-
-    def process_symbol(self, symbol: str, equity: float) -> None:
-        try:
-            if Config.SKIP_IF_SYMBOL_HAS_POSITION:
-                with self._own_lock:
-                    ocupado = (symbol in self._foreign_symbols
-                               or any(s == symbol for s, _ in self._own))
-                if ocupado:
-                    return
-
-            # Descarte barato ANTES de bajar velas: si el aforo está lleno
-            # no tiene sentido pedir 300 klines de cada símbolo.
-            if self.own_count() >= Config.MAX_CONCURRENT_POSITIONS:
-                return
-
-            # historial generoso: el replay necesita cubrir cualquier
-            # sweep que pudiera seguir activo desde varias barras atrás
-            candles = self.client.get_klines(
-                symbol, Config.TIMEFRAME,
-                limit=max(300, Config.MAX_CONFIRMATION_BARS + Config.STRUCTURE_LENGTH + Config.SWING_LENGTH * 4 + 100),
-            )
-            if len(candles) < 40:
-                return
-
-            now_ms = int(time.time() * 1000)
-            if candles[-1]["time"] + self.timeframe_ms > now_ms:
-                candles = candles[:-1]
-            if not candles:
-                return
-
-            df = pd.DataFrame(candles)
-            signal = sweep_engine.replay_signal(df, Config)
-            if signal is None:
-                return
-
-            candle_time = signal["time"]
-            if not self.state.can_signal(symbol, candle_time, 1, self.timeframe_ms):
-                # cooldown mínimo de 1 barra: nunca proceses la misma
-                # vela cerrada dos veces si el sondeo se solapa
-                return
-
-            # bearish y bullish son máquinas de estado independientes
-            # (igual que en el Pine original): en teoría podrían
-            # confirmar ambas en la misma barra. Sin lado claro, no se
-            # entra en ninguna -- mejor que elegir una arbitrariamente.
-            if signal["long_cond"] and signal["short_cond"]:
-                logger.info("%s: long_cond y short_cond confirmados a la vez, señal ambigua, se descarta", symbol)
-                return
-            side = "LONG" if signal["long_cond"] else ("SHORT" if signal["short_cond"] else None)
-            if side is None:
-                return
-
-            self.state.mark_signal(symbol, candle_time)
-            self._handle_entry(symbol, side, signal, equity)
-
-        except BingXAPIError as exc:
-            if exc.code == ERR_POSITION_NOT_EXIST:
-                return
-            logger.warning("Error de API en %s: %s", symbol, exc)
-        except Exception as exc:
-            logger.exception("Error inesperado procesando %s: %s", symbol, exc)
-
-    def _handle_entry(self, symbol: str, side: str, signal: dict, equity: float) -> None:
-        meta = self.contract_meta(symbol)
-        is_long = side == "LONG"
-        entry_price = signal["close"]
-        sl_price, tp_price = sweep_engine.compute_sweep_sl_tp(
-            entry_price, is_long, signal["swept_level"], signal.get("atr"), Config,
-        )
-
-        # Red de seguridad ante SL/TP degenerados: en tokens de precio muy
-        # bajo el redondeo puede dejar el SL igual a la entrada (riesgo 0,
-        # división por cero en el sizing) o del lado equivocado, que se
-        # dispararía nada más abrir.
-        if sl_price <= 0 or tp_price <= 0 or sl_price == entry_price:
-            logger.warning("%s: SL/TP inválidos tras el cálculo (SL=%s TP=%s entrada=%s), señal descartada",
-                           symbol, sl_price, tp_price, entry_price)
-            return
-        if is_long and not (sl_price < entry_price < tp_price):
-            logger.warning("%s LONG: orden de precios incoherente (SL=%s entrada=%s TP=%s), descartada",
-                           symbol, sl_price, entry_price, tp_price)
-            return
-        if (not is_long) and not (tp_price < entry_price < sl_price):
-            logger.warning("%s SHORT: orden de precios incoherente (SL=%s entrada=%s TP=%s), descartada",
-                           symbol, sl_price, entry_price, tp_price)
-            return
-
-        if Config.MIN_BALANCE_USDT and equity < Config.MIN_BALANCE_USDT:
-            self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False,
-                            reason="balance por debajo del mínimo configurado")
-            return
-
-        sizing = risk_manager.compute_position_size(
-            equity, Config.QTY_PCT, entry_price,
-            meta["quantityPrecision"], meta["tradeMinQuantity"], meta["tradeMinUSDT"],
-        )
-        if not sizing.ok:
-            self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False, reason=sizing.reason)
-            return
-
-        if not Config.LIVE_TRADING:
-            self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False,
-                            reason="LIVE_TRADING desactivado")
-            return
-
-        # Reserva de plaza: a partir de aquí el aforo ya cuenta esta
-        # entrada, así que ningún otro hilo puede ocupar la misma.
-        if not self._reserve_slot(symbol, side):
-            self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False,
-                            reason="máximo de posiciones simultáneas alcanzado")
-            return
-
-        try:
-            leverage = None
-            if not self.state.leverage_already_set(symbol):
-                leverage = Config.LEVERAGE
-                self.state.mark_leverage_set(symbol)
-
-            # Apertura protegida: abre, lee el tamaño REAL rellenado,
-            # coloca SL y TP por quantity (closePosition se rechaza en
-            # Hedge con el error 109400, que es lo que dejaba las
-            # posiciones abiertas y desnudas), verifica contra openOrders
-            # y CIERRA si no hay stop.
-            res = self.client.open_protected_position(
-                symbol=symbol,
-                position_side=side,
-                quantity=sizing.quantity,
-                stop_loss=sl_price,
-                take_profit=tp_price,
-                leverage=leverage,
-            )
-
-            if not res.get("ok"):
-                self._release_slot(symbol, side)
-                motivo = res.get("error") or "fallo desconocido en la apertura"
-                if res.get("closed"):
-                    motivo += " (posición cerrada, no quedó desprotegida)"
-                self.tg.signal(symbol, side, entry_price, sl_price, tp_price,
-                               executed=False, reason=motivo)
-                logger.error("Entrada NO completada en %s %s: %s", symbol, side, motivo)
-                return
-
-            self._confirm_slot(symbol, side, {
-                "quantity": res["quantity"], "entry_price": entry_price,
-                "sl": sl_price, "tp": tp_price, "opened_at": time.time(),
+@app.route("/status", methods=["GET"])
+def status():
+    """Diagnóstico más completo: próximas ejecuciones del scheduler,
+    posiciones abiertas conocidas y estado del circuit breaker."""
+    jobs = []
+    if _scheduler:
+        for job in _scheduler.get_jobs():
+            jobs.append({
+                "id": job.id,
+                "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
             })
 
-            aviso = "" if res.get("has_tp") else " ⚠️ SIN TP (con SL puesto)"
-            self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=True)
-            logger.info("Entrada ejecutada: %s %s qty=%s @ %.6g (SL=%.6g TP=%.6g, barrido=%.6g)%s",
-                        symbol, side, res["quantity"], entry_price, sl_price, tp_price,
-                        signal["swept_level"], aviso)
+    # Cuenta compartida: distinguir lo nuestro de lo ajeno es justo lo que
+    # hacía falta para diagnosticar por qué el bot no abría.
+    nuestras = set(state.state.get("positions", {}).keys())
+    try:
+        vivas = {p.get("symbol") for p in _live_positions()}
+    except Exception as e:
+        vivas, err = set(), str(e)
+    else:
+        err = None
 
-        except Exception as exc:
-            self._release_slot(symbol, side)
-            logger.exception("Fallo al ejecutar la entrada en %s: %s", symbol, exc)
-            self.tg.error(f"entrada {symbol} {side}", str(exc))
+    return jsonify(
+        auto_trade=config.AUTO_TRADE,
+        signal_source=config.SIGNAL_SOURCE,
+        symbols=config.SYMBOLS,
+        scheduler_jobs=jobs,
+        open_positions=state.state.get("positions", {}),
+        consecutive_losses=state.state.get("consecutive_losses"),
+        trading_halted=state.state.get("trading_halted"),
+        halt_reason=state.state.get("halt_reason"),
+        daily_start_equity=state.state.get("daily_start_equity"),
+        daily_date=state.state.get("daily_date"),
+        posiciones_propias_vivas=sorted(nuestras & vivas),
+        posiciones_ajenas_en_la_cuenta=sorted(vivas - nuestras),
+        error_leyendo_bingx=err,
+    )
 
-    def run(self) -> None:
-        Config.validate()
-        start_health_server(Config.HEALTH_PORT)
-        logger.info("Iniciando bot.\n%s", Config.summary())
-        self.tg.info("Bot iniciado.\n" + Config.summary())
 
-        self.refresh_contracts(force=True)
+@app.route("/signal-check/<symbol>", methods=["GET"])
+def signal_check(symbol):
+    """Diagnóstico: calcula la señal actual para un símbolo sin ejecutar
+    nada, para verificar que el motor de señales lee bien BingX."""
+    import signal_engine
+    import poller as _poller
+    try:
+        rows = bx.get_klines(symbol.upper(), interval="5m", limit=config.WAVELET_LOOKBACK_ENERGY + 60)
+        df = signal_engine.klines_to_df(rows)
+        sig = signal_engine.compute_signal(df, _poller._params(), last_signal_ts=state.get_last_signal_ts(symbol.upper()))
+        return jsonify(symbol=symbol.upper(), bars=len(df), signal=sig)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
 
-        while True:
-            cycle_start = time.time()
-            try:
-                self.refresh_contracts()
-                self.reconcile_positions()
-                equity = self.get_equity()
-                symbols = self.symbol_universe()
 
-                for i in range(0, len(symbols), Config.SYMBOL_BATCH_SIZE):
-                    if self.own_count() >= Config.MAX_CONCURRENT_POSITIONS:
-                        logger.info("Aforo lleno, se salta el resto del ciclo")
-                        break
-                    batch = symbols[i:i + Config.SYMBOL_BATCH_SIZE]
-                    with ThreadPoolExecutor(max_workers=len(batch)) as pool:
-                        list(pool.map(lambda s: self.process_symbol(s, equity), batch))
-                    time.sleep(Config.SYMBOL_BATCH_DELAY_SECONDS)
+@app.route("/scan", methods=["GET"])
+def scan():
+    """Analiza TODAS las monedas de BingX (o las que estén en SYMBOLS) con
+    el filtro wavelet, sin ejecutar ni notificar nada -- solo para mirar.
+    Parámetros opcionales: ?quote=USDT (default) y ?limit=N (símbolos máx.).
+    Puede tardar varios segundos/minutos si escaneas todo el universo.
+    """
+    import poller as _poller
+    import scanner as _scanner
 
-            except Exception as exc:
-                logger.exception("Error en el ciclo principal: %s", exc)
-                self.tg.error("ciclo principal", str(exc))
+    quote = request.args.get("quote", "USDT").upper()
+    limit = int(request.args.get("limit", config.SCAN_ALL_MAX_SYMBOLS))
+    notify = request.args.get("notify", "false").lower() == "true"
 
-            elapsed = time.time() - cycle_start
-            time.sleep(max(1.0, Config.POLL_INTERVAL_SECONDS - elapsed))
+    try:
+        if config.SYMBOLS and not config.SCAN_ALL_SYMBOLS:
+            symbols = config.SYMBOLS
+        else:
+            symbols = bx.get_all_symbols(quote_filter=quote)[:limit]
+    except Exception as e:
+        return jsonify(error=f"no se pudo listar símbolos: {e}"), 500
+
+    results = _scanner.scan_symbols(bx, config, symbols)
+    ranked = _scanner.rank_results(results)
+
+    if notify:
+        telegram_notifier.send(_scanner.format_scan_summary(ranked))
+
+    return jsonify(symbols_requested=len(symbols), **ranked)
+
+
+@app.route("/webhook/<secret>", methods=["POST"])
+def webhook(secret):
+    if not config.WEBHOOK_SECRET or secret != config.WEBHOOK_SECRET:
+        log.warning("Intento de webhook con secret inválido")
+        return jsonify(error="unauthorized"), 401
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        # TradingView a veces manda el JSON como texto plano
+        try:
+            import json as _json
+            payload = _json.loads(request.data.decode("utf-8"))
+        except Exception:
+            log.error("Payload no parseable: %s", request.data)
+            return jsonify(error="invalid json"), 400
+
+    log.info("Alerta recibida: %s", payload)
+
+    signal = payload.get("signal")
+    try:
+        if signal == "entry":
+            _handle_entry(payload)
+        elif signal == "exit":
+            _handle_exit(payload)
+        else:
+            log.warning("Tipo de señal desconocido: %s", signal)
+            return jsonify(error="unknown signal type"), 400
+    except Exception as e:
+        log.exception("Error procesando la alerta")
+        telegram_notifier.send(f"🚨 Error procesando alerta: `{e}`\nPayload: `{payload}`")
+        return jsonify(error=str(e)), 500
+
+    return jsonify(status="processed"), 200
+
+
+# --------------------------------------------------------------------------- #
+def _handle_entry(alert: dict):
+    tv_symbol = alert["symbol"]
+    symbol = config.tv_symbol_to_bingx(tv_symbol)
+    position_side = alert["positionSide"]          # LONG / SHORT
+    price = float(alert["price"])
+    sl = float(alert["sl"])
+    tp = float(alert["tp"])
+
+    if not config.AUTO_TRADE:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False)
+        )
+        return
+
+    if state.get_open(symbol):
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False, error=f"ya hay posición abierta en {symbol}"
+            )
+        )
+        return
+
+    if state.open_count() >= config.MAX_CONCURRENT_POSITIONS:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False, error="límite de posiciones concurrentes alcanzado"
+            )
+        )
+        return
+
+    # Tope de seguridad ABSOLUTO contra las posiciones REALES en BingX que
+    # son DE ESTE BOT (no el estado local a secas, que puede haberse perdido
+    # si Railway reinició el contenedor sin un Volume persistente).
+    #
+    # Antes esto contaba TODAS las posiciones de la cuenta. Con otros bots
+    # de la flota y operativa manual compartiendo cuenta, bastaban unas
+    # pocas posiciones ajenas para dejar este bot bloqueado sin motivo.
+    try:
+        propias = state.count_own_live_positions(bx)
+    except Exception as e:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False, error=f"no se pudo verificar posiciones reales en BingX: {e}")
+        )
+        return
+    if propias >= config.HARD_MAX_TOTAL_POSITIONS:
+        telegram_notifier.send(
+            f"⛔ Tope de seguridad alcanzado: {propias} posiciones de ESTE bot abiertas en "
+            f"BingX (límite HARD_MAX_TOTAL_POSITIONS={config.HARD_MAX_TOTAL_POSITIONS}). "
+            f"Entrada en {symbol} bloqueada."
+        )
+        return
+
+    # No abrir encima de una posición ajena en el mismo símbolo: en hedge se
+    # fusionarían en una sola posición y ninguno de los dos bots sabría ya
+    # cuál es la suya.
+    try:
+        ajenas_mismo_simbolo = [
+            p for p in _live_positions()
+            if p.get("symbol") == symbol and not state.is_ours(symbol)
+        ]
+    except Exception:
+        ajenas_mismo_simbolo = []
+    if ajenas_mismo_simbolo:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False,
+                error=f"ya hay una posición en {symbol} que NO es de este bot (otro bot o manual)",
+            )
+        )
+        return
+
+    try:
+        equity = bx.get_balance()
+    except Exception as e:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False, error=f"no se pudo leer balance: {e}")
+        )
+        return
+
+    allowed, reason = state.check_circuit_breaker(equity)
+    if not allowed:
+        telegram_notifier.send(f"⛔ Trading pausado (circuit breaker): {reason}")
+        return
+
+    # Sizing: arriesgar RISK_PCT_PER_TRADE% del equity en la distancia al SL.
+    risk_amount = equity * (config.RISK_PCT_PER_TRADE / 100)
+    stop_distance = abs(price - sl)
+    if stop_distance <= 0:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False, error="distancia a SL inválida")
+        )
+        return
+    qty = bx.round_qty(symbol, risk_amount / stop_distance)
+    if qty <= 0:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False, error="qty tras redondeo de precisión es 0")
+        )
+        return
+
+    # Suelo de nocional. El sizing por riesgo da nocional = riesgo / stop%,
+    # así que en símbolos de stop ancho salían posiciones de céntimos donde
+    # las comisiones se comen cualquier resultado. Si el nocional queda por
+    # debajo del mínimo, se SUBE la cantidad -- pero eso aumenta el riesgo
+    # real por encima de RISK_PCT_PER_TRADE, así que se comprueba contra
+    # MAX_RISK_PCT_ABS y, si lo supera, se descarta la señal en vez de
+    # operarla con un riesgo no autorizado.
+    notional = qty * price
+    if config.MIN_NOTIONAL_USDT and notional < config.MIN_NOTIONAL_USDT:
+        qty_minima = bx.round_qty_up(symbol, config.MIN_NOTIONAL_USDT / price)
+        riesgo_forzado = qty_minima * stop_distance
+        riesgo_pct = (riesgo_forzado / equity * 100) if equity > 0 else 999.0
+
+        if riesgo_pct > config.MAX_RISK_PCT_ABS:
+            telegram_notifier.send(
+                telegram_notifier.format_entry_signal(
+                    alert, executed=False,
+                    error=(f"para llegar al mínimo de {config.MIN_NOTIONAL_USDT} USDT haría falta "
+                           f"arriesgar {riesgo_pct:.2f}% del equity (tope {config.MAX_RISK_PCT_ABS}%). "
+                           f"Stop demasiado ancho en este símbolo"),
+                )
+            )
+            return
+
+        log.info("%s: nocional %.2f < mínimo %.2f USDT -- qty %s -> %s (riesgo %.2f%% del equity)",
+                 symbol, notional, config.MIN_NOTIONAL_USDT, qty, qty_minima, riesgo_pct)
+        qty = qty_minima
+        notional = qty * price
+
+    # Fija el leverage ANTES de calcular el margen requerido, y usa el valor
+    # que BingX confirma en la respuesta -- no config.LEVERAGE a ciegas.
+    # Algunos símbolos (sobre todo en SYMBOLS=ALL, altcoins poco comunes)
+    # tienen un tope de apalancamiento propio menor al pedido; si se asume
+    # que se aplicó el LEVERAGE de config y BingX en realidad usó menos, el
+    # cálculo local de margen sale bien pero BingX exige mucho más margen
+    # real al mandar la orden -- de ahí los rechazos "insufficient margin"
+    # aunque el chequeo local decía que sobraba equity.
+    actual_leverage = config.LEVERAGE
+    try:
+        lev_resp = bx.set_leverage(symbol, position_side, config.LEVERAGE)
+        confirmed = None
+        if isinstance(lev_resp, dict):
+            confirmed = lev_resp.get("leverage") or lev_resp.get("longLeverage") or lev_resp.get("shortLeverage")
+        if confirmed:
+            actual_leverage = float(confirmed)
+            if actual_leverage != config.LEVERAGE:
+                log.warning(
+                    "%s: BingX confirmó leverage=%s (pedido %s) -- se recalcula el margen con el real",
+                    symbol, actual_leverage, config.LEVERAGE,
+                )
+    except Exception as e:
+        log.warning("No se pudo fijar/confirmar leverage para %s (%s) -- se asume config.LEVERAGE=%s",
+                    symbol, e, config.LEVERAGE)
+
+    # Comprobación de margen: evita mandar una orden que BingX rechazaría
+    # por fondos insuficientes (o que consumiría casi todo el margen
+    # disponible sin que quede colchón para el resto de posiciones).
+    required_margin = (qty * price) / max(actual_leverage, 1)
+    if required_margin > equity * 0.95:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False,
+                error=f"margen insuficiente (necesita ~{required_margin:.2f} USDT con leverage {actual_leverage}x, equity {equity:.2f} USDT)",
+            )
+        )
+        return
+
+    # Apertura protegida: abre, lee el tamaño REAL rellenado, verifica el
+    # SL/TP contra openOrders y, si no consigue dejar un stop puesto, CIERRA
+    # la posición. Antes esto eran tres llamadas sueltas sin marcha atrás:
+    # si el SL fallaba, la posición se quedaba abierta y desnuda.
+    res = bx.open_protected_position(
+        symbol=symbol,
+        position_side=position_side,
+        quantity=qty,
+        stop_loss=sl,
+        take_profit=tp,
+        leverage=None,          # ya fijado y confirmado arriba
+        margin_mode="ISOLATED",
+    )
+
+    if not res.get("ok"):
+        motivo = res.get("error") or "fallo desconocido en la apertura"
+        if res.get("closed"):
+            motivo += " — la posición se cerró, no quedó desprotegida"
+        elif res.get("quantity"):
+            motivo += " — ⚠️ POSICIÓN POSIBLEMENTE ABIERTA SIN STOP, REVISA BINGX"
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False, error=motivo)
+        )
+        log.error("Entrada NO completada en %s %s: %s", symbol, position_side, motivo)
+        return
+
+    state.record_open(symbol, position_side, res["quantity"], price, sl, tp)
+    telegram_notifier.send(
+        telegram_notifier.format_entry_signal(alert, executed=True, qty=res["quantity"])
+    )
+    if not res.get("has_tp"):
+        telegram_notifier.send(f"⚠️ *{symbol}*: abierta con SL pero SIN TP confirmado.")
+
+
+def _handle_exit(alert: dict):
+    tv_symbol = alert["symbol"]
+    symbol = config.tv_symbol_to_bingx(tv_symbol)
+    position_side = alert["positionSide"]
+
+    if not config.AUTO_TRADE:
+        telegram_notifier.send(telegram_notifier.format_exit_signal(alert, executed=False))
+        return
+
+    pos = state.get_open(symbol)
+    if not pos:
+        # puede que ya se haya cerrado por SL/TP directamente en BingX; solo avisamos
+        telegram_notifier.send(
+            telegram_notifier.format_exit_signal(
+                alert, executed=False, error="no había posición registrada localmente (¿cerrada ya por SL/TP?)"
+            )
+        )
+        return
+
+    try:
+        exit_price = float(alert.get("price", 0))
+        # Verificado: un 'ok' de la API no garantiza que la posición quede a
+        # cero (puede ejecutarse parcialmente). Si no se cierra, no se
+        # registra el cierre ni se contabiliza el PnL.
+        cerrada = bx.close_position_and_verify(symbol, position_side)
+        if not cerrada:
+            telegram_notifier.send(
+                f"🚨 *{symbol}*: la señal de salida no consiguió cerrar la posición. "
+                f"CIÉRRALA A MANO EN BINGX."
+            )
+            return
+        entry_price = pos["entry_price"]
+        pnl = (exit_price - entry_price) if position_side == "LONG" else (entry_price - exit_price)
+    except Exception as e:
+        log.exception("Fallo cerrando orden en BingX")
+        telegram_notifier.send(
+            telegram_notifier.format_exit_signal(alert, executed=False, error=str(e))
+        )
+        return
+
+    state.record_close(symbol, pnl=pnl)
+    telegram_notifier.send(telegram_notifier.format_exit_signal(alert, executed=True))
+
+
+# --------------------------------------------------------------------------- #
+@app.route("/reset-breaker/<secret>", methods=["POST"])
+def reset_breaker(secret):
+    """Endpoint manual para reactivar el trading tras un circuit breaker.
+
+    Reancla además el equity de referencia del día al equity actual: sin
+    eso, un reset con la cuenta ya caída vuelve a disparar el breaker en la
+    siguiente señal, porque el drawdown se sigue midiendo contra el equity
+    de ANTES de la caída.
+    """
+    if secret != config.WEBHOOK_SECRET:
+        return jsonify(error="unauthorized"), 401
+    try:
+        equity = bx.get_balance()
+    except Exception:
+        log.exception("No se pudo leer el balance al resetear el breaker")
+        equity = None
+    state.manual_reset_breaker(reanclar_equity=equity)
+    telegram_notifier.send(
+        f"✅ Circuit breaker reseteado manualmente."
+        + (f" Ancla diaria movida a {equity:.4f} USDT." if equity else "")
+    )
+    return jsonify(status="reset", daily_start_equity=equity), 200
+
+
+@app.route("/emergency-stop/<secret>", methods=["POST"])
+def emergency_stop(secret):
+    """Botón de pánico: pausa el trading YA y cierra posiciones.
+
+    Por defecto cierra SOLO las posiciones de este bot. La versión anterior
+    cerraba TODAS las de la cuenta, incluidas las de otros bots de la flota
+    y las manuales del usuario -- una parada de emergencia de un bot no
+    debería liquidar operativa ajena.
+
+    Para cerrar todo de verdad (incluida la operativa ajena), hay que
+    pedirlo explícitamente: ?scope=all
+    """
+    if secret != config.WEBHOOK_SECRET:
+        return jsonify(error="unauthorized"), 401
+
+    scope = request.args.get("scope", "own").lower()
+
+    state.state["trading_halted"] = True
+    state.state["halt_reason"] = "PARADA DE EMERGENCIA manual"
+    state._save()
+
+    try:
+        live_positions = _live_positions()
+    except Exception as e:
+        telegram_notifier.send(f"🚨 Parada de emergencia: no se pudo leer posiciones de BingX: {e}")
+        return jsonify(error=str(e)), 500
+
+    if scope == "all":
+        objetivo = live_positions
+    else:
+        objetivo = [p for p in live_positions if state.is_ours(p.get("symbol"))]
+
+    omitidas = [p.get("symbol") for p in live_positions if p not in objetivo]
+
+    closed, failed = [], []
+    for p in objetivo:
+        sym = p.get("symbol")
+        side = p.get("positionSide", "LONG")
+        try:
+            if bx.close_position_and_verify(sym, side):
+                state.record_close(sym)
+                closed.append(sym)
+            else:
+                failed.append((sym, "no llegó a cero tras varios intentos"))
+        except Exception as e:
+            log.exception("Fallo cerrando %s en parada de emergencia", sym)
+            failed.append((sym, str(e)))
+
+    msg = (
+        f"🛑 *PARADA DE EMERGENCIA* (alcance: {'TODA la cuenta' if scope == 'all' else 'solo este bot'})"
+        f" — trading pausado.\nCerradas: {closed or 'ninguna'}"
+    )
+    if omitidas:
+        msg += f"\nNo tocadas (ajenas a este bot): {omitidas}"
+    if failed:
+        msg += f"\n⚠️ Fallaron: {failed} — CIÉRRALAS A MANO EN BINGX AHORA."
+    telegram_notifier.send(msg)
+
+    return jsonify(status="stopped", scope=scope, closed=closed,
+                   skipped=omitidas, failed=failed), 200
+
+
+@app.route("/positions", methods=["GET"])
+def positions():
+    """Posiciones REALES en BingX ahora mismo (consulta directa al
+    exchange, no el JSON local), separadas en propias y ajenas."""
+    try:
+        live = _live_positions()
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+    propias = [p for p in live if state.is_ours(p.get("symbol"))]
+    ajenas = [p for p in live if not state.is_ours(p.get("symbol"))]
+    return jsonify(count=len(live), propias=propias, ajenas=ajenas)
+
+
+@app.route("/unprotected", methods=["GET"])
+def unprotected():
+    """Posiciones abiertas SIN stop en la cuenta. Solo informa: este bot no
+    cierra nada ajeno. Útil para revisar de un vistazo qué está expuesto."""
+    try:
+        live = _live_positions()
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+    salida = []
+    for p in live:
+        sym = p.get("symbol")
+        side = str(p.get("positionSide", "")).upper()
+        has_sl, has_tp = bx.protection_status(sym, side)
+        if not has_sl:
+            salida.append({
+                "symbol": sym, "positionSide": side,
+                "quantity": abs(float(p.get("positionAmt", 0) or 0)),
+                "has_tp": has_tp, "de_este_bot": state.is_ours(sym),
+            })
+    return jsonify(count=len(salida), sin_stop=salida)
 
 
 if __name__ == "__main__":
-    Bot().run()
+    import os
+
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
