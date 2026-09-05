@@ -235,6 +235,24 @@ class Config(metaclass=_ConfigMeta):
     # distintas y mezclarlas hizo que un RISK_PCT=0.5 se leyera como
     # "0.5% de nocional" -> posiciones de 0.33 USDT.
     QTY_PCT = _primera(["QTY_PCT"], 10.0, "float")
+
+    # MARGEN FIJO por operación, en USDT. Si es > 0 MANDA sobre QTY_PCT.
+    #
+    # Es lo que BingX muestra en la columna "Margen": los USDT que quedan
+    # inmovilizados. El tamaño de la posición sale de multiplicarlo por
+    # el apalancamiento:  nocional = MARGIN_PER_TRADE_USDT x LEVERAGE.
+    # Con 10 USDT y leverage 10x -> posiciones de 100 USDT.
+    #
+    # A diferencia de QTY_PCT, esto NO escala con el equity: si la cuenta
+    # baja, el margen por operación sigue siendo el mismo y pesa más en
+    # porcentaje. Por eso existe MAX_MARGIN_PCT.
+    MARGIN_PER_TRADE_USDT = _float("MARGIN_PER_TRADE_USDT", 0.0)
+
+    # Freno del anterior: porcentaje máximo del equity que pueden
+    # inmovilizar TODAS las posiciones simultáneas juntas. Si
+    # MARGIN_PER_TRADE_USDT x MAX_CONCURRENT_POSITIONS lo supera, se
+    # rechaza la señal en vez de dejar la cuenta sin margen libre.
+    MAX_MARGIN_PCT = _float("MAX_MARGIN_PCT", 60.0)
     # Suelo de tamaño: valor MÍNIMO de la posición en USDT (qty × precio),
     # NO margen. Con LEVERAGE=10, 9 USDT de nocional inmovilizan 0.9 de
     # margen. Evita posiciones de céntimos en cuentas pequeñas, donde las
@@ -312,7 +330,23 @@ class Config(metaclass=_ConfigMeta):
         if cls.DEMO_MODE:
             lineas.append("  ⚠️  DEMO_MODE activo: órdenes contra saldo de práctica (-VST).")
 
-        corte = cls.MIN_NOTIONAL_USDT / (cls.MAX_NOTIONAL_PCT / 100.0) if cls.MAX_NOTIONAL_PCT else 0
+        if cls.MARGIN_PER_TRADE_USDT > 0:
+            nocional = cls.MARGIN_PER_TRADE_USDT * cls.LEVERAGE
+            margen_total = cls.MARGIN_PER_TRADE_USDT * cls.MAX_CONCURRENT_POSITIONS
+            lineas.append(
+                f"  ℹ️  MARGEN FIJO {cls.MARGIN_PER_TRADE_USDT} USDT/operación "
+                f"x {cls.LEVERAGE}x = {nocional:.0f} USDT de posición.")
+            lineas.append(
+                f"     Con {cls.MAX_CONCURRENT_POSITIONS} simultáneas: "
+                f"{margen_total:.0f} USDT de margen y "
+                f"{nocional * cls.MAX_CONCURRENT_POSITIONS:.0f} USDT de exposición.")
+            lineas.append(
+                f"     Se rechaza la señal si ese margen total pasa del "
+                f"{cls.MAX_MARGIN_PCT}% del equity "
+                f"(hace falta equity >= {margen_total / (cls.MAX_MARGIN_PCT/100):.2f} USDT).")
+            lineas.append("     QTY_PCT y MIN_NOTIONAL_USDT quedan IGNORADOS en este modo.")
+
+        corte = cls.MIN_NOTIONAL_USDT / (cls.MAX_NOTIONAL_PCT / 100.0) if (cls.MAX_NOTIONAL_PCT and not cls.MARGIN_PER_TRADE_USDT) else 0
         if corte:
             lineas.append(
                 f"  ℹ️  Suelo de nocional {cls.MIN_NOTIONAL_USDT} USDT con tope "
@@ -336,7 +370,10 @@ class Config(metaclass=_ConfigMeta):
             "Sweep Reversal Map — BingX\n"
             f"Modo cuenta: {modo} | Trading: {trading}\n"
             f"Símbolos: {cls.SYMBOLS} | Timeframe: {cls.TIMEFRAME}\n"
-            f"qty_pct={cls.QTY_PCT}% | leverage={cls.LEVERAGE}x | "
+            + (f"margen fijo={cls.MARGIN_PER_TRADE_USDT} USDT/op "
+               f"(-> {cls.MARGIN_PER_TRADE_USDT * cls.LEVERAGE:.0f} USDT de posición) | "
+               if cls.MARGIN_PER_TRADE_USDT > 0 else f"qty_pct={cls.QTY_PCT}% | ")
+            + f"leverage={cls.LEVERAGE}x | "
             f"max_posiciones_simultaneas={cls.MAX_CONCURRENT_POSITIONS}\n"
             f"swing={cls.SWING_LENGTH} | structure={cls.STRUCTURE_LENGTH} | "
             f"max_confirmation_bars={cls.MAX_CONFIRMATION_BARS} | "

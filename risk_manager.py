@@ -35,6 +35,10 @@ def compute_position_size(
     trade_min_usdt: float = 0.0,
     min_notional_usdt: float = 0.0,
     max_notional_pct: float = 0.0,
+    margin_usdt: float = 0.0,
+    leverage: int = 1,
+    max_concurrent: int = 1,
+    max_margin_pct: float = 60.0,
 ) -> Sizing:
     """Cantidad de contratos para poner qty_pct% del equity en nocional.
 
@@ -58,11 +62,55 @@ def compute_position_size(
     if qty_pct <= 0:
         return Sizing(ok=False, reason=f"QTY_PCT inválido: {qty_pct}")
 
+    # MODO MARGEN FIJO. Manda sobre qty_pct cuando está activo.
+    #
+    # El margen es lo que BingX inmoviliza; el tamaño de la posición es
+    # ese margen POR el apalancamiento. Confundirlos es el error típico:
+    # qty_pct fija el nocional, así que con leverage 10x el margen sale
+    # diez veces menor de lo que uno espera ver en la columna "Margen".
+    forzado = False
+    if margin_usdt and margin_usdt > 0:
+        lev = max(int(leverage or 1), 1)
+        margen_total = margin_usdt * max(int(max_concurrent or 1), 1)
+        tope_margen = equity * (max_margin_pct / 100.0) if max_margin_pct else None
+        if tope_margen is not None and margen_total > tope_margen:
+            return Sizing(
+                ok=False,
+                reason=(f"margen fijo {margin_usdt} USDT x {max_concurrent} posiciones "
+                        f"= {margen_total:.2f} USDT, por encima del {max_margin_pct}% del "
+                        f"equity ({tope_margen:.2f} USDT). Baja MARGIN_PER_TRADE_USDT, "
+                        f"reduce MAX_CONCURRENT_POSITIONS o sube MAX_MARGIN_PCT"),
+            )
+        notional = margin_usdt * lev
+        raw_qty = notional / entry_price
+        try:
+            precision = int(quantity_precision)
+        except (TypeError, ValueError):
+            precision = 4
+        precision = max(precision, 0)
+        qty = round(raw_qty, precision)
+        if qty <= 0:
+            return Sizing(
+                ok=False,
+                reason=(f"con margen {margin_usdt} USDT x {lev}x el tamaño "
+                        f"{raw_qty:.10f} se redondea a 0 (precisión {precision})"),
+            )
+        min_qty = float(trade_min_quantity or 0)
+        if min_qty and qty < min_qty:
+            return Sizing(ok=False,
+                          reason=f"cantidad {qty} por debajo del mínimo del contrato ({min_qty})")
+        notional_real = qty * entry_price
+        min_usdt = float(trade_min_usdt or 0)
+        if min_usdt and notional_real < min_usdt:
+            return Sizing(ok=False,
+                          reason=(f"nocional {notional_real:.2f} USDT por debajo del mínimo "
+                                  f"del contrato ({min_usdt} USDT)"))
+        return Sizing(ok=True, quantity=qty, notional=notional_real)
+
     notional = equity * (qty_pct / 100.0)
 
     # Suelo de nocional: se aplica ANTES de convertir a contratos, para
     # que el redondeo trabaje ya sobre el tamaño definitivo.
-    forzado = False
     if min_notional_usdt and notional < min_notional_usdt:
         tope = equity * (max_notional_pct / 100.0) if max_notional_pct else None
         if tope and min_notional_usdt > tope:

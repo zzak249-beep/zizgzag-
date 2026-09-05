@@ -386,6 +386,10 @@ class Bot:
             meta["quantityPrecision"], meta["tradeMinQuantity"], meta["tradeMinUSDT"],
             min_notional_usdt=Config.MIN_NOTIONAL_USDT,
             max_notional_pct=Config.MAX_NOTIONAL_PCT,
+            margin_usdt=Config.MARGIN_PER_TRADE_USDT,
+            leverage=Config.LEVERAGE,
+            max_concurrent=Config.MAX_CONCURRENT_POSITIONS,
+            max_margin_pct=Config.MAX_MARGIN_PCT,
         )
         if not sizing.ok:
             self._descartar(f"sizing: {sizing.reason[:60]}")
