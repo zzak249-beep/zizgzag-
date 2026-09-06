@@ -1,428 +1,271 @@
 """
-config.py — Configuración del Sweep Reversal Map Bot.
+Configuración del bot Wavelet MRA.
 
-Todo se lee de variables de entorno (Railway → Variables). Los valores
-por defecto reproducen los que aparecen en el log de arranque actual.
+MODE=SIGNAL por defecto. Esta estrategia tiene CERO operaciones medidas
+y su filtro central estaba mal calibrado en el original, así que los
+números del hilo de partida (71%, Sharpe 2.44) no son una referencia
+válida: describen una versión con el filtro encendido el 92% del
+tiempo. Mide antes con backtest.py.
 """
 import os
 
 
-def _bool(name, default="false"):
-    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+def _bool(n, d=False):
+    return os.getenv(n, str(d)).strip().lower() in ("1", "true", "yes", "si", "sí")
 
 
-def _str(name, default=""):
-    """Quita espacios/saltos de línea accidentales: pegar variables en
-    Railway suele dejar un '\\n' al final, y eso rompe cabeceras HTTP
-    como X-BX-APIKEY con un ValueError críptico."""
-    return os.getenv(name, default).strip()
-
-
-def _int(name, default):
+def _float(n, d):
     try:
-        return int(_str(name, str(default)))
-    except ValueError:
-        return int(default)
+        return float(os.getenv(n, d))
+    except (TypeError, ValueError):
+        return d
 
 
-def _float(name, default):
+def _int(n, d):
     try:
-        return float(_str(name, str(default)))
-    except ValueError:
-        return float(default)
+        return int(os.getenv(n, d))
+    except (TypeError, ValueError):
+        return d
 
 
-# Nombres de variable que se encontraron y cuáles no: se imprime al
-# arrancar. Sin esto, una variable con otro nombre en Railway hace que
-# el bot coja el default en silencio -- y si el default es "no operar",
-# el bot parece roto sin estarlo.
-VARIABLES_ENCONTRADAS = {}
+MODE = os.getenv("MODE", "SIGNAL").strip().upper()
+LIVE_CONFIRMED = _bool("LIVE_CONFIRMED", False)
 
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
+BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
+BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com").strip()
+# Ventana de validez de la firma. Sin recvWindow, una latencia alta
+# hace que BingX rechace la petición por timestamp fuera de rango.
+RECV_WINDOW = _int("RECV_WINDOW", 5000)
 
-def _primera(nombres, default, tipo="str"):
-    """Lee la primera variable de entorno que exista de la lista.
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
 
-    La flota ha usado nombres distintos para el mismo interruptor
-    (LIVE_TRADING, AUTO_TRADE, MODE=LIVE...). En vez de fallar en
-    silencio con el default, se prueban todos y se deja constancia de
-    cuál se usó.
-    """
-    for nombre in nombres:
-        crudo = os.getenv(nombre)
-        if crudo is None or not crudo.strip():
-            continue
-        crudo = crudo.strip()
-        VARIABLES_ENCONTRADAS[nombres[0]] = f"{nombre}={crudo}"
-        if tipo == "bool":
-            return crudo.lower() in ("1", "true", "yes", "on", "live", "real")
-        if tipo == "int":
-            try:
-                return int(float(crudo))
-            except ValueError:
-                return default
-        if tipo == "float":
-            try:
-                return float(crudo)
-            except ValueError:
-                return default
-        return crudo
-    VARIABLES_ENCONTRADAS[nombres[0]] = f"(ninguna encontrada, default={default})"
-    return default
+# ── Motor wavelet ─────────────────────────────────────────────────────
+TIMEFRAME = os.getenv("TIMEFRAME", "5m").strip()
+# Varios timeframes a la vez, separados por comas. Por defecto solo uno.
+TIMEFRAMES = [t.strip() for t in os.getenv("TIMEFRAMES", "").split(",") if t.strip()] or [TIMEFRAME]
+LOOKBACK_ENERGY = _int("LOOKBACK_ENERGY", 40)
+APPROX_LEN = _int("APPROX_LEN", 8)
+ATR_LEN = _int("ATR_LEN", 14)
 
+# Niveles de la descomposición à trous. Con 4 las escalas son 1,2,4,8
+# barras (las mismas que el original) y hacen falta 16 barras de
+# calentamiento. Con 5 son 1,2,4,8,16 y hacen falta 32.
+MRA_LEVELS = _int("MRA_LEVELS", 4)
+# Sobre qué serie se busca el cruce: "trend" (S_J, la tendencia wavelet,
+# coherente con el motor y con el Pine) o "price" (el precio crudo, como
+# la versión anterior). Cambiarlo y comparar en el backtester.
+CROSS_SOURCE = os.getenv("CROSS_SOURCE", "trend").strip().lower()
 
-# Parámetros del motor con nombres alternativos. sweep_engine.py usa el
-# prefijo SWEEP_ para algunos (SWEEP_ATR_LENGTH), y no todos los módulos
-# coinciden. En vez de ir descubriéndolos uno a uno con un crash por
-# cada deploy, Config resuelve el prefijo automáticamente.
-_PREFIJOS = ("SWEEP_", "WAVELET_")
+# LA CORRECCIÓN CENTRAL. Con normalización por escala, el ratio en ruido
+# puro tiene mediana 0.75 y percentil 75 en 1.00, así que 1.30 deja
+# pasar aproximadamente el cuartil superior. Sin normalizar (modo
+# original) el ruido puro ya da mediana 3.04 y habría que poner el
+# umbral en 4.0 para filtrar algo — con 1.5 se enciende el 92% del
+# tiempo y no filtra nada.
+NORMALIZE_SCALES = _bool("NORMALIZE_SCALES", True)
+DOMINANCE_THRESHOLD = _float("DOMINANCE_THRESHOLD", 1.30)
 
-# Parámetros del motor que no estaban en config y hubo que inventar un
-# valor. NO son tuyos: son el valor NEUTRO (filtro desactivado), elegido
-# para no alterar la estrategia con un umbral inventado. Si tu Pine usa
-# otro, defínelo en Railway.
+# SEGUNDO COMPONENTE DEL RÉGIMEN, y el que de verdad separa tendencia
+# de oscilación. El ratio de energía mide TAMAÑO por escala, no
+# dirección: sobre series sintéticas da 1.12 en tendencia moderada y
+# 1.44 en oscilante, así que por sí solo deja pasar el 64% de los
+# mercados que van y vuelven. El ER sobre la tendencia wavelet baja ese
+# 64% al 6% sin recortar las de tendencia.
+USE_PERSISTENCE = _bool("USE_PERSISTENCE", True)
+MIN_PERSISTENCE = _float("MIN_PERSISTENCE", 0.60)
+
+ALLOW_LONG = _bool("ALLOW_LONG", True)
+ALLOW_SHORT = _bool("ALLOW_SHORT", True)
+
+# ── Las tres correcciones del cruce de medias ─────────────────────────
+# Un cruce sin filtros dispara 30-50 veces por trimestre con 60-65% de
+# perdedoras y factor de ganancias ~1.0: breakeven menos comisiones. La
+# literatura coincide en tres arreglos, y aquí están los tres.
 #
-# La alternativa era que el bot siguiera cascando un símbolo tras otro.
-_DEFAULTS_NEUTROS = {
-    "MIN_PENETRATION_ATR": 0.0,      # 0 = no se exige penetración mínima
-    "MIN_DISPLACEMENT_ATR": 0.2,     # este sí sale de tu log de arranque
-    "MAX_PENETRATION_ATR": 999.0,    # sin techo
-    "MIN_SWEEP_ATR": 0.0,
-    "MIN_BODY_ATR": 0.0,
-    "MIN_WICK_RATIO": 0.0,
-    "BUFFER_ATR": 0.0,
-}
+# (1) RÉGIMEN — ya lo cubre DOMINANCE_THRESHOLD, que es el equivalente
+#     al filtro de ADX que recomiendan: no operar cruces en mercado
+#     plano.
+#
+# (2) VOLUMEN en la vela del cruce. Activado por defecto: las fuentes
+#     dicen que "este filtro por sí solo elimina una porción
+#     significativa de los whipsaws", porque los cruces con poco volumen
+#     en mercado fino se giran casi siempre.
+USE_VOL_FILTER = _bool("USE_VOL_FILTER", True)
+VOL_LEN = _int("VOL_LEN", 20)
+VOL_MULT = _float("VOL_MULT", 1.2)
 
-# Nombres a los que se les aplicó un default neutro, para avisar al
-# arrancar en vez de que pase desapercibido.
-DEFAULTS_APLICADOS = {}
+# (3) TENDENCIA DEL TIMEFRAME SUPERIOR. Es la corrección que más
+#     recortaba señales en los estudios ("elimina la mayoría de los
+#     fallos a contratendencia"). Solo largos si el precio está sobre su
+#     media larga, solo cortos si está por debajo. Reduce las señales
+#     aproximadamente a la mitad — esa es la idea.
+USE_HTF_FILTER = _bool("USE_HTF_FILTER", True)
+HTF_MA_LEN = _int("HTF_MA_LEN", 200)
 
+# ── Salidas ───────────────────────────────────────────────────────────
+SL_ATR = _float("SL_ATR", 1.5)
+TP_ATR = _float("TP_ATR", 2.5)
+# "Los trailing stops típicamente superan a las salidas por cruce
+# contrario porque capturan la continuación después de ganar el edge
+# inicial." Disponible, apagado: cámbialo y compara en el backtester en
+# vez de creértelo.
+USE_TRAILING = _bool("USE_TRAILING", False)
+TRAIL_ATR = _float("TRAIL_ATR", 2.0)
+TRAIL_START_R = _float("TRAIL_START_R", 1.0)
+MAX_TRADE_MINUTES = _int("MAX_TRADE_MINUTES", 120)
+USE_TIME_EXIT = _bool("USE_TIME_EXIT", True)
+TIME_EXIT_ONLY_LOSING = _bool("TIME_EXIT_ONLY_LOSING", True)
 
-class _ConfigMeta(type):
-    """Resuelve atributos que no existen literalmente en Config.
+# ── Coste y liquidez ──────────────────────────────────────────────────
+# ── Coste: comisiones separadas y TCA ─────────────────────────────────
+# Una limitada POST-ONLY nunca cruza el spread, así que la entrada paga
+# comisión MAKER. Sin post-only, una limitada que cruza se ejecuta como
+# taker y pagas la tarifa alta sin enterarte. La salida (SL/TP son
+# STOP_MARKET) siempre es taker.
+POST_ONLY = _bool("POST_ONLY", True)
+FEE_MAKER_PCT = _float("FEE_MAKER_PCT", 0.02)
+FEE_TAKER_PCT = _float("FEE_TAKER_PCT", 0.05)
 
-    Orden: variable de entorno con ese nombre exacto -> mismo nombre sin
-    prefijo SWEEP_/WAVELET_ -> mismo nombre CON prefijo. Si nada encaja,
-    lanza AttributeError con un mensaje que dice qué falta y dónde
-    definirlo, en vez del críptico "type object 'Config' has no
-    attribute".
-    """
+# Coste medido por símbolo a partir del diario, en vez de una constante
+# para los 400. Con menos de MIN_TCA_SAMPLES operaciones se usa la
+# estimación: tres fills no son una medición.
+USE_TCA = _bool("USE_TCA", True)
+MIN_TCA_SAMPLES = _int("MIN_TCA_SAMPLES", 10)
+TCA_BLACKLIST_MULT = _float("TCA_BLACKLIST_MULT", 2.0)
 
-    def __getattr__(cls, name):
-        # Solo se resuelven nombres de CONSTANTE (mayúsculas). Sin este
-        # filtro, el metaclass intercepta también métodos y atributos
-        # internos de Python y devuelve un AttributeError con un mensaje
-        # sobre variables de Railway que no viene a cuento.
-        if name.startswith("_") or not name.isupper():
-            raise AttributeError(name)
+COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
+MIN_ATR_PCT = _float("MIN_ATR_PCT", 0.5)
+MIN_COST_COVER = _float("MIN_COST_COVER", 6.0)
+MAX_COST_IN_R = _float("MAX_COST_IN_R", 0.20)
+MAX_RISK_PCT = _float("MAX_RISK_PCT", 4.0)
+# Suelo de riesgo: si el stop queda demasiado cerca, el coste pesa
+# demasiado. MAX_COST_IN_R ya lo cubre, pero el backtester heredado lo
+# consulta por separado.
+MIN_RISK_PCT = _float("MIN_RISK_PCT", 0.0)
+MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 2_000_000.0)
 
-        crudo = os.getenv(name)
-        if crudo is not None and crudo.strip():
-            crudo = crudo.strip()
-            VARIABLES_ENCONTRADAS[name] = f"{name}={crudo} (resuelta al vuelo)"
-            for conv in (int, float):
-                try:
-                    return conv(crudo)
-                except ValueError:
-                    pass
-            if crudo.lower() in ("true", "false"):
-                return crudo.lower() == "true"
-            return crudo
+# ── Universo ──────────────────────────────────────────────────────────
+SCAN_INTERVAL_SEC = _int("SCAN_INTERVAL_SEC", 60)
+MAX_SYMBOLS = _int("MAX_SYMBOLS", 400)
+SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
+SYMBOL_WHITELIST = [s.strip().upper() for s in os.getenv("SYMBOL_WHITELIST", "").split(",") if s.strip()]
+EXCLUDE_PREFIXES = [p.strip().upper() for p in os.getenv("EXCLUDE_PREFIXES", "NC").split(",") if p.strip()]
 
-        candidatos = []
-        for pref in _PREFIJOS:
-            if name.startswith(pref):
-                candidatos.append(name[len(pref):])
-            else:
-                candidatos.append(pref + name)
+# ── Acciones tokenizadas ──────────────────────────────────────────────
+# En el historial real, 7 de 37 operaciones (19%) fueron sobre acciones
+# e índices tokenizados: SP500, PLTR, SAMSUNG, DRAM, TTWO, UBER,
+# ANTHROPIC. TODAS perdedoras, media -0.09 USDT. Es aritmética: un
+# índice no se mueve un 1.5% en cinco minutos, así que su amplitud no
+# puede cubrir el coste de operarlo. Se excluyen por defecto.
+ONLY_CRYPTO = _bool("ONLY_CRYPTO", True)
+STOCK_TOKENS = [s.strip().upper() for s in os.getenv(
+    "STOCK_TOKENS",
+    "SP500,NAS100,PLTR,TSLA,NVDA,AAPL,MSFT,AMZN,META,GOOG,GOOGL,COIN,MSTR,"
+    "SAMSUNG,DRAM,TTWO,UBER,UBERUS,ANTHROPIC,OPENAI,SPACEX,XAUT,PAXG,GOLD,"
+    "OIL,SILVER,EUR,GBP,JPY"
+).split(",") if s.strip()]
 
-        for alt in candidatos:
-            valor = cls.__dict__.get(alt)
-            if valor is not None:
-                VARIABLES_ENCONTRADAS[name] = f"-> {alt} (alias)"
-                return valor
+# ── Movimiento mínimo esperado ────────────────────────────────────────
+# El 38% de las operaciones reales tuvieron |PnL| MENOR que la comisión
+# (~0.10 USDT sobre 100 de nocional). Entrar y salir en 15 minutos
+# pagando peaje no es estrategia, es fricción. Se exige que el objetivo
+# esperado valga al menos N veces la comisión de ida y vuelta.
+MIN_TP_OVER_FEE = _float("MIN_TP_OVER_FEE", 8.0)
 
-        base = name
-        for pref in _PREFIJOS:
-            if base.startswith(pref):
-                base = base[len(pref):]
-                break
-        if base in _DEFAULTS_NEUTROS:
-            valor = _DEFAULTS_NEUTROS[base]
-            DEFAULTS_APLICADOS[name] = valor
-            return valor
+# ── Riesgo ────────────────────────────────────────────────────────────
+RISK_PCT = _float("RISK_PCT", 0.5)
+MAX_CONCURRENT = _int("MAX_CONCURRENT", 1)
+MAX_TOTAL_POSITIONS = _int("MAX_TOTAL_POSITIONS", 3)
+LEVERAGE = _int("LEVERAGE", 2)
+# Tope duro. En el historial apareció una operación a 20x con
+# LEVERAGE=10 que perdió 5.21 USDT — el 40% de todo lo perdido en una
+# sola operación. Si el exchange no acepta el apalancamiento pedido, no
+# se opera ese símbolo.
+MAX_LEVERAGE_HARD = _int("MAX_LEVERAGE_HARD", 5)
+if LEVERAGE > MAX_LEVERAGE_HARD:
+    LEVERAGE = MAX_LEVERAGE_HARD
+MARGIN_MODE = os.getenv("MARGIN_MODE", "ISOLATED").strip().upper()
+MAX_CONSECUTIVE_LOSSES = _int("MAX_CONSECUTIVE_LOSSES", 3)
+COOLDOWN_MINUTES = _int("COOLDOWN_MINUTES", 120)
+MAX_DAILY_LOSS_R = _float("MAX_DAILY_LOSS_R", 3.0)
+# El límite diario aplicado a TODA LA CUENTA, no solo a este bot. Con
+# dos bots en real sobre la misma cuenta, un límite por bot permite
+# perder el doble de lo declarado sin que ninguno se pare.
+ACCOUNT_DAILY_LOSS = _bool("ACCOUNT_DAILY_LOSS", True)
 
-        raise AttributeError(
-            f"Config no tiene '{name}' ni un equivalente ({', '.join(candidatos)}). "
-            f"Defínelo como variable de entorno en Railway o añádelo a config.py."
-        )
+# ── Freno de drawdown ─────────────────────────────────────────────────
+# Sin throttle se compone el error: en drawdown se sigue arriesgando el
+# mismo porcentaje de un capital menor. Al superar DD_BRAKE_PCT desde el
+# pico, el riesgo se multiplica por DD_BRAKE_FACTOR y no se restaura
+# hasta recuperar hasta DD_RESUME_PCT.
+USE_DD_BRAKE = _bool("USE_DD_BRAKE", True)
+DD_BRAKE_PCT = _float("DD_BRAKE_PCT", 10.0)
+DD_RESUME_PCT = _float("DD_RESUME_PCT", 5.0)
+DD_BRAKE_FACTOR = _float("DD_BRAKE_FACTOR", 0.5)
 
+# ── Ranking de candidatos ─────────────────────────────────────────────
+# Con 400 símbolos y un hueco, ejecutar la PRIMERA señal que dispara
+# hace que el orden del universo decida qué operas: azar disfrazado de
+# sistema. Se recogen todas las del ciclo y se ejecuta la mejor.
+RANK_CANDIDATES = _bool("RANK_CANDIDATES", True)
+COOLDOWN_BARS = _int("COOLDOWN_BARS", 4)
+ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
+LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
+LIMIT_TTL_MIN = _int("LIMIT_TTL_MIN", 10)
 
-class Config(metaclass=_ConfigMeta):
-    # --- BingX ---
-    BINGX_API_KEY = _str("BINGX_API_KEY")
-    BINGX_API_SECRET = _str("BINGX_API_SECRET")
-    BINGX_BASE_URL = _str("BINGX_BASE_URL", "https://open-api.bingx.com")
-    BINGX_RECV_WINDOW_MS = _int("BINGX_RECV_WINDOW_MS", 5000)
+# ── Avisos ────────────────────────────────────────────────────────────
+SIGNAL_COOLDOWN_MIN = _int("SIGNAL_COOLDOWN_MIN", 60)
+WATCHLIST_MIN = _int("WATCHLIST_MIN", 30)
+DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
+DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
+HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
+IDLE_ALERT_DAYS = _int("IDLE_ALERT_DAYS", 5)
+# Horas tras las que una posición abierta se considera olvidada. No se
+# cierra sola —esa decisión es del usuario— pero avisar es obligatorio.
+ZOMBIE_ALERT_HOURS = _float("ZOMBIE_ALERT_HOURS", 6.0)
+BTC_CONTEXT = _bool("BTC_CONTEXT", True)
 
-    # DEMO_MODE opera contra el saldo de práctica (sufijo -VST).
-    DEMO_MODE = _primera(["DEMO_MODE", "BINGX_DEMO"], False, "bool")
+# ── Funding ───────────────────────────────────────────────────────────
+# El carry (comprar spot + vender perp) es edge ESTRUCTURAL, no
+# estadístico: los fondos que lo hacen reportan drawdowns bajo el 1%.
+# Pero con 135 USDT da 2 céntimos al día a funding normal y tarda 13
+# días en cubrir la comisión de abrir. Por eso el bot NO monta carry:
+# solo avisa cuando el funding está tan alto que sí compensaría, con el
+# cálculo hecho sobre el saldo real.
+FUNDING_ALERTS = _bool("FUNDING_ALERTS", True)
+FUNDING_EXTREMO = _float("FUNDING_EXTREMO", 0.05)
+FUNDING_ALERT_MIN = _int("FUNDING_ALERT_MIN", 120)
+CARRY_MAX_DIAS_COBERTURA = _float("CARRY_MAX_DIAS_COBERTURA", 3.0)
+# Saldo de referencia para el cálculo del carry cuando el bot está en
+# SIGNAL y no puede consultar el balance real.
+SALDO_ESTIMADO = _float("SALDO_ESTIMADO", 135.0)
+# Filtro opcional y APAGADO: no abrir largos si BTC cae fuerte, porque
+# las alts caen más. Sin datos propios que lo respalden, activarlo sería
+# añadir una creencia al sistema.
+BTC_FILTER = _bool("BTC_FILTER", False)
+BTC_MIN_24H = _float("BTC_MIN_24H", -3.0)
 
-    # Interruptor real de ejecución. Con LIVE_TRADING=false el bot calcula
-    # señales y avisa por Telegram, pero no manda ninguna orden.
-    # Se aceptan los nombres que la flota ha usado para lo mismo. Si
-    # ninguno existe, NO se opera: el default seguro es no mandar órdenes.
-    LIVE_TRADING = _primera(
-        ["LIVE_TRADING", "AUTO_TRADE", "TRADING_ACTIVO", "MODE", "LIVE_CONFIRMED"],
-        False, "bool")
-
-    # --- Telegram ---
-    TELEGRAM_BOT_TOKEN = _str("TELEGRAM_BOT_TOKEN")
-    TELEGRAM_CHAT_ID = _str("TELEGRAM_CHAT_ID")
-
-    # --- Universo y ritmo ---
-    # Default "ALL" (todos los perpetuos USDT-M), que es como venía
-    # operando el bot. SYMBOL_WHITELIST no se acepta como alias: en tu
-    # Railway está vacío, y una lista vacía no significa "solo BTC".
-    SYMBOLS = _primera(["SYMBOLS"], "ALL")
-    TIMEFRAME = _str("TIMEFRAME", "5m")
-    POLL_INTERVAL_SECONDS = _int("POLL_INTERVAL_SECONDS", 60)
-    # El escaneo va por lotes para no abrir cientos de conexiones a la vez
-    # ni comerse el rate limit de BingX.
-    SYMBOL_BATCH_SIZE = _int("SYMBOL_BATCH_SIZE", 20)
-    SYMBOL_BATCH_DELAY_SECONDS = _float("SYMBOL_BATCH_DELAY_SECONDS", 1.0)
-
-    # --- Motor de señal (sweep_engine) ---
-    # Los nombres son EXACTAMENTE los que lee sweep_engine.replay_signal
-    # y compute_sweep_sl_tp. Los valores por defecto son los que aparecen
-    # en tu log de arranque original.
-    SWING_LENGTH = _int("SWING_LENGTH", 5)
-    STRUCTURE_LENGTH = _int("STRUCTURE_LENGTH", 3)
-    MAX_CONFIRMATION_BARS = _int("MAX_CONFIRMATION_BARS", 12)
-    MIN_DISPLACEMENT_ATR = _float("MIN_DISPLACEMENT_ATR", 0.2)
-    SWEEP_ATR_LENGTH = _int("SWEEP_ATR_LENGTH", _int("ATR_LENGTH", 14))
-    ATR_LENGTH = SWEEP_ATR_LENGTH   # alias, mismo valor
-
-    # Penetración mínima por encima del swing para considerar que hubo
-    # barrido, en múltiplos de ATR. Con 0.0 basta con TOCAR el nivel:
-    #   high[i] >= swing_high + 0
-    # Es el valor neutro (filtro desactivado). Subirlo exige que el
-    # barrido sea más profundo y reduce los falsos disparos por un
-    # roce del nivel. No sé cuál usa tu Pine: si era otro, ponlo en
-    # Railway como MIN_PENETRATION_ATR.
-    MIN_PENETRATION_ATR = _float("MIN_PENETRATION_ATR", 0.0)
-
-    # --- Salidas ---
-    # El SL va al nivel barrido con un colchón en ATR (si se pone justo en
-    # el nivel, el mismo ruido que provocó el barrido lo toca enseguida).
-    # El TP es un múltiplo de esa distancia de riesgo (RR).
-    #
-    # Nombres tal cual los pide compute_sweep_sl_tp: SWEEP_SL_ATR_BUFFER
-    # y SWEEP_RR_RATIO. Ojo, SWEEP_RR_RATIO NO se resolvía por el alias
-    # de prefijo (habría buscado "RR_RATIO", que no existía) -- habría
-    # sido el siguiente crash.
-    SWEEP_SL_ATR_BUFFER = _float("SWEEP_SL_ATR_BUFFER", _float("SL_ATR_BUFFER", 0.3))
-    SWEEP_RR_RATIO = _float("SWEEP_RR_RATIO", _float("TP_RR", 2.0))
-    SL_ATR_BUFFER = SWEEP_SL_ATR_BUFFER   # alias para summary()
-    TP_RR = SWEEP_RR_RATIO                # alias para summary()
-
-    # --- Riesgo / cuenta ---
-    # OJO: QTY_PCT es porcentaje del equity en NOCIONAL, no riesgo. El
-    # riesgo real de cada operación depende de dónde caiga el nivel
-    # barrido y varía entre entradas.
-    # SOLO QTY_PCT. NO se acepta RISK_PCT como alias: en otros bots de la
-    # flota RISK_PCT es el % de equity ARRIESGADO en la distancia al stop,
-    # mientras que aquí QTY_PCT es el % puesto en NOCIONAL. Son magnitudes
-    # distintas y mezclarlas hizo que un RISK_PCT=0.5 se leyera como
-    # "0.5% de nocional" -> posiciones de 0.33 USDT.
-    QTY_PCT = _primera(["QTY_PCT"], 10.0, "float")
-
-    # MARGEN FIJO por operación, en USDT. Si es > 0 MANDA sobre QTY_PCT.
-    #
-    # Es lo que BingX muestra en la columna "Margen": los USDT que quedan
-    # inmovilizados. El tamaño de la posición sale de multiplicarlo por
-    # el apalancamiento:  nocional = MARGIN_PER_TRADE_USDT x LEVERAGE.
-    # Con 10 USDT y leverage 10x -> posiciones de 100 USDT.
-    #
-    # A diferencia de QTY_PCT, esto NO escala con el equity: si la cuenta
-    # baja, el margen por operación sigue siendo el mismo y pesa más en
-    # porcentaje. Por eso existe MAX_MARGIN_PCT.
-    MARGIN_PER_TRADE_USDT = _float("MARGIN_PER_TRADE_USDT", 0.0)
-
-    # Freno del anterior: porcentaje máximo del equity que pueden
-    # inmovilizar TODAS las posiciones simultáneas juntas. Si
-    # MARGIN_PER_TRADE_USDT x MAX_CONCURRENT_POSITIONS lo supera, se
-    # rechaza la señal en vez de dejar la cuenta sin margen libre.
-    MAX_MARGIN_PCT = _float("MAX_MARGIN_PCT", 60.0)
-    # Suelo de tamaño: valor MÍNIMO de la posición en USDT (qty × precio),
-    # NO margen. Con LEVERAGE=10, 9 USDT de nocional inmovilizan 0.9 de
-    # margen. Evita posiciones de céntimos en cuentas pequeñas, donde las
-    # comisiones se comen cualquier resultado. 0 lo desactiva.
-    MIN_NOTIONAL_USDT = _float("MIN_NOTIONAL_USDT", 9.0)
-    # Freno del suelo anterior: si forzar el mínimo supera este % del
-    # equity, se descarta la señal en vez de abrir algo desproporcionado.
-    # 40% y no 25%: con MIN_NOTIONAL_USDT=9 y un tope del 25%, cualquier
-    # equity por debajo de 36 USDT rechazaba TODAS las señales sin que
-    # fuera evidente por qué. A 40% el corte baja a 22.5 USDT.
-    MAX_NOTIONAL_PCT = _float("MAX_NOTIONAL_PCT", 40.0)
-    LEVERAGE = _primera(["LEVERAGE"], 10, "int")
-    # Sin alias, por lo mismo: MAX_CONCURRENT de otro bot vale 1 y aquí
-    # dejaba el aforo en 1 en vez de 5.
-    MAX_CONCURRENT_POSITIONS = _primera(["MAX_CONCURRENT_POSITIONS"], 5, "int")
-    MIN_BALANCE_USDT = _float("MIN_BALANCE_USDT", 0.0)
-    # No abrir en un símbolo que ya tiene posición (propia o ajena): en
-    # hedge se fusionarían y ningún bot sabría cuál es la suya.
-    SKIP_IF_SYMBOL_HAS_POSITION = _bool("SKIP_IF_SYMBOL_HAS_POSITION", "true")
-
-    # --- Infra ---
-    HEALTH_PORT = _int("PORT", 8080)
-    LOG_LEVEL = _str("LOG_LEVEL", "INFO")
-
-    # ------------------------------------------------------------------ #
-    @classmethod
-    def validate(cls) -> None:
-        """Falla al arrancar en vez de a mitad del primer ciclo."""
-        errores = []
-
-        if cls.LIVE_TRADING and not (cls.BINGX_API_KEY and cls.BINGX_API_SECRET):
-            errores.append("LIVE_TRADING=true pero faltan BINGX_API_KEY/BINGX_API_SECRET")
-
-        if cls.TIMEFRAME[-1].lower() not in ("m", "h", "d"):
-            errores.append(f"TIMEFRAME no soportado: {cls.TIMEFRAME}")
-
-        if cls.MAX_CONCURRENT_POSITIONS < 1:
-            errores.append("MAX_CONCURRENT_POSITIONS debe ser >= 1")
-
-        if cls.QTY_PCT <= 0 or cls.QTY_PCT > 100:
-            errores.append(f"QTY_PCT fuera de rango: {cls.QTY_PCT}")
-
-        if cls.TP_RR <= 0:
-            errores.append(f"TP_RR debe ser > 0: {cls.TP_RR}")
-
-        # Aviso, no error: es una configuración legítima pero arriesgada, y
-        # conviene que quede escrito en el log del arranque.
-        exposicion = cls.QTY_PCT * cls.MAX_CONCURRENT_POSITIONS
-        if exposicion > 100:
-            print(f"⚠️  AVISO: QTY_PCT={cls.QTY_PCT}% × {cls.MAX_CONCURRENT_POSITIONS} "
-                  f"posiciones = {exposicion}% del equity en nocional simultáneo.")
-
-        if errores:
-            raise SystemExit("Configuración inválida:\n  - " + "\n  - ".join(errores))
-
-    @classmethod
-    def diagnostico(cls) -> str:
-        """Por qué el bot podría no estar abriendo operaciones.
-
-        Se imprime al arrancar. Recorre todas las puertas en el mismo
-        orden en que las evalúa _handle_entry, para que la causa sea
-        visible en el log en vez de haber que deducirla.
-        """
-        lineas = ["── Diagnóstico: ¿puede abrir operaciones? ──"]
-
-        if not cls.LIVE_TRADING:
-            lineas.append("  ❌ NO. Trading desactivado -> no se manda ninguna orden.")
-            lineas.append("     Define LIVE_TRADING=true (o AUTO_TRADE=true) en Railway.")
-        else:
-            lineas.append("  ✅ Trading activado.")
-
-        if not (cls.BINGX_API_KEY and cls.BINGX_API_SECRET):
-            lineas.append("  ❌ Faltan BINGX_API_KEY / BINGX_API_SECRET.")
-
-        if cls.DEMO_MODE:
-            lineas.append("  ⚠️  DEMO_MODE activo: órdenes contra saldo de práctica (-VST).")
-
-        if cls.MARGIN_PER_TRADE_USDT > 0:
-            nocional = cls.MARGIN_PER_TRADE_USDT * cls.LEVERAGE
-            margen_total = cls.MARGIN_PER_TRADE_USDT * cls.MAX_CONCURRENT_POSITIONS
-            lineas.append(
-                f"  ℹ️  MARGEN FIJO {cls.MARGIN_PER_TRADE_USDT} USDT/operación "
-                f"x {cls.LEVERAGE}x = {nocional:.0f} USDT de posición.")
-            lineas.append(
-                f"     Con {cls.MAX_CONCURRENT_POSITIONS} simultáneas: "
-                f"{margen_total:.0f} USDT de margen y "
-                f"{nocional * cls.MAX_CONCURRENT_POSITIONS:.0f} USDT de exposición.")
-            lineas.append(
-                f"     Se rechaza la señal si ese margen total pasa del "
-                f"{cls.MAX_MARGIN_PCT}% del equity "
-                f"(hace falta equity >= {margen_total / (cls.MAX_MARGIN_PCT/100):.2f} USDT).")
-            lineas.append("     QTY_PCT y MIN_NOTIONAL_USDT quedan IGNORADOS en este modo.")
-
-        corte = cls.MIN_NOTIONAL_USDT / (cls.MAX_NOTIONAL_PCT / 100.0) if (cls.MAX_NOTIONAL_PCT and not cls.MARGIN_PER_TRADE_USDT) else 0
-        if corte:
-            lineas.append(
-                f"  ℹ️  Suelo de nocional {cls.MIN_NOTIONAL_USDT} USDT con tope "
-                f"{cls.MAX_NOTIONAL_PCT}%: con equity < {corte:.2f} USDT se "
-                f"rechazan TODAS las señales.")
-
-        if cls.MIN_BALANCE_USDT:
-            lineas.append(f"  ℹ️  MIN_BALANCE_USDT={cls.MIN_BALANCE_USDT}: por debajo no se opera.")
-
-        lineas.append("  Variables leídas del entorno:")
-        for clave, valor in sorted(VARIABLES_ENCONTRADAS.items()):
-            lineas.append(f"    {clave}: {valor}")
-
-        return "\n".join(lineas)
-
-    @classmethod
-    def summary(cls) -> str:
-        modo = "DEMO/VST" if cls.DEMO_MODE else "REAL"
-        trading = "ACTIVO (envía órdenes reales)" if cls.LIVE_TRADING else "SOLO SEÑALES"
-        return (
-            "Sweep Reversal Map — BingX\n"
-            f"Modo cuenta: {modo} | Trading: {trading}\n"
-            f"Símbolos: {cls.SYMBOLS} | Timeframe: {cls.TIMEFRAME}\n"
-            + (f"margen fijo={cls.MARGIN_PER_TRADE_USDT} USDT/op "
-               f"(-> {cls.MARGIN_PER_TRADE_USDT * cls.LEVERAGE:.0f} USDT de posición) | "
-               if cls.MARGIN_PER_TRADE_USDT > 0 else f"qty_pct={cls.QTY_PCT}% | ")
-            + f"leverage={cls.LEVERAGE}x | "
-            f"max_posiciones_simultaneas={cls.MAX_CONCURRENT_POSITIONS}\n"
-            f"swing={cls.SWING_LENGTH} | structure={cls.STRUCTURE_LENGTH} | "
-            f"max_confirmation_bars={cls.MAX_CONFIRMATION_BARS} | "
-            f"min_displacement={cls.MIN_DISPLACEMENT_ATR}x ATR | "
-            f"min_penetration={cls.MIN_PENETRATION_ATR}x ATR\n"
-            f"SL: nivel barrido ± {cls.SL_ATR_BUFFER}x ATR | TP: RR {cls.TP_RR}x"
-        )
+STATE_PATH = os.getenv("STATE_PATH", "/data/state_wavelet.json")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
 
-# --------------------------------------------------------------------- #
-def parametros_que_pide(ruta_modulo: str = "sweep_engine.py"):
-    """Lee el CÓDIGO de sweep_engine y saca todos los `params.X` que usa.
+def _tf_min() -> int:
+    return {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(TIMEFRAME, 5)
 
-    Sirve para dejar de descubrir parámetros que faltan de uno en uno,
-    con un crash por deploy. Se ejecuta al arrancar y reporta la lista
-    completa: los que Config resuelve, los que caen a un default neutro
-    y los que no existen.
 
-    Devuelve (resueltos, con_default, ausentes).
-    """
-    import ast
-    import os.path
+def max_trade_seconds() -> int:
+    return MAX_TRADE_MINUTES * 60
 
-    if not os.path.exists(ruta_modulo):
-        return [], [], []
 
-    try:
-        arbol = ast.parse(open(ruta_modulo, encoding="utf-8").read())
-    except Exception:
-        return [], [], []
+def is_live() -> bool:
+    return MODE == "LIVE" and LIVE_CONFIRMED and bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
 
-    nombres = set()
-    for nodo in ast.walk(arbol):
-        # params.X / cfg.X / config.X / Config.X
-        if isinstance(nodo, ast.Attribute) and isinstance(nodo.value, ast.Name):
-            if nodo.value.id in ("params", "cfg", "config", "Config"):
-                if nodo.attr.isupper():
-                    nombres.add(nodo.attr)
 
-    resueltos, con_default, ausentes = [], [], []
-    for nombre in sorted(nombres):
-        antes = dict(DEFAULTS_APLICADOS)
-        try:
-            getattr(Config, nombre)
-        except AttributeError:
-            ausentes.append(nombre)
-            continue
-        if nombre in DEFAULTS_APLICADOS and nombre not in antes:
-            con_default.append(nombre)
-        else:
-            resueltos.append(nombre)
-    return resueltos, con_default, ausentes
+def describe() -> str:
+    if is_live():
+        return "LIVE — enviando órdenes reales a BingX"
+    if MODE == "LIVE":
+        return "LIVE pedido pero SIN confirmar — sigue en SIGNAL"
+    return "SIGNAL — solo avisos, no toca el exchange"

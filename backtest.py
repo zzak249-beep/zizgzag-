@@ -41,6 +41,7 @@ import httpx
 
 import config
 import strategy
+import tca
 
 BINANCE_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
@@ -131,12 +132,18 @@ def simulate(symbol: str, velas: list[dict]) -> Result:
             if toca_sl:
                 abierta.exit = abierta.sl
                 abierta.motivo = "stop"
-                abierta.r = -1.0 - config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
+                abierta.r = -1.0 - tca.coste(abierta.symbol) / (riesgo0 / abierta.entry * 100.0)
             elif toca_tp:
                 abierta.exit = abierta.tp
                 abierta.motivo = "objetivo"
                 bruto = (abierta.tp - abierta.entry) if largo else (abierta.entry - abierta.tp)
-                abierta.r = bruto / riesgo0 - config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
+                abierta.r = bruto / riesgo0 - tca.coste(abierta.symbol) / (riesgo0 / abierta.entry * 100.0)
+            elif strategy.exit_cross(velas[max(0, i - ventana): i + 1], abierta.side):
+                precio = vela["close"]
+                bruto = (precio - abierta.entry) if largo else (abierta.entry - precio)
+                abierta.exit = precio
+                abierta.motivo = "cruce"
+                abierta.r = bruto / riesgo0 - tca.coste(abierta.symbol) / (riesgo0 / abierta.entry * 100.0)
             elif venc:
                 precio = vela["close"]
                 bruto = (precio - abierta.entry) if largo else (abierta.entry - precio)
@@ -146,7 +153,7 @@ def simulate(symbol: str, velas: list[dict]) -> Result:
                     continue
                 abierta.exit = precio
                 abierta.motivo = "tiempo"
-                abierta.r = bruto / riesgo0 - config.COST_ROUNDTRIP_PCT / (riesgo0 / abierta.entry * 100.0)
+                abierta.r = bruto / riesgo0 - tca.coste(abierta.symbol) / (riesgo0 / abierta.entry * 100.0)
             else:
                 i += 1
                 continue
@@ -250,6 +257,9 @@ def significancia(rs: list[float], n_simbolos: int) -> str:
     alpha = 0.05 / max(1, n_simbolos)
     # aproximación de la inversa normal (Beasley-Springer-Moro simplificada)
     z = math.sqrt(2.0) * _erfinv(1 - alpha)
+    # Con un solo símbolo, Bonferroni da 1.96 — MENOS que el umbral
+    # clásico de 2.0. Nunca puede ser el listón más bajo de los tres.
+    z = max(z, 3.0)
 
     veredicto = (
         "PASA incluso ajustando por multiplicidad" if abs(t) >= z else
@@ -283,8 +293,11 @@ async def main() -> int:
     mensual = "--mensual" in sys.argv
 
     print(f"Descargando {days} días en {interval} para {len(symbols)} símbolo(s)...")
-    print(f"Filtros activos: coste {config.COST_ROUNDTRIP_PCT}% · "
+    print(f"Filtros activos: coste {config.COST_ROUNDTRIP_PCT}% estimado "
+          f"(comisión real ida y vuelta {tca.comision_ida_vuelta():.3f}%) · "
           f"riesgo {config.MIN_RISK_PCT}-{config.MAX_RISK_PCT}%")
+    print("El backtest usa la ESTIMACIÓN: no hay diario del futuro. "
+          "Compara su expectativa con la real del diario.")
 
     total_r = 0.0
     total_ops = 0
