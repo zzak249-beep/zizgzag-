@@ -1,32 +1,28 @@
-# Crowding bot v2.1 — solo señales (pool arreglado)
+# Crowding bot v2.2 — solo señales
 
 Bot de señales del posicionamiento amontonado en perpetuos de BingX.
 
 **NO OPERA. NO PIDE CLAVES DE API.** Solo endpoints públicos.
 
-## Cambios v2.1
-- Connection pool ampliado (40) → desaparecen los warnings `Connection pool is full`
-- Retry automático en 429/5xx
-- Resto de mejoras v2 intactas (premiumIndex global + ThreadPoolExecutor)
+## Novedades v2.2
+- **Progreso de calentamiento** en cada ciclo:
+  `calentando 287/300 (media 12.4 h, 84 muestras)`
+- **Heartbeat cada hora** por Telegram + log (listos, media de horas, virtuales abiertas)
+- Pool de conexiones ampliado (v2.1)
+- premiumIndex global + ThreadPoolExecutor (v2)
 
-## Despliegue en Railway (importante)
+## Despliegue en Railway
 
-### 1. Start Command
-En **Settings → Deploy → Start Command** pon **exactamente**:
-
+### Start Command
 ```
 python crowding_bot.py
 ```
+(NO pongas `worker: ...`)
 
-**NO** pongas `worker: python crowding_bot.py` (provoca `worker:: command not found`).
+### Volume
+Monta un Volume en `/data`.
 
-El archivo `railway.toml` ya fuerza este comando.
-
-### 2. Volume
-Monta un **Volume** en `/data`.
-
-### 3. Variables recomendadas
-
+### Variables recomendadas
 ```
 TIMEFRAME=15m
 SCAN_SEC=120
@@ -58,23 +54,17 @@ REPORT_HOUR=7
 PACING=0
 ```
 
-### 4. Tipo de servicio
-Configura el servicio como **Worker**.
+Servicio tipo **Worker**.
 
 ## Calentamiento
-Hasta cumplir 30 h + 200 muestras por símbolo el bot no emite señales
-(aparecerá “calentando”). Con el ciclo actual son ~30-35 horas de reloj.
+Hasta 30 h + 200 muestras por símbolo → 0 señales (normal).
+Con cadencia ~2 min son aproximadamente **30-35 horas de reloj**.
 
-## Telegram
-Por defecto solo el informe diario. Activa con:
-```
-TG_SIGNALS=true
-TG_CLOSES=true
-```
+El heartbeat te dirá el progreso cada hora.
 
 ## Archivos
 ```
-crowding_bot.py   # v2.1 (pool arreglado)
+crowding_bot.py
 confirm.py
 requirements.txt
 Procfile

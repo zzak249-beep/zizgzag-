@@ -82,9 +82,10 @@ logging.basicConfig(
 log = logging.getLogger("crowding")
 
 _ultimo_ciclo = 0.0
+_ultimo_heartbeat = 0.0
 
 BASE = "https://open-api.bingx.com"
-UA = {"User-Agent": "crowding-signal-bot/2.1"}
+UA = {"User-Agent": "crowding-signal-bot/2.2"}
 
 # Session reutilizable + pool grande (evita "Connection pool is full")
 SESSION = requests.Session()
@@ -708,18 +709,60 @@ def ciclo(st: Estado, simbolos: list[str]):
             log.exception("Fallo evaluando %s", sym)
 
     top = sorted(razones.items(), key=lambda kv: -kv[1])[:4]
-    global _ultimo_ciclo
+    global _ultimo_ciclo, _ultimo_heartbeat
     ahora = time.time()
     cad = (ahora - _ultimo_ciclo) / 60.0 if _ultimo_ciclo else 0.0
     _ultimo_ciclo = ahora
-    log.info("Ciclo: %d símbolos · %d señales · cadencia %.1f min | workers=%d | %s",
-             motivos, señales, cad, workers,
-             " · ".join(f"{k}: {v}" for k, v in top))
+
+    # Progreso de calentamiento
+    min_h = float(CFG["MIN_HORAS"])
+    min_n = int(CFG["MIN_MUESTRAS"])
+    listos = calentando = 0
+    sum_h = sum_n = 0.0
+    for sym in simbolos:
+        hb = st.basis.get(sym)
+        if not hb or len(hb) < 2:
+            calentando += 1
+            continue
+        span = (hb[-1][0] - hb[0][0]) / 3600.0
+        n = len(hb)
+        sum_h += span
+        sum_n += n
+        if span >= min_h and n >= min_n:
+            listos += 1
+        else:
+            calentando += 1
+    total = max(listos + calentando, 1)
+    media_h = sum_h / total
+    media_n = sum_n / total
+
+    if señales > 0 or calentando == 0:
+        log.info("Ciclo: %d símbolos · %d señales · cadencia %.1f min | workers=%d | listos %d/%d · %s",
+                 motivos, señales, cad, workers, listos, total,
+                 " · ".join(f"{k}: {v}" for k, v in top))
+    else:
+        log.info("Ciclo: %d símbolos · 0 señales · cadencia %.1f min | calentando %d/%d "
+                 "(media %.1f h, %.0f muestras) | %s",
+                 motivos, cad, calentando, total, media_h, media_n,
+                 " · ".join(f"{k}: {v}" for k, v in top[:3]))
+
+    # Heartbeat cada ~60 min
+    if ahora - _ultimo_heartbeat >= 3600:
+        _ultimo_heartbeat = ahora
+        msg = (f"💓 <b>Crowding heartbeat</b>\n"
+               f"Universo {len(simbolos)} · listos {listos}/{total}\n"
+               f"Calentando: media {media_h:.1f} h / {media_n:.0f} muestras\n"
+               f"Virtuales abiertas: {len(st.abiertas)}\n"
+               f"Cadencia: {cad:.1f} min")
+        tg(msg, "informe")
+        log.info("Heartbeat: listos %d/%d · media %.1f h · %d virtuales",
+                 listos, total, media_h, len(st.abiertas))
+
     st.guardar()
 
 
 def main():
-    log.info("Crowding bot v2 — SOLO SEÑALES, sin claves de API, %s | workers=%s",
+    log.info("Crowding bot v2.2 — SOLO SEÑALES, sin claves de API, %s | workers=%s",
              CFG["TIMEFRAME"], CFG["MAX_WORKERS"])
     st = Estado(CFG["STATE"])
     syms = contratos()
@@ -729,13 +772,13 @@ def main():
         syms.sort(key=lambda s: vols.get(s, 0), reverse=True)
     syms = syms[: int(CFG["MAX_SYMBOLS"])]
     log.info("Universo: %d símbolos", len(syms))
-    tg(f"🤖 <b>Crowding bot v2 arrancado</b>\n{len(syms)} símbolos · {CFG['TIMEFRAME']}\n"
+    tg(f"🤖 <b>Crowding bot v2.2 arrancado</b>\n{len(syms)} símbolos · {CFG['TIMEFRAME']}\n"
        f"Workers: {CFG['MAX_WORKERS']} · SCAN_SEC: {CFG['SCAN_SEC']}\n"
        f"Avisos: señal {'ON' if CFG['TG_SIGNALS'] else 'off'} · "
        f"cierre {'ON' if CFG['TG_CLOSES'] else 'off'} · informe diario a las "
        f"{CFG['REPORT_HOUR']}:00 UTC\n"
        f"<i>Sin claves de API: solo lee endpoints públicos. No puede operar.</i>\n"
-       f"<i>Necesita ~3 días de calentamiento antes de emitir.</i>")
+       f"<i>Calentamiento: 30 h + 200 muestras por símbolo (~30-35 h de reloj).</i>")
 
     ultimo_universo = time.time()
     while True:
