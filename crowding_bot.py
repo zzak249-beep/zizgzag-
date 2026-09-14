@@ -70,6 +70,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import confirm as cf
 
@@ -82,11 +84,18 @@ log = logging.getLogger("crowding")
 _ultimo_ciclo = 0.0
 
 BASE = "https://open-api.bingx.com"
-UA = {"User-Agent": "crowding-signal-bot/2.0"}
+UA = {"User-Agent": "crowding-signal-bot/2.1"}
 
-# Session reutilizable: reduce latencia TCP/TLS
+# Session reutilizable + pool grande (evita "Connection pool is full")
 SESSION = requests.Session()
 SESSION.headers.update(UA)
+_adapter = HTTPAdapter(
+    pool_connections=40,
+    pool_maxsize=40,
+    max_retries=Retry(total=2, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504]),
+)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
 
 
 def env(k, d):

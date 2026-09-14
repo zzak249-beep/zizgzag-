@@ -1,65 +1,31 @@
-# Crowding bot v2 — solo señales (más rápido y preciso)
+# Crowding bot v2.1 — solo señales (pool arreglado)
 
 Bot de señales del posicionamiento amontonado en perpetuos de BingX.
 
-**NO OPERA. NO PIDE CLAVES DE API.** Solo endpoints públicos, así que no
-puede tocar la cuenta ni por error.
+**NO OPERA. NO PIDE CLAVES DE API.** Solo endpoints públicos.
 
-## Mejoras v2 (velocidad + precisión)
+## Cambios v2.1
+- Connection pool ampliado (40) → desaparecen los warnings `Connection pool is full`
+- Retry automático en 429/5xx
+- Resto de mejoras v2 intactas (premiumIndex global + ThreadPoolExecutor)
 
-| Antes | Ahora |
-|-------|-------|
-| ~9,4 min por ciclo (300 símbolos) | ~2-3 min típico |
-| 3 llamadas REST por símbolo | 1 llamada global de premiumIndex + paralelo OI/klines |
-| `requests` sueltos | `requests.Session` (connection pooling) |
-| Secuencial + PACING 0.15 s | `ThreadPoolExecutor` (MAX_WORKERS=20 por defecto) |
-| klines limit=200 | klines limit=120 (suficiente) |
-| SCAN_SEC=300 | SCAN_SEC=120 (ajustable) |
+## Despliegue en Railway (importante)
 
-Rate limit oficial de BingX (market data públicos): **500 requests / 10 s por IP**.
-Con 20 workers te mantienes cómodamente por debajo.
+### 1. Start Command
+En **Settings → Deploy → Start Command** pon **exactamente**:
 
-## Qué hace
+```
+python crowding_bot.py
+```
 
-Detecta apalancamiento amontonado (basis extremo + open interest subiendo
-+ precio en un extremo) y espera la primera vela EN CONTRA de la multitud.
-Cada señal abre una operación **virtual** con stop y objetivo, la sigue
-hasta el desenlace y anota el resultado en R con el coste descontado.
+**NO** pongas `worker: python crowding_bot.py` (provoca `worker:: command not found`).
 
-El informe diario dice la muestra acumulada **y qué se puede concluir con
-ella**:
+El archivo `railway.toml` ya fuerza este comando.
 
-| ventaja real | operaciones necesarias |
-|---|---|
-| 0.50 R/op | 31 |
-| 0.30 R/op | 87 |
-| 0.20 R/op | 196 |
-| 0.10 R/op | 784 |
+### 2. Volume
+Monta un **Volume** en `/data`.
 
-## Despliegue en Railway
-
-1. Proyecto nuevo desde este repo.
-2. **Monta un Volume en `/data`.** Sin él, cada redespliegue borra la
-   historia acumulada y el bot vuelve a calentar desde cero.
-3. Variables de entorno (ver abajo).
-
-## Calentamiento
-
-BingX no sirve histórico de open interest, así que el bot acumula el suyo.
-Dirá `calentando (X/30h, N/200)` y no emitirá nada hasta cumplir **las dos
-condiciones**: 30 horas de historia Y 200 muestras.
-
-Con la cadencia más rápida de v2 el calentamiento real es más corto en
-tiempo de reloj (más muestras por hora).
-
-## Los parámetros van en HORAS, no en muestras
-
-`OI_LOOK_H`, `HIST_HORAS` y `MIN_HORAS` están en horas y el bot hace la
-conversión con su cadencia real.
-
-`MIN_MUESTRAS` sigue siendo una cuenta: hacen falta las dos cosas.
-
-## Variables
+### 3. Variables recomendadas
 
 ```
 TIMEFRAME=15m
@@ -92,46 +58,27 @@ REPORT_HOUR=7
 PACING=0
 ```
 
-### Nuevas / cambiadas en v2
+### 4. Tipo de servicio
+Configura el servicio como **Worker**.
 
-- `MAX_WORKERS` (default 20): paralelismo de descarga OI+klines.
-- `KLINES_LIMIT` (default 120): velas pedidas (antes fijo 200).
-- `SCAN_SEC` default bajado a 120.
-- `PACING` default 0 (ya no hace falta el sleep extra).
+## Calentamiento
+Hasta cumplir 30 h + 200 muestras por símbolo el bot no emite señales
+(aparecerá “calentando”). Con el ciclo actual son ~30-35 horas de reloj.
 
 ## Telegram
-
-`TG_SIGNALS` y `TG_CLOSES` vienen **apagados**. Por defecto llega
-**un mensaje al día**: el informe.
-
-Todo queda igualmente en el CSV.
-
-## Sobre las claves de BingX
-
-**No las pongas.** Todo lo que este bot necesita es público.
-
-## Régimen (confirm.py)
-
-El módulo `confirm.py` calcula el ratio de varianzas robusto y etiqueta el
-símbolo como tendencial, reversivo o indeterminado. **Aquí solo se apunta,
-nunca decide.**
-
-Motivo: el crowding opera CONTRA la multitud (reversión). El veto de
-`confirm.py` está pensado para ruptura.
-
-## Salida
-
-- `/data/crowding_ops.csv` — una fila por operación virtual cerrada
-- `/data/crowding_state.json` — historia de basis y OI + virtuales abiertas
-- Telegram — informe diario (+ señales/cierres si los activas)
+Por defecto solo el informe diario. Activa con:
+```
+TG_SIGNALS=true
+TG_CLOSES=true
+```
 
 ## Archivos
-
 ```
-crowding_bot.py   # bot principal (v2 optimizado)
-confirm.py        # filtro de régimen (solo registro)
-requirements.txt  # requests
-Procfile          # worker: python crowding_bot.py
+crowding_bot.py   # v2.1 (pool arreglado)
+confirm.py
+requirements.txt
+Procfile
+railway.toml
 README.md
 .gitignore
 ```
