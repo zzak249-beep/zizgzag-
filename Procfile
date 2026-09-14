@@ -1,1 +1,1 @@
-worker: python main.py
+worker: python crowding_bot.py

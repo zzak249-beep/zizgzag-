@@ -1,201 +1,137 @@
-# Bot Wavelet MRA — BingX
+# Crowding bot v2 — solo señales (más rápido y preciso)
 
-Descomposición **Haar à trous** causal + cruce sobre la tendencia, con
-el régimen medido en dos componentes: energía normalizada por escala y
-eficiencia de la tendencia.
+Bot de señales del posicionamiento amontonado en perpetuos de BingX.
 
-**Arranca en SIGNAL.** Lee lo que viene antes de cambiarlo.
+**NO OPERA. NO PIDE CLAVES DE API.** Solo endpoints públicos, así que no
+puede tocar la cuenta ni por error.
 
----
+## Mejoras v2 (velocidad + precisión)
 
-## Lo que cambió en esta versión
+| Antes | Ahora |
+|-------|-------|
+| ~9,4 min por ciclo (300 símbolos) | ~2-3 min típico |
+| 3 llamadas REST por símbolo | 1 llamada global de premiumIndex + paralelo OI/klines |
+| `requests` sueltos | `requests.Session` (connection pooling) |
+| Secuencial + PACING 0.15 s | `ThreadPoolExecutor` (MAX_WORKERS=20 por defecto) |
+| klines limit=200 | klines limit=120 (suficiente) |
+| SCAN_SEC=300 | SCAN_SEC=120 (ajustable) |
 
-### 1. El motor ahora es à trous de verdad
+Rate limit oficial de BingX (market data públicos): **500 requests / 10 s por IP**.
+Con 20 workers te mantienes cómodamente por debajo.
 
-Antes: el "detalle a escala n" era la diferencia entre dos medias de n
-barras separadas n barras. Causal, pero no reconstruye la serie y la
-normalización por n no correspondía a la longitud real del filtro.
+## Qué hace
 
-Ahora, la recursión de Renaud, Starck & Murtagh:
+Detecta apalancamiento amontonado (basis extremo + open interest subiendo
++ precio en un extremo) y espera la primera vela EN CONTRA de la multitud.
+Cada señal abre una operación **virtual** con stop y objetivo, la sigue
+hasta el desenlace y anota el resultado en R con el coste descontado.
 
-```
-S_0(t)     = close(t)
-S_{j+1}(t) = [S_j(t) + S_j(t - 2^j)] / 2
-w_{j+1}(t) = S_j(t) - S_{j+1}(t)
-```
+El informe diario dice la muestra acumulada **y qué se puede concluir con
+ella**:
 
-Verificado: reconstrucción exacta (error 0.0) y el valor de la barra t
-no cambia 25 barras después.
+| ventaja real | operaciones necesarias |
+|---|---|
+| 0.50 R/op | 31 |
+| 0.30 R/op | 87 |
+| 0.20 R/op | 196 |
+| 0.10 R/op | 784 |
 
-### 2. El ratio de energía NO distingue tendencia de oscilación
+## Despliegue en Railway
 
-Medido sobre 400 series sintéticas por régimen, con la normalización
-correcta:
+1. Proyecto nuevo desde este repo.
+2. **Monta un Volume en `/data`.** Sin él, cada redespliegue borra la
+   historia acumulada y el bot vuelve a calentar desde cero.
+3. Variables de entorno (ver abajo).
 
-| Régimen | Mediana del ratio | Pasa 1.30 |
-|---|---|---|
-| Ruido puro | 0.70 | 6% |
-| Tendencia moderada | 1.12 | 36% |
-| Tendencia fuerte | 1.94 | 94% |
-| **Oscilante** | **1.44** | **64%** |
+## Calentamiento
 
-La oscilante puntúa MÁS ALTO que la tendencia moderada. Es lógico: una
-oscilación de amplitud grande también concentra energía en las escalas
-gruesas. El ratio mide **tamaño** por escala, no **dirección**.
+BingX no sirve histórico de open interest, así que el bot acumula el suyo.
+Dirá `calentando (X/30h, N/200)` y no emitirá nada hasta cumplir **las dos
+condiciones**: 30 horas de historia Y 200 muestras.
 
-### 3. La corrección: eficiencia de la tendencia
+Con la cadencia más rápida de v2 el calentamiento real es más corto en
+tiempo de reloj (más muestras por hora).
 
-Kaufman ER calculado sobre S_J (no sobre el precio, que en 5m es
-ruidosísimo):
+## Los parámetros van en HORAS, no en muestras
 
-| Régimen | Mediana del ER | Filtro combinado |
-|---|---|---|
-| Ruido puro | 0.57 | 6% → **4%** |
-| Tendencia moderada | 1.00 | 36% → **36%** |
-| Tendencia fuerte | 1.00 | 94% → **94%** |
-| Oscilante | 0.26 | 64% → **6%** |
+`OI_LOOK_H`, `HIST_HORAS` y `MIN_HORAS` están en horas y el bot hace la
+conversión con su cadencia real.
 
-Las oscilantes caen del 64% al 6% **sin recortar ni una** de las de
-tendencia. `MIN_PERSISTENCE=0.60`, apagable con `USE_PERSISTENCE`.
+`MIN_MUESTRAS` sigue siendo una cuenta: hacen falta las dos cosas.
 
----
-
-## Cuatro fallos vivos que se han arreglado
-
-1. **`reconcile()` salía antes si no estaba en LIVE.** Un `state.json`
-   heredado, o el paso de LIVE a SIGNAL, dejaba posiciones "abiertas"
-   eternamente bloqueando el hueco. Ahora corre siempre y limpia el
-   estado avisando una vez.
-
-2. **La R se calculaba sin mirar el lado.** `(ultimo - entrada) /
-   riesgo` para todo, así que **en los cortos salía invertida**: una
-   ganancia se contaba como pérdida. Corrompía `wins/losses`, el
-   circuit breaker y el acumulador de pérdida diaria a la vez.
-
-3. **`pending` existía en el estado y nadie lo usaba.** Con
-   `ENTRY_TYPE=LIMIT` por defecto, una orden que no se ejecutaba se daba
-   por abierta igual: hueco bloqueado, cierre inventado en `reconcile`,
-   y la orden viva en el exchange llenándose horas después.
-   `LIMIT_TTL_MIN` estaba definido y no se leía en ningún sitio.
-
-4. **La firma no se construía una sola vez.** Se firmaba `urlencode(p)`
-   y luego httpx reserializaba el dict. Funcionaba por orden de
-   inserción, pero cualquier cambio de versión lo rompía en silencio.
-   Ahora la cadena que se firma es literalmente la que viaja, con
-   `recvWindow`.
-
-Además: salida por **cruce contrario** (antes solo existía el reloj),
-`IDLE_ALERT_DAYS` conectado, Bonferroni con suelo en 3.0 (con un solo
-símbolo daba 1.96, menos que el umbral clásico), y los textos heredados
-del bot RSI corregidos.
-
----
-
-## Sobre el 71% y el Sharpe 2.44 del hilo original
-
-No los tomes como referencia. Describen una versión con el filtro
-encendido el 92% del tiempo — es decir, un cruce sin filtro efectivo.
-
-**Esta estrategia sigue teniendo cero operaciones medidas en real.**
-
----
-
-## Lo que hereda
-
-Margen aislado por símbolo · límite global contando toda la cuenta ·
-pérdida diaria máxima en R · reconciliación · verificación tras
-respuesta perdida · redondeo a la precisión del contrato · diario de
-operaciones reales · salida por tiempo que solo corta lo que no va a
-favor · avisos agrupados con enfriamiento · watchlist · funding como
-contexto · `ensure_config`.
-
----
-
-## Antes de operarlo
+## Variables
 
 ```
-python test_telegram.py
-python backtest.py BTC-USDT 5m 240 --mensual
-python backtest.py BTC-USDT,ETH-USDT,SOL-USDT 5m 240
-python sweep.py BTC-USDT,ETH-USDT,SOL-USDT 5m 180
+TIMEFRAME=15m
+SCAN_SEC=120
+MIN_VOL_24H=2000000
+MAX_SYMBOLS=300
+MAX_WORKERS=20
+KLINES_LIMIT=120
+HIST_HORAS=168
+MIN_HORAS=30
+MIN_MUESTRAS=200
+OI_LOOK_H=6
+Z_BASIS=2.0
+Z_OI=1.0
+EXT_PCT=80
+ATR_LEN=14
+SL_ATR=1.5
+TP_R=2.0
+MAX_BARS=16
+MIN_ATR_PCT=1.0
+COST_PCT=0.25
+MAX_COST_R=0.20
+STATE=/data/crowding_state.json
+CSV=/data/crowding_ops.csv
+TG_TOKEN=
+TG_CHAT=
+TG_SIGNALS=false
+TG_CLOSES=false
+REPORT_HOUR=7
+PACING=0
 ```
 
-Compara `CROSS_SOURCE=trend` contra `price` y `USE_PERSISTENCE=true`
-contra `false`. Mira **el agregado**, no el mejor símbolo: elegir los k
-mejores de n sesga casi tanto como elegir el mejor de n^k.
+### Nuevas / cambiadas en v2
 
-Servicio aparte, volumen en `/data`, y para LIVE los dos cerrojos:
-`MODE=LIVE` **y** `LIVE_CONFIRMED=true`.
+- `MAX_WORKERS` (default 20): paralelismo de descarga OI+klines.
+- `KLINES_LIMIT` (default 120): velas pedidas (antes fijo 200).
+- `SCAN_SEC` default bajado a 120.
+- `PACING` default 0 (ya no hace falta el sleep extra).
 
+## Telegram
 
----
+`TG_SIGNALS` y `TG_CLOSES` vienen **apagados**. Por defecto llega
+**un mensaje al día**: el informe.
 
-## v2 — las cinco mejoras
+Todo queda igualmente en el CSV.
 
-### 1. Post-only (`POST_ONLY=true`)
-Una limitada sin `postOnly` que cruza el spread se ejecuta como **taker**
-y paga la tarifa alta sin avisar. Ahora se rechaza en vez de cruzar.
-Comisión ida y vuelta: **0.070%** con post-only (0.02 maker entrada +
-0.05 taker salida) contra **0.100%** sin él. El rechazo no es un error:
-llega a Telegram con la sugerencia de subir `LIMIT_OFFSET_PCT` si pasa
-muy a menudo.
+## Sobre las claves de BingX
 
-### 2. Ranking de candidatos (`RANK_CANDIDATES=true`)
-Con 400 símbolos y un hueco, ejecutar la primera que dispara hacía que
-el **orden del universo** decidiera qué operas. Ahora se recogen todas
-las del ciclo y se ordenan por coste en R ascendente, luego
-persistencia y dominancia. Verificado: entre dos con el mismo coste,
-gana la de más persistencia.
+**No las pongas.** Todo lo que este bot necesita es público.
 
-### 3. TCA por símbolo (`tca.py`, `USE_TCA=true`)
-`COST_ROUNDTRIP_PCT` era **una constante para los 400 símbolos**. Ahora
-se mide desde el diario:
+## Régimen (confirm.py)
+
+El módulo `confirm.py` calcula el ratio de varianzas robusto y etiqueta el
+símbolo como tendencial, reversivo o indeterminado. **Aquí solo se apunta,
+nunca decide.**
+
+Motivo: el crowding opera CONTRA la multitud (reversión). El veto de
+`confirm.py` está pensado para ruptura.
+
+## Salida
+
+- `/data/crowding_ops.csv` — una fila por operación virtual cerrada
+- `/data/crowding_state.json` — historia de basis y OI + virtuales abiertas
+- Telegram — informe diario (+ señales/cierres si los activas)
+
+## Archivos
 
 ```
-coste = comisión_entrada + comisión_salida + 2 x deslizamiento_mediano
+crowding_bot.py   # bot principal (v2 optimizado)
+confirm.py        # filtro de régimen (solo registro)
+requirements.txt  # requests
+Procfile          # worker: python crowding_bot.py
+README.md
+.gitignore
 ```
-
-El deslizamiento se mide contra el **arrival price** — el precio del
-momento de la señal, que es el que supone el backtest. Con menos de
-`MIN_TCA_SAMPLES` (10) operaciones se usa la estimación. Los símbolos
-cuyo coste medido supere `TCA_BLACKLIST_MULT` x la estimación se
-descartan solos, con el motivo en el embudo.
-
-Probado con diario sintético: un símbolo con 0.02% de deslizamiento da
-0.110% de coste; uno con 0.25% da **0.603%** y queda descartado.
-El informe va en el resumen diario.
-
-### 4. Límite diario de CUENTA (`ACCOUNT_DAILY_LOSS=true`)
-`MAX_DAILY_LOSS_R` era por bot. Con dos bots en real sobre la misma
-cuenta, eso permite perder **el doble** de lo declarado sin que ninguno
-se pare. Ahora se lee el PnL realizado de la cuenta desde las 00:00 UTC
-(`/user/income`) y se convierte a R con el riesgo de referencia.
-
-Es aproximado — si los bots usan `RISK_PCT` distintos, la conversión
-desvía. Si el endpoint no responde, cae al contador propio en vez de
-quedarse sin freno.
-
-### 5. Freno de drawdown (`USE_DD_BRAKE=true`)
-`RISK_PCT` es un porcentaje del saldo, así que en drawdown seguías
-arriesgando lo mismo de un capital menor. Al caer un 10% desde el pico,
-el riesgo se multiplica por 0.5 y **no se restaura hasta recuperar
-hasta el 5%**. La histéresis evita que el factor parpadee en el umbral.
-
-Verificado: 135→120 (dd 11.1%) frena; 120→129 (dd 4.4%) libera. Sizing
-0.3375 normal, 0.1688 frenado.
-
----
-
-## Lo que NO se implementó, y por qué
-
-- **Smart order routing multi-venue**: reduce slippage pero añade
-  complejidad operativa y exposición a contraparte. Con este tamaño el
-  coste operativo supera el ahorro.
-- **Volatility targeting a nivel cartera**: la estimación de
-  volatilidad mira hacia atrás, así que reduce exposición *después* de
-  que suba, y es procíclica. Con un hueco simultáneo no aporta.
-- **Modelos de impacto de mercado**: tu orden no mueve el libro.
-
-`LOOKBACK_ENERGY` sube de 40 a **160** en las plantillas: con 40, el
-percentil 95 del ratio en ruido puro era 1.41, por encima del umbral de
-1.30, y dos ventanas discrepaban en la decisión el 16% de las veces.
